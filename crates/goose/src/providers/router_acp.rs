@@ -238,6 +238,8 @@ pub async fn connect_completion_session(
             .unwrap_or_default(),
         model_config_option_id: None,
         mode_mapping: HashMap::new(),
+        // A one-shot completion runs no commands.
+        terminal: false,
         notification_callback: None,
     };
     AcpProvider::connect(
@@ -288,6 +290,9 @@ impl RouterAcpProvider {
                 session_config_options,
                 model_config_option_id: Some("model".to_string()),
                 mode_mapping: HashMap::new(),
+                // The session hosts the agent's terminals, so router-acp offers its
+                // `background_start` and every background command has a visible lifecycle.
+                terminal: true,
                 notification_callback: None,
             };
 
