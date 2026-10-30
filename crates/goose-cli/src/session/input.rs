@@ -40,6 +40,8 @@ pub enum InputResult {
     Edit(Option<String>),
     ListSkills,
     LoadSkills(Vec<String>),
+    /// `/review <pr>`: a Kory Source review of a pull request.
+    Review(String),
 }
 
 #[derive(Debug)]
@@ -443,6 +445,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EDIT: &str = "/edit";
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
     const CMD_SKILLS: &str = "/skills";
+    const CMD_REVIEW: &str = "/review";
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
@@ -533,6 +536,9 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_COMPACT => Some(InputResult::Compact),
         s if s == CMD_CHILDREN => Some(InputResult::Children),
         "/shutdown" => Some(InputResult::Shutdown),
+        s if s == CMD_REVIEW || s.starts_with(&format!("{CMD_REVIEW} ")) => Some(
+            InputResult::Review(s.get(CMD_REVIEW.len()..).unwrap_or("").trim().to_string()),
+        ),
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
         s if s == CMD_SKILLS || s.starts_with(&format!("{CMD_SKILLS} ")) => {
             let args = s.get(CMD_SKILLS.len()..).unwrap_or("").trim();
@@ -649,6 +655,7 @@ fn help_text() -> String {
 /clear - Clears the current chat history
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
 /children - Browse this session's subagent sessions (read-only)
+/review <#123 | owner/repo#123> - Get a Kory Source review of a PR here; nothing is posted to GitHub
 /shutdown - In an /implement session: save the run's resume state, drain its workers, and end
             the session gracefully; /implement in a new session resumes (also mid-turn)
 
@@ -798,6 +805,18 @@ mod tests {
             handle_slash_command("/children"),
             Some(InputResult::Children)
         ));
+
+        for (input, argument) in [
+            ("/review #123", "#123"),
+            ("/review   hickoryai/goose#7 ", "hickoryai/goose#7"),
+            ("/review", ""),
+        ] {
+            match handle_slash_command(input) {
+                Some(InputResult::Review(parsed)) => assert_eq!(parsed, argument, "{input}"),
+                other => panic!("{input}: {other:?}"),
+            }
+        }
+        assert!(handle_slash_command("/reviewer").is_none());
 
         // Test help commands
         assert!(matches!(

@@ -13,6 +13,7 @@ pub mod recipes;
 pub mod session;
 pub mod signal;
 mod skill_check;
+pub mod source_review;
 
 // Re-export commonly used types
 pub use cli::Cli;

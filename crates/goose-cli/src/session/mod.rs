@@ -898,6 +898,10 @@ impl CliSession {
                 history.save(editor);
                 self.handle_list_skills().await?;
             }
+            InputResult::Review(argument) => {
+                history.save(editor);
+                handle_source_review(&argument).await;
+            }
         }
         Ok(())
     }
@@ -3219,6 +3223,21 @@ fn find_elicitation_request(message: &Message) -> Option<(String, String, Value)
         }
         None
     })
+}
+
+/// Runs `/review` until it finishes or Ctrl-C stops it.
+async fn handle_source_review(argument: &str) {
+    let cancel = CancellationToken::new();
+    let on_interrupt = cancel.clone();
+    let _interrupt = AbortOnDropHandle::new(tokio::spawn(async move {
+        if ctrl_c().await.is_ok() {
+            on_interrupt.cancel();
+        }
+    }));
+    let cwd = std::env::current_dir().unwrap_or_default();
+    program_status::report(ProgramStatus::Working, None);
+    crate::source_review::run_command(argument, &cwd, &cancel, &mut std::io::stdout()).await;
+    program_status::report(ProgramStatus::Idle, None);
 }
 
 /// Handle MCP notification event (logging or progress)

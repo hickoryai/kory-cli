@@ -95,9 +95,7 @@ impl RouterStateSource {
     }
 
     fn configured_for(cwd: &Path) -> Result<Self> {
-        let binary = SearchPaths::builder()
-            .with_npm()
-            .resolve(ROUTER_ACP_BINARY)?;
+        let binary = router_binary()?;
         let config = router_config_path(Config::global(), &binary, cwd)?;
         Ok(Self { binary, config })
     }
@@ -207,6 +205,47 @@ pub fn parse_delegates(json: &[u8]) -> Result<Vec<RouterDelegate>> {
         );
     }
     Ok(envelope.data.children)
+}
+
+/// The router-acp binary goose would serve, or why it cannot be found.
+pub fn router_binary() -> Result<PathBuf> {
+    SearchPaths::builder().with_npm().resolve(ROUTER_ACP_BINARY)
+}
+
+/// A one-prompt router session for a completion the host runs on the user's seats rather
+/// than as an agent turn. `config` is served as-is, so a project overlay
+/// (`.router-acp/router.yaml`) still layers onto the user's accounts. Chat mode rejects every
+/// tool permission request, and a `candidate` pins `router.candidate` before the prompt.
+pub async fn connect_completion_session(
+    work_dir: PathBuf,
+    config: PathBuf,
+    candidate: Option<String>,
+) -> Result<AcpProvider> {
+    let provider_config = AcpProviderConfig {
+        command: router_binary()?,
+        args: vec![
+            "serve".to_string(),
+            "--config".to_string(),
+            config.display().to_string(),
+        ],
+        env: vec![],
+        env_remove: vec![],
+        work_dir,
+        mcp_servers: vec![],
+        session_mode_id: None,
+        session_config_options: candidate
+            .map(|candidate| vec![("router.candidate".to_string(), candidate)])
+            .unwrap_or_default(),
+        model_config_option_id: None,
+        mode_mapping: HashMap::new(),
+        notification_callback: None,
+    };
+    AcpProvider::connect(
+        ROUTER_ACP_PROVIDER_NAME.to_string(),
+        crate::config::GooseMode::Chat,
+        provider_config,
+    )
+    .await
 }
 
 impl RouterAcpProvider {
