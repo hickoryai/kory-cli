@@ -1626,7 +1626,7 @@ fn set_terminal_title() {
             .unwrap_or_default();
         std::thread::spawn(move || {
             let mut shown = String::new();
-            for tick in 0usize.. {
+            for tick in 0usize..=usize::MAX {
                 let title = terminal_title(
                     &goose::acp::session_activity::current(),
                     LOCAL_BUSY.load(std::sync::atomic::Ordering::Relaxed),

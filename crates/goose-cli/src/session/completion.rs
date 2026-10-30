@@ -244,6 +244,7 @@ impl GooseCompleter {
             "/mode".to_string(),
             "/model".to_string(),
             "/new".to_string(),
+            "/review".to_string(),
         ];
         commands.extend(
             list_commands()
