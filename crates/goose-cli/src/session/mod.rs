@@ -1126,6 +1126,7 @@ impl CliSession {
             &self.agent,
             &self.session_id,
             target_provider_name,
+            &new_model_config,
         )
         .await
         {
@@ -2838,20 +2839,33 @@ impl CliSession {
     }
 }
 
-/// The provider `session_id` would get with `provider_name`, without switching
-/// the session to it.
+/// The provider `session_id` would get with `provider_name` and `model_config`,
+/// without switching the session to them. A new session has no saved model
+/// config yet, so the caller's resolved one must be passed in: without it the
+/// provider falls back to the global `GOOSE_MODEL`, which `--model` doesn't set.
 pub(crate) async fn session_provider(
     agent: &Agent,
     session_id: &str,
     provider_name: &str,
+    model_config: &goose_providers::model::ModelConfig,
 ) -> anyhow::Result<Arc<dyn Provider>> {
-    let mut session = agent
+    let session = agent
         .config
         .session_manager
         .get_session(session_id, false)
         .await?;
-    session.provider_name = Some(provider_name.to_string());
+    let session = with_provider_selection(session, provider_name, model_config);
     agent.config.providers.provider_for(&session).await
+}
+
+fn with_provider_selection(
+    mut session: goose::session::Session,
+    provider_name: &str,
+    model_config: &goose_providers::model::ModelConfig,
+) -> goose::session::Session {
+    session.provider_name = Some(provider_name.to_string());
+    session.model_config = Some(model_config.clone());
+    session
 }
 
 async fn create_successor_session(
@@ -3646,6 +3660,21 @@ mod tests {
         // goose's own loop: the last call's usage is the context.
         assert_eq!(context_in_use(None, false, Some(12_000)), Some(12_000));
         assert_eq!(context_in_use(None, false, None), Some(0));
+    }
+
+    #[test]
+    fn provider_selection_carries_the_resolved_model_into_a_new_session() {
+        // A new `goose run --provider pi-acp --model default` session has no saved
+        // model config; provider creation must use the resolved one, not GOOSE_MODEL.
+        let session = with_provider_selection(
+            goose::session::Session::default(),
+            "pi-acp",
+            &goose_providers::model::ModelConfig::new("default"),
+        );
+
+        assert_eq!(session.provider_name.as_deref(), Some("pi-acp"));
+        let model_config = goose::agents::provider_manager::model_config_for(&session).unwrap();
+        assert_eq!(model_config.model_name, "default");
     }
 
     #[test]

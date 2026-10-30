@@ -725,7 +725,14 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
     }
 
     let (new_provider, effective_provider_name, effective_model_name, effective_model_config) =
-        match session_provider(&agent, &session_id, &resolved.provider_name).await {
+        match session_provider(
+            &agent,
+            &session_id,
+            &resolved.provider_name,
+            &resolved.model_config,
+        )
+        .await
+        {
             Ok(provider) => (
                 provider,
                 resolved.provider_name.clone(),
@@ -766,7 +773,14 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
                 if !session_config.interactive {
                     fallback_model_config = fallback_model_config.with_cache_ttl_clamped();
                 }
-                match session_provider(&agent, &session_id, &fallback_provider).await {
+                match session_provider(
+                    &agent,
+                    &session_id,
+                    &fallback_provider,
+                    &fallback_model_config,
+                )
+                .await
+                {
                     Ok(provider) => (
                         provider,
                         fallback_provider,
