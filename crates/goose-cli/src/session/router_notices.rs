@@ -103,9 +103,51 @@ pub fn summary(notice: &str) -> String {
 type Matcher = fn(&str) -> bool;
 type Summarizer = fn(&str) -> Option<String>;
 
+/// A message another agent sent this session through `router-acp send-input`, as the router
+/// announces it on delivery: `router-acp · external message from <sender> · <input id>
+/// (<delivery>)`, then the message as quoted lines (on its first delivery only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalMessage {
+    pub sender: String,
+    pub input_id: String,
+    /// `turn`, `steered` or `interrupt`, with `, delivery <n>` on a retry.
+    pub delivery: String,
+    /// Empty on a re-delivery, which repeats only the headline.
+    pub body: String,
+}
+
+const EXTERNAL: &str = "external message from ";
+
+/// The external message a notice announces, if it is one.
+pub fn external_message(notice: &str) -> Option<ExternalMessage> {
+    let (headline, body) = notice.split_once('\n').unwrap_or((notice, ""));
+    let rest = headline
+        .strip_prefix(PREFIX)
+        .map(str::trim_start)
+        .unwrap_or(headline)
+        .strip_prefix(EXTERNAL)?;
+    let (sender, tail) = rest.rsplit_once(" · ")?;
+    let (input_id, delivery) = match tail.rsplit_once(" (") {
+        Some((id, how)) => (id, how.strip_suffix(')').unwrap_or(how)),
+        None => (tail, ""),
+    };
+    Some(ExternalMessage {
+        sender: sender.trim().to_string(),
+        input_id: input_id.trim().to_string(),
+        delivery: delivery.trim().to_string(),
+        body: body.trim_matches('\n').to_string(),
+    })
+}
+
+fn external(headline: &str) -> Option<String> {
+    let message = external_message(headline)?;
+    Some(format!("✉ from {} · {}", message.sender, message.input_id))
+}
+
 /// Each notice kind router-acp sends, by its headline, and how it is shortened. Anything else
 /// falls back to its first clause.
 const SUMMARIZERS: &[(Matcher, Summarizer)] = &[
+    (|h| h.starts_with(EXTERNAL), external),
     (|h| h.starts_with("delegate_task"), delegate_task),
     (|h| h.starts_with("switched "), switched),
     (|h| h.starts_with("failover: cordon"), cordon_failover),
@@ -320,6 +362,41 @@ fn plain(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block router-acp's `external_message::block` emits for a `send-input --from`.
+    const EXTERNAL: &str = "Checking the build.\n\n\
+        > router-acp · external message from repair agent · repair-hold:x:2026-11-01 (interrupt)\n\
+        > Stop run 7 now.\n>\n> Then report.\n\nStopping run 7.";
+
+    #[test]
+    fn an_external_message_is_split_out_with_its_sender_and_body() {
+        let segments = split(EXTERNAL);
+        assert_eq!(segments.len(), 3, "{segments:?}");
+        let Segment::Notice(notice) = &segments[1] else {
+            panic!("{segments:?}")
+        };
+        assert_eq!(
+            external_message(notice),
+            Some(ExternalMessage {
+                sender: "repair agent".into(),
+                input_id: "repair-hold:x:2026-11-01".into(),
+                delivery: "interrupt".into(),
+                body: "Stop run 7 now.\n\nThen report.".into(),
+            })
+        );
+        assert_eq!(
+            summary(notice),
+            "router-acp · ✉ from repair agent · repair-hold:x:2026-11-01"
+        );
+        let redelivery = external_message(
+            "router-acp · external message from an external agent · kill-7 (turn, delivery 2)",
+        )
+        .unwrap();
+        assert_eq!(redelivery.sender, "an external agent");
+        assert_eq!(redelivery.delivery, "turn, delivery 2");
+        assert!(redelivery.body.is_empty());
+        assert!(external_message("router-acp · switched a → b").is_none());
+    }
 
     const DELEGATE: &str = r#"router-acp · delegate_task → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · task Feature · planner → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · phase=implementation (pool: implementation_candidates + boost +3.00) · utility 3.63 = 0.84×quality 2.97→0.55 (Feature) + 0.16×quota (headroom 60%, cost rank 4) + pref 3.07 · tradeoff 3→1.6 (complexity-scaled) · "[router-acp planner role: implement-work] Policy identity...""#;
 
