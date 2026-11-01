@@ -791,7 +791,54 @@ pub fn print_status_line(line: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// Reply text, with each router-acp notice quoted in it shown as a tool-call line.
+/// Body lines an external message shows inline; the tool-call list (↑) holds the rest.
+const EXTERNAL_MESSAGE_LINES: usize = 40;
+
+/// The lines a message another agent sent this session shows as, unstyled: a header saying it
+/// is external and who sent it, then the message, so the operator sees what the agent was
+/// told and by whom. A re-delivery shows the header only.
+pub(super) fn external_message_lines(
+    message: &super::router_notices::ExternalMessage,
+) -> Vec<String> {
+    let delivery = if message.delivery.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", message.delivery)
+    };
+    let mut lines = vec![sanitize_terminal_line(&format!(
+        "✉ external message · from {} · {}{delivery}",
+        message.sender, message.input_id
+    ))];
+    let body: Vec<&str> = message.body.lines().collect();
+    for line in body.iter().take(EXTERNAL_MESSAGE_LINES) {
+        lines.push(format!("│ {}", sanitize_terminal_line(line)));
+    }
+    if body.len() > EXTERNAL_MESSAGE_LINES {
+        lines.push(format!(
+            "│ … {} more lines (↑ shows the whole message)",
+            body.len() - EXTERNAL_MESSAGE_LINES
+        ));
+    }
+    lines
+}
+
+fn print_external_message(message: &super::router_notices::ExternalMessage) {
+    if !at_line_start() {
+        outln!();
+    }
+    let mut lines = external_message_lines(message).into_iter();
+    if let Some(header) = lines.next() {
+        outln!("{}", style(header).magenta().bold());
+    }
+    for line in lines {
+        outln!("{}", style(line).magenta());
+    }
+    outln!();
+    let _ = std::io::stdout().flush();
+}
+
+/// Reply text, with each router-acp notice quoted in it shown as a tool-call line, except an
+/// external message, which is shown in full.
 fn render_reply_text(text: &str, buffer: &mut MarkdownBuffer, theme: Theme) {
     for segment in super::router_notices::split(text) {
         match segment {
@@ -802,6 +849,10 @@ fn render_reply_text(text: &str, buffer: &mut MarkdownBuffer, theme: Theme) {
             }
             super::router_notices::Segment::Notice(notice) => {
                 flush_markdown_buffer(buffer, theme);
+                if let Some(message) = super::router_notices::external_message(&notice) {
+                    print_external_message(&message);
+                    continue;
+                }
                 print_tool_call_line(&sanitize_terminal_line(&super::router_notices::summary(
                     &notice,
                 )));
@@ -1848,6 +1899,54 @@ mod tests {
             .to_string()
             .contains("Admitted the worker."));
         assert!(!is_capturing());
+    }
+
+    /// A message another agent sent through `router-acp send-input` is shown in full, marked
+    /// external and with its sender, never folded into a one-line notice.
+    #[test]
+    fn an_external_message_is_shown_with_its_sender_and_body() {
+        let mut buffer = MarkdownBuffer::new();
+        let mut thinking_header_shown = false;
+        let rendered = capture_output(|| {
+            render_message_streaming(
+                &Message::assistant().with_text(
+                    "> router-acp · external message from repair agent · hold:1 (steered)\n\
+                     > Stop run 7 now.\n\nStopping run 7.\n",
+                ),
+                &mut buffer,
+                &mut thinking_header_shown,
+                false,
+            );
+            flush_markdown_buffer_current_theme(&mut buffer);
+        });
+        let plain = strip_str(&rendered).to_string();
+        assert!(
+            plain.contains("✉ external message · from repair agent · hold:1 (steered)"),
+            "{plain}"
+        );
+        assert!(plain.contains("│ Stop run 7 now."), "{plain}");
+        assert!(plain.contains("Stopping run 7."), "{plain}");
+        assert!(!plain.contains("▸ router-acp"), "{plain}");
+    }
+
+    #[test]
+    fn a_long_external_message_points_at_the_full_text() {
+        let body = (1..=45)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = external_message_lines(&super::super::router_notices::ExternalMessage {
+            sender: "repair agent".into(),
+            input_id: "hold:1".into(),
+            delivery: String::new(),
+            body,
+        });
+        assert_eq!(lines[0], "✉ external message · from repair agent · hold:1");
+        assert_eq!(lines.len(), 1 + EXTERNAL_MESSAGE_LINES + 1);
+        assert_eq!(
+            lines.last().unwrap(),
+            "│ … 5 more lines (↑ shows the whole message)"
+        );
     }
 
     #[test]

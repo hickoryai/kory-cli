@@ -2519,11 +2519,7 @@ impl CliSession {
             return;
         }
         self.dock = None;
-        let router = root.clone().and_then(|id| {
-            RouterStateSource::configured()
-                .ok()
-                .map(|source| (source, id))
-        });
+        let router = RouterStateSource::configured().ok().zip(root.clone());
         let dock = child_sessions::dock::Dock::start(child_sessions::dock::Sources {
             session_manager: self.agent.config.session_manager.clone(),
             session_id: self.session_id.clone(),
