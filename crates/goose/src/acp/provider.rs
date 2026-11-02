@@ -2,8 +2,9 @@ use agent_client_protocol::schema::v1::{
     Annotations as AcpAnnotations, ClientCapabilities, CloseSessionRequest, ContentBlock,
     ContentChunk, EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse,
     LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
+    ElicitationCapabilities, ElicitationFormCapabilities, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
@@ -1805,7 +1806,11 @@ async fn handle_requests(
 ) -> Result<(), agent_client_protocol::Error> {
     let mut init_tx = Some(init_tx);
 
-    let client_capabilities = ClientCapabilities::new();
+    // router-acp translates provider-native question requests into ACP form
+    // elicitation only when the connected client advertises this capability.
+    // Without it, questions such as Grok's `_x.ai/ask_user_question` remain
+    // vendor-specific requests and cannot reach Kory's question UI.
+    let client_capabilities = client_capabilities();
     let init_response: InitializeResponse = cx
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1).client_capabilities(client_capabilities),
@@ -2011,6 +2016,11 @@ async fn handle_requests(
     }
 
     Ok(())
+}
+
+fn client_capabilities() -> ClientCapabilities {
+    ClientCapabilities::new()
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
 }
 
 async fn apply_session_config_options(
@@ -2653,6 +2663,12 @@ mod tests {
         ConfigOptionUpdate, ErrorCode, SessionConfigSelectGroup, SessionConfigSelectOption,
         SessionMode, SessionModeId,
     };
+
+    #[test]
+    fn client_capabilities_advertise_form_elicitation() {
+        let value = serde_json::to_value(client_capabilities()).unwrap();
+        assert_eq!(value["elicitation"]["form"], serde_json::json!({}));
+    }
 
     use test_case::test_case;
 
