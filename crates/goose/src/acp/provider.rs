@@ -445,6 +445,9 @@ pub struct AcpProvider {
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     /// The terminals this client hosts for the agent (and router-acp's `background_start`).
     terminals: TerminalManager,
+    /// Work the agent started with its own tools (a Monitor, a backgrounded Bash command),
+    /// as router-acp reports it in `_router/background` notifications.
+    native_backgrounds: Arc<Mutex<Vec<NativeBackground>>>,
     /// True after the first ACP prompt completes with the handoff context committed.
     /// Failed or abandoned first prompts reset this so the next prompt can retry it.
     handoff_context_sent: Arc<AtomicBool>,
@@ -583,6 +586,11 @@ impl AcpProvider {
         let (unsolicited, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         tokio::spawn(relay_unsolicited(unsolicited_rx, unsolicited.clone()));
         let (extension_notifications, _) = broadcast::channel(UNSOLICITED_CAPACITY);
+        let native_backgrounds = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(follow_native_backgrounds(
+            extension_notifications.subscribe(),
+            native_backgrounds.clone(),
+        ));
         let terminals = TerminalManager::new(config.work_dir.clone());
         let client_loop = AcpClientLoop::new(
             config,
@@ -637,6 +645,7 @@ impl AcpProvider {
             pending_elicitations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_tool_updates,
             terminals,
+            native_backgrounds,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
             context_used,
@@ -1099,11 +1108,32 @@ impl Provider for AcpProvider {
     }
 
     fn background_tasks(&self) -> Vec<crate::providers::base::BackgroundTask> {
-        self.terminals.running()
+        let mut tasks = self.terminals.running();
+        if let Ok(native) = self.native_backgrounds.lock() {
+            tasks.extend(native.iter().map(|native| native.task.clone()));
+        }
+        tasks.sort_by_key(|task| task.started_at);
+        tasks
     }
 
     fn background_output(&self, id: &str) -> Option<String> {
-        self.terminals.output_of(id)
+        if let Some(output) = self.terminals.output_of(id) {
+            return Some(output);
+        }
+        // A backgrounded Bash command writes to a file; a Monitor's output goes only to the
+        // agent, so its view says so.
+        let native = self
+            .native_backgrounds
+            .lock()
+            .ok()?
+            .iter()
+            .find(|native| native.task.id == id)
+            .cloned()?;
+        Some(match native.output_file {
+            Some(file) => tail_of_file(&file, 256 * 1024)
+                .unwrap_or_else(|error| format!("(cannot read {file}: {error})")),
+            None => "(this task's output goes to the agent only)".to_string(),
+        })
     }
 
     fn stop_background(&self, id: &str) -> bool {
@@ -2599,6 +2629,75 @@ fn acp_tool_call_content_to_rmcp(
     out
 }
 
+/// A task the agent started with its own tools, as `_router/background` reports it.
+#[derive(Clone, Debug)]
+struct NativeBackground {
+    task: crate::providers::base::BackgroundTask,
+    output_file: Option<String>,
+}
+
+const ROUTER_BACKGROUND_METHOD: &str = "_router/background";
+
+/// Keeps `native` in step with router-acp's `_router/background` notifications: a task is
+/// listed from `running` until `ended`.
+async fn follow_native_backgrounds(
+    mut notifications: broadcast::Receiver<ExtensionNotification>,
+    native: Arc<Mutex<Vec<NativeBackground>>>,
+) {
+    loop {
+        match notifications.recv().await {
+            Ok(notification) if notification.method == ROUTER_BACKGROUND_METHOD => {
+                if let Ok(mut native) = native.lock() {
+                    apply_native_background(&mut native, &notification.params);
+                }
+            }
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+fn apply_native_background(native: &mut Vec<NativeBackground>, params: &serde_json::Value) {
+    let task = &params["task"];
+    let Some(id) = task["id"].as_str() else {
+        return;
+    };
+    native.retain(|existing| existing.task.id != id);
+    if params["state"].as_str() != Some("running") {
+        return;
+    }
+    let started_at = task["startedAt"]
+        .as_i64()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    native.push(NativeBackground {
+        task: crate::providers::base::BackgroundTask {
+            id: id.to_string(),
+            kind: task["kind"].as_str().unwrap_or("background").to_string(),
+            command: task["command"].as_str().unwrap_or_default().to_string(),
+            started_at,
+            last_line: String::new(),
+        },
+        output_file: task["outputFile"].as_str().map(str::to_string),
+    });
+}
+
+/// The last `limit` bytes of a file, from a line start.
+fn tail_of_file(path: &str, limit: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(limit);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(match (start > 0, text.split_once('\n')) {
+        (true, Some((_, rest))) => rest.to_string(),
+        _ => text,
+    })
+}
+
 /// An `elicitation/create` request's question and its form's JSON schema; no schema for a
 /// mode other than a form (a URL to open), which the CLI cannot show.
 fn elicitation_form(request: &CreateElicitationRequest) -> (String, Option<serde_json::Value>) {
@@ -3047,6 +3146,7 @@ mod tests {
                 pending_elicitations: Arc::new(TokioMutex::new(HashMap::new())),
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
                 terminals: TerminalManager::new(std::env::temp_dir()),
+                native_backgrounds: Arc::new(Mutex::new(Vec::new())),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),
                 context_used: Arc::new(AtomicU64::new(0)),
@@ -5509,6 +5609,31 @@ mod tests {
             SteerOutcome::Unsupported
         );
         assert!(provider.steering_unsupported.load(Ordering::Acquire));
+    }
+
+    /// Work the agent starts with its own tools is listed from router-acp's
+    /// `_router/background` running notice until its ended one.
+    #[test]
+    fn native_background_work_follows_router_notifications() {
+        let mut native = Vec::new();
+        let running = serde_json::json!({"sessionId": "s", "state": "running", "task": {
+            "id": "bash_7", "kind": "shell", "command": "cargo build",
+            "startedAt": 1_793_736_940_000_i64, "outputFile": "/tmp/bash_7.out"}});
+        apply_native_background(&mut native, &running);
+        apply_native_background(&mut native, &running);
+        assert_eq!(native.len(), 1, "a repeated notice is one task");
+        assert_eq!(native[0].task.kind, "shell");
+        assert_eq!(native[0].task.command, "cargo build");
+        assert_eq!(
+            native[0].task.started_at.timestamp_millis(),
+            1_793_736_940_000
+        );
+        assert_eq!(native[0].output_file.as_deref(), Some("/tmp/bash_7.out"));
+        apply_native_background(
+            &mut native,
+            &serde_json::json!({"state": "ended", "reason": "finished", "task": {"id": "bash_7"}}),
+        );
+        assert!(native.is_empty());
     }
 
     /// The operator's report: an `/implement` parent asked a question (Claude's

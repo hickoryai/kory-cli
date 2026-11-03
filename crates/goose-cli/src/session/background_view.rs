@@ -61,6 +61,12 @@ impl BackgroundView {
         self.draw();
     }
 
+    /// A terminal this session hosts can be stopped here; work the agent's own tools run
+    /// (a monitor, a backgrounded shell) only the agent can stop.
+    fn stoppable(&self) -> bool {
+        matches!(self.kind.as_str(), "background" | "terminal")
+    }
+
     /// False when the view closes.
     pub fn key(&mut self, key: Key) -> bool {
         let (_, rows) = self.screen.size();
@@ -72,7 +78,7 @@ impl BackgroundView {
             Key::PageUp => self.back += page,
             Key::PageDown => self.back = self.back.saturating_sub(page),
             Key::End => self.back = 0,
-            Key::Char('s') if !self.ended => {
+            Key::Char('s') if !self.ended && self.stoppable() => {
                 self.notice = Some(if self.provider.stop_background(&self.id) {
                     "stopping…".to_string()
                 } else {
@@ -109,8 +115,10 @@ impl BackgroundView {
         );
         let keys = if self.ended {
             "↑↓ PgUp/PgDn scroll · End follow · q back"
-        } else {
+        } else if self.stoppable() {
             "↑↓ PgUp/PgDn scroll · End follow · s stop · q back"
+        } else {
+            "↑↓ PgUp/PgDn scroll · End follow · q back · the agent runs this one: ask it to stop it"
         };
         let footer = match &self.notice {
             Some(notice) => format!("{} · {}", style(notice).yellow(), style(keys).dim()),
