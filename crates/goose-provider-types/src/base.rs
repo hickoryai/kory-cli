@@ -357,6 +357,20 @@ pub type MessageStream = Pin<
 pub type MessageStream =
     Pin<Box<dyn Stream<Item = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>>>>;
 
+/// Work a provider runs for its session that outlives the tool call that started it: a
+/// command in a terminal the provider hosts, a monitor. Listed while it runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTask {
+    pub id: String,
+    /// What kind of work it is, as the session shows it: `background`, `terminal`, `monitor`.
+    pub kind: String,
+    /// The command line it runs.
+    pub command: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// The last line it printed, for a one-line activity.
+    pub last_line: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionRouting {
     ActionRequired,
@@ -856,6 +870,21 @@ pub trait Provider: MaybeSend + MaybeSync {
     /// `{"action":"accept","content":{…}}`, `{"action":"decline"}` or `{"action":"cancel"}`.
     /// False when `request_id` is not one of its questions.
     async fn handle_elicitation_response(&self, _request_id: &str, _response: &Value) -> bool {
+        false
+    }
+
+    /// The background work running for this provider's session, oldest first.
+    fn background_tasks(&self) -> Vec<BackgroundTask> {
+        Vec::new()
+    }
+
+    /// The output of one background task so far, `None` when it is not this provider's.
+    fn background_output(&self, _id: &str) -> Option<String> {
+        None
+    }
+
+    /// Stop one background task; false when it is not running here.
+    fn stop_background(&self, _id: &str) -> bool {
         false
     }
 }

@@ -21,7 +21,19 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{watch, Notify};
 
+use crate::providers::base::BackgroundTask;
 use crate::subprocess::configure_subprocess;
+
+/// The last non-empty line of a command's output, for a one-line activity.
+fn last_line(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
 
 /// Output cap applied when the agent does not request one, bounding memory for
 /// commands that emit unbounded output.
@@ -49,6 +61,12 @@ struct TerminalSession {
     buffer: Arc<Mutex<TerminalBuffer>>,
     exit_rx: watch::Receiver<Option<TerminalExitStatus>>,
     kill: Arc<Notify>,
+    /// The command line as the agent asked for it, for the session's list of running work.
+    command: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// router-acp's `background_start` marks its terminals; anything else the agent runs
+    /// through a terminal is shown as a plain terminal.
+    background: bool,
 }
 
 struct TerminalBuffer {
@@ -129,6 +147,17 @@ impl TerminalManager {
             .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
             .unwrap_or(DEFAULT_OUTPUT_BYTE_LIMIT);
         let session_id = request.session_id.0.to_string();
+        let command_line = std::iter::once(request.command.clone())
+            .chain(request.args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let background = request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("router_acp"))
+            .and_then(|router| router.get("managed_background"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let mut cmd = terminal_command(&request.command, &request.args);
         cmd.current_dir(&cwd)
@@ -187,10 +216,63 @@ impl TerminalManager {
                     buffer,
                     exit_rx,
                     kill,
+                    command: command_line,
+                    started_at: chrono::Utc::now(),
+                    background,
                 }),
             );
         }
         Ok(TerminalId::new(id))
+    }
+
+    /// Terminals whose command still runs, oldest first.
+    pub(crate) fn running(&self) -> Vec<BackgroundTask> {
+        let Ok(sessions) = self.inner.sessions.lock() else {
+            return Vec::new();
+        };
+        let mut running: Vec<BackgroundTask> = sessions
+            .iter()
+            .filter(|(_, session)| session.exit_rx.borrow().is_none())
+            .map(|(id, session)| BackgroundTask {
+                id: id.clone(),
+                kind: if session.background {
+                    "background".to_string()
+                } else {
+                    "terminal".to_string()
+                },
+                command: session.command.clone(),
+                started_at: session.started_at,
+                last_line: session
+                    .buffer
+                    .lock()
+                    .map(|buffer| last_line(&buffer.output()))
+                    .unwrap_or_default(),
+            })
+            .collect();
+        running.sort_by_key(|task| task.started_at);
+        running
+    }
+
+    /// A terminal's output so far (or its retained output once released), by id alone.
+    pub(crate) fn output_of(&self, id: &str) -> Option<String> {
+        self.resolve_output(id)
+    }
+
+    /// Stop a terminal's command by id alone; false when it is not running here.
+    pub(crate) fn kill_id(&self, id: &str) -> bool {
+        let session = self
+            .inner
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(id).cloned());
+        match session {
+            Some(session) if session.exit_rx.borrow().is_none() => {
+                session.kill.notify_one();
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn output(&self, session_id: &str, id: &str) -> Option<TerminalOutputResponse> {
@@ -507,6 +589,45 @@ mod tests {
         .unwrap();
 
         assert!(status.exit_code.is_none() || status.exit_code != Some(0));
+    }
+
+    /// The session lists the background work it hosts while it runs, and only then.
+    #[tokio::test]
+    async fn running_terminals_are_listed_until_they_end() {
+        let manager = TerminalManager::new(PathBuf::from("."));
+        let background = request("sh", &["-c", "echo watching; sleep 30"]).meta(
+            serde_json::json!({"router_acp": {"managed_background": true}})
+                .as_object()
+                .cloned(),
+        );
+        let id = manager.create(background).await.unwrap();
+        let plain = manager.create(request("sleep", &["30"])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let running = manager.running();
+        assert_eq!(running.len(), 2);
+        assert_eq!(running[0].id, id.0.as_ref());
+        assert_eq!(running[0].kind, "background");
+        assert_eq!(running[0].command, "sh -c echo watching; sleep 30");
+        assert_eq!(running[0].last_line, "watching");
+        assert_eq!(running[1].kind, "terminal");
+
+        assert!(manager.kill_id(id.0.as_ref()));
+        timeout(
+            Duration::from_secs(2),
+            manager.wait_for_exit("s", id.0.as_ref()),
+        )
+        .await
+        .expect("stopped terminal should exit promptly");
+        let running = manager.running();
+        assert_eq!(running.len(), 1, "an ended command leaves the list");
+        assert_eq!(running[0].id, plain.0.as_ref());
+        assert!(!manager.kill_id(id.0.as_ref()), "it is no longer running");
+        assert!(manager
+            .output_of(id.0.as_ref())
+            .unwrap()
+            .contains("watching"));
+        manager.kill_id(plain.0.as_ref());
     }
 
     #[tokio::test]

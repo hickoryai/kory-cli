@@ -443,6 +443,8 @@ pub struct AcpProvider {
     /// Questions the agent asked, by the action-required id the session answers.
     pending_elicitations: Arc<TokioMutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
+    /// The terminals this client hosts for the agent (and router-acp's `background_start`).
+    terminals: TerminalManager,
     /// True after the first ACP prompt completes with the handoff context committed.
     /// Failed or abandoned first prompts reset this so the next prompt can retry it.
     handoff_context_sent: Arc<AtomicBool>,
@@ -581,6 +583,7 @@ impl AcpProvider {
         let (unsolicited, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         tokio::spawn(relay_unsolicited(unsolicited_rx, unsolicited.clone()));
         let (extension_notifications, _) = broadcast::channel(UNSOLICITED_CAPACITY);
+        let terminals = TerminalManager::new(config.work_dir.clone());
         let client_loop = AcpClientLoop::new(
             config,
             goose_mode_shared.clone(),
@@ -591,6 +594,7 @@ impl AcpProvider {
             unsolicited_tx.clone(),
             connection.clone(),
             extension_notifications.clone(),
+            terminals.clone(),
         );
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx, cancel_rx));
@@ -632,6 +636,7 @@ impl AcpProvider {
             pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_elicitations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_tool_updates,
+            terminals,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
             context_used,
@@ -1093,6 +1098,18 @@ impl Provider for AcpProvider {
         false
     }
 
+    fn background_tasks(&self) -> Vec<crate::providers::base::BackgroundTask> {
+        self.terminals.running()
+    }
+
+    fn background_output(&self, id: &str) -> Option<String> {
+        self.terminals.output_of(id)
+    }
+
+    fn stop_background(&self, id: &str) -> bool {
+        self.terminals.kill_id(id)
+    }
+
     async fn handle_elicitation_response(
         &self,
         request_id: &str,
@@ -1393,6 +1410,7 @@ struct AcpClientLoop {
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
     connection: SharedConnection,
     extension_notifications: broadcast::Sender<ExtensionNotification>,
+    terminals: TerminalManager,
 }
 
 impl AcpClientLoop {
@@ -1407,6 +1425,7 @@ impl AcpClientLoop {
         unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
         connection: SharedConnection,
         extension_notifications: broadcast::Sender<ExtensionNotification>,
+        terminals: TerminalManager,
     ) -> Self {
         Self {
             config,
@@ -1419,6 +1438,7 @@ impl AcpClientLoop {
             unsolicited_tx,
             connection,
             extension_notifications,
+            terminals,
         }
     }
 
@@ -1478,11 +1498,11 @@ impl AcpClientLoop {
             unsolicited_tx,
             connection,
             extension_notifications,
+            terminals: terminal_manager,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
         let terminal_enabled = config.terminal;
-        let terminal_manager = TerminalManager::new(config.work_dir.clone());
         let session_state = AcpSessionState::new(effort, terminal_manager.clone());
 
         Client
@@ -3026,6 +3046,7 @@ mod tests {
                 pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
                 pending_elicitations: Arc::new(TokioMutex::new(HashMap::new())),
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
+                terminals: TerminalManager::new(std::env::temp_dir()),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),
                 context_used: Arc::new(AtomicU64::new(0)),

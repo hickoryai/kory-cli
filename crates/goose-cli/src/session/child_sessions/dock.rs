@@ -111,6 +111,8 @@ pub struct Sources {
     pub session_manager: Arc<SessionManager>,
     pub session_id: String,
     pub router: Option<(RouterStateSource, String)>,
+    /// The session's agent, whose provider runs its background work (terminals, monitors).
+    pub agent: Option<Arc<goose::agents::Agent>>,
 }
 
 impl Dock {
@@ -934,9 +936,31 @@ async fn load_rows(sources: &Sources, turn_active: bool) -> Option<Vec<ChildRow>
             .ok()?;
         rows.extend(router::dock_rows(&delegates, root, chrono::Utc::now()));
     }
+    if let Some(agent) = &sources.agent {
+        if let Ok(provider) = agent.provider(&sources.session_id).await {
+            rows.extend(background_rows(provider.background_tasks()));
+        }
+    }
     rows.retain(|row| row.status == ChildStatus::Running);
     rows.reverse();
     Some(rows)
+}
+
+/// Background work as rows of the children list: its kind where a child shows its model,
+/// how long it has run, the command, and the last line it printed. A task that ends leaves
+/// the list the way a finished child does.
+fn background_rows(tasks: Vec<goose::providers::base::BackgroundTask>) -> Vec<ChildRow> {
+    tasks
+        .into_iter()
+        .map(|task| ChildRow {
+            id: format!("{}{}", super::super::background_view::ROW_PREFIX, task.id),
+            label: task.command,
+            status: ChildStatus::Running,
+            model: task.kind,
+            started_at: Some(task.started_at),
+            activity: task.last_line,
+        })
+        .collect()
 }
 
 fn terminal_size() -> (usize, usize) {
@@ -1306,6 +1330,34 @@ mod tests {
         assert_eq!(rows(&dock), 2, "a timed-out query is not an empty list");
         dock.shared.update(Some(Vec::new()));
         assert_eq!(rows(&dock), 0);
+    }
+
+    /// Background work sits in the children list: its kind where a child shows its model,
+    /// the time it has run and its command.
+    #[test]
+    fn background_work_is_listed_with_its_kind_time_and_command() {
+        let rows = background_rows(vec![goose::providers::base::BackgroundTask {
+            id: "term-3".into(),
+            kind: "background".into(),
+            command: "cargo build --release".into(),
+            started_at: chrono::Utc::now() - chrono::Duration::minutes(3),
+            last_line: "Compiling goose".into(),
+        }]);
+        let state = State {
+            rows,
+            ..State::default()
+        };
+        let lines = painted(&state, 100, 40);
+        let row = lines
+            .iter()
+            .find(|line| line.contains("cargo build"))
+            .expect("the task is listed");
+        assert!(row.contains("background [3m] cargo build --release"), "{row}");
+        assert!(row.contains("Compiling goose"), "{row}");
+        assert_eq!(
+            super::super::super::background_view::task_id(&state.rows[0]),
+            Some("term-3")
+        );
     }
 
     #[test]

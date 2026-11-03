@@ -1,3 +1,4 @@
+mod background_view;
 mod builder;
 mod child_sessions;
 mod completion;
@@ -1540,6 +1541,8 @@ impl CliSession {
         let mut handed_to_goose: Vec<String> = Vec::new();
         // ↑ from the input line with nothing queued: the session's tool calls, full screen.
         let mut tool_view: Option<tool_calls::ToolCallsView> = None;
+        // A background task chosen from the children list, full screen.
+        let mut background: Option<background_view::BackgroundView> = None;
         // A `/shutdown`'s progress, and its lines held while a full-screen view is open.
         let mut shutdown_rx = self.take_shutdown_notifications();
         let mut held_status: Vec<String> = Vec::new();
@@ -1548,6 +1551,17 @@ impl CliSession {
         loop {
             tokio::select! {
                 key = children.next_key() => {
+                    // A background task's output, while open, takes every key but Ctrl-C.
+                    if let Some(view) = background.as_mut() {
+                        if key == child_sessions::Key::Interrupt {
+                            cancel_token_clone.cancel();
+                        } else if !view.key(key) {
+                            background = None;
+                            print_held_status(&mut held_status);
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                        }
+                        continue;
+                    }
                     // The tool-call list, while open, takes every key but Ctrl-C.
                     if let Some(view) = tool_view.as_mut() {
                         if key == child_sessions::Key::Interrupt {
@@ -1642,7 +1656,13 @@ impl CliSession {
                             if let Some(child) = chosen {
                                 output::hide_thinking();
                                 let _ = progress_bars.hide();
-                                children.open_at(&child, true).await;
+                                if background_view::task_id(&child).is_some() {
+                                    if let Ok(provider) = self.agent.provider(&self.session_id).await {
+                                        background = background_view::BackgroundView::open(provider, &child);
+                                    }
+                                } else {
+                                    children.open_at(&child, true).await;
+                                }
                             }
                             continue;
                         }
@@ -1660,7 +1680,7 @@ impl CliSession {
                 }
                 notification = shutdown::next_notification(&mut shutdown_rx) => {
                     let lines = self.take_shutdown_progress(&notification);
-                    if children.is_open() || tool_view.is_some() {
+                    if children.is_open() || tool_view.is_some() || background.is_some() {
                         held_status.extend(lines);
                     } else if !lines.is_empty() {
                         output::hide_thinking();
@@ -1673,7 +1693,7 @@ impl CliSession {
                     let Some(dock) = self.dock() else { continue };
                     let (delivered, echo) = settle_steer(dock, text, outcome, &mut handed_to_goose);
                     if let Some(echo) = &echo {
-                        if children.is_open() || tool_view.is_some() {
+                        if children.is_open() || tool_view.is_some() || background.is_some() {
                             deferred_messages.push(echo.clone());
                         } else {
                             output::hide_thinking();
@@ -1690,6 +1710,9 @@ impl CliSession {
                 }
                 _ = refresh_context.tick(), if self.dock().is_some() => {
                     let _ = self.display_context_usage().await;
+                    if let Some(view) = background.as_mut() {
+                        view.refresh();
+                    }
                 }
                 _ = refresh_children.tick(), if children.is_open() || children.watches_router() => {
                     if children.is_open() {
@@ -1714,6 +1737,7 @@ impl CliSession {
                             if needs_terminal {
                                 drop(extended_keys.take());
                                 tool_view = None;
+                                background = None;
                                 children.suspend();
                                 render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             }
@@ -1857,7 +1881,7 @@ impl CliSession {
                                 } else if let Some(view) = tool_view.as_mut() {
                                     view.refresh(tool_calls::collect(self.messages.messages()));
                                     deferred_messages.push(message);
-                                } else if children.is_open() {
+                                } else if children.is_open() || background.is_some() {
                                     deferred_messages.push(message);
                                 } else if !is_json_mode {
                                     output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
@@ -1878,7 +1902,7 @@ impl CliSession {
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
                         Some(Ok(AgentEvent::McpNotification(_)))
-                            if children.is_open() || tool_view.is_some() => {}
+                            if children.is_open() || tool_view.is_some() || background.is_some() => {}
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
                             handle_mcp_notification(
                                 &extension_id,
@@ -1895,6 +1919,7 @@ impl CliSession {
                         }
                         Some(Err(e)) => {
                             tool_view = None;
+                            background = None;
                             children.suspend();
                             render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             if interactive || !is_stream_json_mode {
@@ -1920,6 +1945,7 @@ impl CliSession {
                 }
                 _ = cancel_token_clone.cancelled() => {
                     tool_view = None;
+                    background = None;
                     children.suspend();
                     render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                     drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
@@ -1932,6 +1958,7 @@ impl CliSession {
             }
         }
         drop(tool_view);
+        drop(background);
         drop(children);
         print_held_status(&mut held_status);
         self.return_shutdown_notifications(shutdown_rx);
@@ -2549,6 +2576,7 @@ impl CliSession {
             session_manager: self.agent.config.session_manager.clone(),
             session_id: self.session_id.clone(),
             router,
+            agent: Some(self.agent.clone()),
         });
         self.dock = dock.map(|dock| (root, dock));
     }
@@ -2753,6 +2781,30 @@ impl CliSession {
         quitting
     }
 
+    /// A background task chosen from the children list, full screen until q or Esc; its
+    /// output keeps arriving while it shows.
+    async fn view_background(&self, row: &child_sessions::ChildRow) {
+        let Ok(provider) = self.agent.provider(&self.session_id).await else {
+            return;
+        };
+        let Some(mut view) = background_view::BackgroundView::open(provider, row) else {
+            return;
+        };
+        let Ok(mut keys) = child_sessions::KeyReader::start() else {
+            return;
+        };
+        let mut refresh = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            tokio::select! {
+                key = keys.next() => match key {
+                    Some(key) if view.key(key) => {}
+                    _ => break,
+                },
+                _ = refresh.tick() => view.refresh(),
+            }
+        }
+    }
+
     /// ↓ on an empty prompt: ↑/↓ choose a child, Enter (or a click) opens it in the
     /// navigator, Esc or ↑ past the first row returns to the prompt.
     async fn focus_dock(&mut self) {
@@ -2782,7 +2834,11 @@ impl CliSession {
             };
             if let Some(child) = chosen {
                 drop(keys);
-                navigator.browse_at(&child).await;
+                if background_view::task_id(&child).is_some() {
+                    self.view_background(&child).await;
+                } else {
+                    navigator.browse_at(&child).await;
+                }
                 keys = match child_sessions::KeyReader::start() {
                     Ok(keys) => keys,
                     Err(_) => break,
