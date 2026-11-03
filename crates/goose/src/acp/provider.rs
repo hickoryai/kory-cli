@@ -448,6 +448,8 @@ pub struct AcpProvider {
     /// Work the agent started with its own tools (a Monitor, a backgrounded Bash command),
     /// as router-acp reports it in `_router/background` notifications.
     native_backgrounds: Arc<Mutex<Vec<NativeBackground>>>,
+    /// The goal router-acp holds the session to, from its `_router/goal` notifications.
+    session_goal: Arc<Mutex<Option<crate::providers::base::SessionGoal>>>,
     /// True after the first ACP prompt completes with the handoff context committed.
     /// Failed or abandoned first prompts reset this so the next prompt can retry it.
     handoff_context_sent: Arc<AtomicBool>,
@@ -587,9 +589,11 @@ impl AcpProvider {
         tokio::spawn(relay_unsolicited(unsolicited_rx, unsolicited.clone()));
         let (extension_notifications, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         let native_backgrounds = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(follow_native_backgrounds(
+        let session_goal = Arc::new(Mutex::new(None));
+        tokio::spawn(follow_router_state(
             extension_notifications.subscribe(),
             native_backgrounds.clone(),
+            session_goal.clone(),
         ));
         let terminals = TerminalManager::new(config.work_dir.clone());
         let client_loop = AcpClientLoop::new(
@@ -646,6 +650,7 @@ impl AcpProvider {
             pending_tool_updates,
             terminals,
             native_backgrounds,
+            session_goal,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
             context_used,
@@ -1105,6 +1110,10 @@ impl Provider for AcpProvider {
             return true;
         }
         false
+    }
+
+    fn session_goal(&self) -> Option<crate::providers::base::SessionGoal> {
+        self.session_goal.lock().ok()?.clone()
     }
 
     fn background_tasks(&self) -> Vec<crate::providers::base::BackgroundTask> {
@@ -2637,12 +2646,14 @@ struct NativeBackground {
 }
 
 const ROUTER_BACKGROUND_METHOD: &str = "_router/background";
+const ROUTER_GOAL_METHOD: &str = "_router/goal";
 
-/// Keeps `native` in step with router-acp's `_router/background` notifications: a task is
-/// listed from `running` until `ended`.
-async fn follow_native_backgrounds(
+/// Keeps the provider in step with router-acp's notifications: a native task is listed from
+/// its `running` notice until `ended`, and the session's goal is the last one reported.
+async fn follow_router_state(
     mut notifications: broadcast::Receiver<ExtensionNotification>,
     native: Arc<Mutex<Vec<NativeBackground>>>,
+    goal: Arc<Mutex<Option<crate::providers::base::SessionGoal>>>,
 ) {
     loop {
         match notifications.recv().await {
@@ -2651,10 +2662,24 @@ async fn follow_native_backgrounds(
                     apply_native_background(&mut native, &notification.params);
                 }
             }
+            Ok(notification) if notification.method == ROUTER_GOAL_METHOD => {
+                if let Ok(mut goal) = goal.lock() {
+                    *goal = reported_goal(&notification.params);
+                }
+            }
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
             Err(broadcast::error::RecvError::Closed) => return,
         }
     }
+}
+
+/// The goal in a `_router/goal` notification; `null` when the session has none.
+fn reported_goal(params: &serde_json::Value) -> Option<crate::providers::base::SessionGoal> {
+    let goal = params.get("goal")?;
+    Some(crate::providers::base::SessionGoal {
+        objective: goal.get("objective")?.as_str()?.to_string(),
+        status: goal.get("status")?.as_str()?.to_string(),
+    })
 }
 
 fn apply_native_background(native: &mut Vec<NativeBackground>, params: &serde_json::Value) {
@@ -3147,6 +3172,7 @@ mod tests {
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
                 terminals: TerminalManager::new(std::env::temp_dir()),
                 native_backgrounds: Arc::new(Mutex::new(Vec::new())),
+                session_goal: Arc::new(Mutex::new(None)),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),
                 context_used: Arc::new(AtomicU64::new(0)),

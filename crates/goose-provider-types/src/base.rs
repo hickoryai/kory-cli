@@ -371,6 +371,14 @@ pub struct BackgroundTask {
     pub last_line: String,
 }
 
+/// The objective a provider holds the session to (router-acp's `/goal`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGoal {
+    pub objective: String,
+    /// `active`, `met`, `unmeetable` or `stalled`.
+    pub status: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionRouting {
     ActionRequired,
@@ -871,6 +879,11 @@ pub trait Provider: MaybeSend + MaybeSync {
     /// False when `request_id` is not one of its questions.
     async fn handle_elicitation_response(&self, _request_id: &str, _response: &Value) -> bool {
         false
+    }
+
+    /// The goal this provider holds its session to, when it holds one.
+    fn session_goal(&self) -> Option<SessionGoal> {
+        None
     }
 
     /// The background work running for this provider's session, oldest first.

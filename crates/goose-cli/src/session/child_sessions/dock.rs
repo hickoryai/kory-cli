@@ -95,6 +95,24 @@ struct State {
     notice: Option<String>,
     /// A question is open in the transcript above and takes the keys, not the input box.
     question: bool,
+    /// The goal the session is held to, shown on the status line.
+    goal: Option<goose::providers::base::SessionGoal>,
+    /// ↑ selected the goal: the next key edits or removes it, or moves on.
+    goal_selected: bool,
+}
+
+/// What a key does to a selected goal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoalKey {
+    /// Enter: its objective, to edit in the input box.
+    Edit(String),
+    /// Backspace or Delete.
+    Remove,
+    /// ↑ again: on to the tool calls.
+    ToolCalls,
+    /// ↓ or Esc.
+    Back,
+    Stay,
 }
 
 struct Shared {
@@ -144,6 +162,14 @@ impl Dock {
         let task = tokio::spawn(async move {
             loop {
                 let turn_active = painter.state.lock().unwrap().turn_started.is_some();
+                let goal = load_goal(&sources).await;
+                {
+                    let mut state = painter.state.lock().unwrap();
+                    if goal.is_none() {
+                        state.goal_selected = false;
+                    }
+                    state.goal = goal;
+                }
                 painter.update(load_rows(&sources, turn_active).await);
                 tokio::time::sleep(REPAINT).await;
             }
@@ -436,6 +462,47 @@ impl Dock {
         selecting
     }
 
+    /// ↑ on an empty input box: selects the goal when there is one.
+    pub fn select_goal(&self) -> bool {
+        let selected = {
+            let mut state = self.shared.state.lock().unwrap();
+            state.goal_selected = state.goal.is_some() && !state.goal_selected;
+            state.goal_selected
+        };
+        relay::repaint();
+        selected
+    }
+
+    pub fn is_goal_selected(&self) -> bool {
+        self.shared.state.lock().unwrap().goal_selected
+    }
+
+    /// A router session's goal can change mid-turn through `_router/goal`.
+    pub fn is_routed(&self) -> bool {
+        self.shared.state.lock().unwrap().always_list
+    }
+
+    /// A key while the goal is selected; anything but `Stay` ends the selection.
+    pub fn goal_key(&self, key: Key) -> GoalKey {
+        let action = {
+            let mut state = self.shared.state.lock().unwrap();
+            let objective = state.goal.as_ref().map(|goal| goal.objective.clone());
+            let action = match (key, objective) {
+                (Key::Enter, Some(objective)) => GoalKey::Edit(objective),
+                (Key::Backspace | Key::Delete, Some(_)) => GoalKey::Remove,
+                (Key::Up, _) => GoalKey::ToolCalls,
+                (Key::Down | Key::Escape, _) | (_, None) => GoalKey::Back,
+                _ => GoalKey::Stay,
+            };
+            if action != GoalKey::Stay {
+                state.goal_selected = false;
+            }
+            action
+        };
+        relay::repaint();
+        action
+    }
+
     pub fn clear_selection(&self) {
         {
             let mut state = self.shared.state.lock().unwrap();
@@ -709,6 +776,27 @@ fn pane(state: &State, cols: usize, lines: usize) -> Vec<String> {
     out
 }
 
+/// The goal on the status line: its state and its objective's first line, reversed while
+/// selected.
+fn goal_label(goal: &goose::providers::base::SessionGoal, selected: bool) -> String {
+    let objective = goal.objective.lines().next().unwrap_or_default();
+    let text = match goal.status.as_str() {
+        "met" => format!("✓ goal met: {objective}"),
+        "unmeetable" => format!("✗ goal unmeetable: {objective}"),
+        "stalled" => format!("⚠ goal stalled: {objective}"),
+        _ => format!("◎ goal: {objective}"),
+    };
+    if selected {
+        style(text).reverse().to_string()
+    } else {
+        match goal.status.as_str() {
+            "met" => style(text).green().to_string(),
+            "unmeetable" | "stalled" => style(text).yellow().to_string(),
+            _ => style(text).magenta().to_string(),
+        }
+    }
+}
+
 /// What the session is doing on the left, the context window on the right.
 fn status_line(state: &State, width: usize) -> String {
     let mut left = Vec::new();
@@ -725,6 +813,9 @@ fn status_line(state: &State, width: usize) -> String {
     let queued = state.queued.len() + usize::from(state.steering.is_some());
     if queued > 0 {
         left.push(style(format!("{queued} queued")).dim().to_string());
+    }
+    if let Some(goal) = &state.goal {
+        left.push(goal_label(goal, state.goal_selected));
     }
     let left = format!("  {}", left.join(&style(" · ").dim().to_string()));
     let right = state
@@ -809,6 +900,8 @@ fn children_summary(state: &State, width: usize) -> String {
     };
     let keys = if state.question {
         String::new()
+    } else if state.goal_selected {
+        "goal: Enter edit · Delete remove · ↑ tool calls · Esc back".to_string()
     } else if state.selected.is_some() {
         "↑↓ select · Enter open · Esc back".to_string()
     } else {
@@ -944,6 +1037,12 @@ async fn load_rows(sources: &Sources, turn_active: bool) -> Option<Vec<ChildRow>
     rows.retain(|row| row.status == ChildStatus::Running);
     rows.reverse();
     Some(rows)
+}
+
+async fn load_goal(sources: &Sources) -> Option<goose::providers::base::SessionGoal> {
+    let agent = sources.agent.as_ref()?;
+    let provider = agent.provider(&sources.session_id).await.ok()?;
+    provider.session_goal()
 }
 
 /// Background work as rows of the children list: its kind where a child shows its model,
@@ -1352,11 +1451,63 @@ mod tests {
             .iter()
             .find(|line| line.contains("cargo build"))
             .expect("the task is listed");
-        assert!(row.contains("background [3m] cargo build --release"), "{row}");
+        assert!(
+            row.contains("background [3m] cargo build --release"),
+            "{row}"
+        );
         assert!(row.contains("Compiling goose"), "{row}");
         assert_eq!(
             super::super::super::background_view::task_id(&state.rows[0]),
             Some("term-3")
+        );
+    }
+
+    fn goal(status: &str) -> goose::providers::base::SessionGoal {
+        goose::providers::base::SessionGoal {
+            objective: "ship the release\nwith smokes green".into(),
+            status: status.into(),
+        }
+    }
+
+    /// The goal sits next to "working" above the input; ↑ selects it, and from there Enter
+    /// edits it, Delete removes it, ↑ moves on to the tool calls and Esc goes back.
+    #[tokio::test]
+    async fn the_goal_shows_by_working_and_up_selects_it() {
+        let dock = in_turn();
+        assert!(!dock.select_goal(), "no goal to select");
+        dock.shared.state.lock().unwrap().goal = Some(goal("active"));
+        let lines = painted(&dock.shared.state.lock().unwrap(), 100, 40);
+        assert!(
+            lines[0].contains("✻ working 0s · ◎ goal: ship the release"),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("smokes"), "its first line: {lines:?}");
+
+        assert!(dock.select_goal());
+        let lines = painted(&dock.shared.state.lock().unwrap(), 100, 40);
+        assert!(
+            lines[4].contains("goal: Enter edit · Delete remove"),
+            "{lines:?}"
+        );
+        assert_eq!(dock.goal_key(Key::Char('x')), GoalKey::Stay);
+        assert!(dock.is_goal_selected());
+        assert_eq!(
+            dock.goal_key(Key::Enter),
+            GoalKey::Edit("ship the release\nwith smokes green".into())
+        );
+        assert!(!dock.is_goal_selected());
+        dock.select_goal();
+        assert_eq!(dock.goal_key(Key::Delete), GoalKey::Remove);
+        dock.select_goal();
+        assert_eq!(dock.goal_key(Key::Up), GoalKey::ToolCalls);
+        dock.select_goal();
+        assert_eq!(dock.goal_key(Key::Escape), GoalKey::Back);
+
+        dock.shared.state.lock().unwrap().goal = Some(goal("met"));
+        let lines = painted(&dock.shared.state.lock().unwrap(), 100, 40);
+        assert!(
+            lines[0].contains("✓ goal met: ship the release"),
+            "{lines:?}"
         );
     }
 

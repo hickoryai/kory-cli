@@ -575,6 +575,24 @@ async fn read_in_pane(
             walk.back = None;
         }
         let empty = pane.input_text().is_empty();
+        // The selected goal takes the keys until it is edited, removed or left.
+        if key != Key::Interrupt && pane.is_goal_selected() {
+            use super::child_sessions::dock::GoalKey;
+            match pane.goal_key(key) {
+                GoalKey::Edit(objective) => {
+                    pane.set_input(&format!("/goal {objective}"), usize::MAX)
+                }
+                GoalKey::Remove => return Ok(PaneRead::Text("/goal clear".to_string())),
+                GoalKey::ToolCalls => {
+                    if super::tool_calls::request_focus() {
+                        super::tool_calls::take_focus_request();
+                        return Ok(PaneRead::Result(InputResult::ToolFocus));
+                    }
+                }
+                GoalKey::Back | GoalKey::Stay => {}
+            }
+            continue;
+        }
         match key {
             Key::Interrupt => {
                 let mut cache = completion_cache.write().unwrap();
@@ -599,6 +617,7 @@ async fn read_in_pane(
             Key::Eof if empty => return Ok(PaneRead::Result(InputResult::Exit)),
             Key::Up if pane.move_vertical(-1) => {}
             Key::Down if pane.move_vertical(1) => {}
+            Key::Up if empty && walk.back.is_none() && pane.select_goal() => {}
             Key::Up if empty && walk.back.is_none() && super::tool_calls::request_focus() => {
                 super::tool_calls::take_focus_request();
                 return Ok(PaneRead::Result(InputResult::ToolFocus));
@@ -896,6 +915,8 @@ Ctrl+C - Clear current line if text is entered, otherwise exit the session
 Up on an empty prompt - Select the session's tool calls (Up/Down move, Enter shows one, Esc returns)
 Ctrl+P/Ctrl+N - Navigate through command history (also Up/Down while the prompt has text)
 Down on an empty prompt - Select a running child session in the dock
+/goal <objective> - Keep working until the objective is met; /goal shows it, /goal clear drops it
+Up on an empty prompt, with a goal - Select the goal (Enter edits, Delete removes, Up moves on)
 Wheel or PageUp/PageDown - Scroll the transcript; typing or the Jump to bottom pill returns
 Shift+drag - Select text while the wheel scrolls the transcript
 Tab (while subagents run) - Open the read-only child session navigator; Tab, q or Esc closes it

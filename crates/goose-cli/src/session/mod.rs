@@ -1580,7 +1580,44 @@ impl CliSession {
                     .then(|| self.dock().filter(|dock| !dock.is_selecting()).map(|dock| dock.input_text()))
                     .flatten()
                     .filter(|text| !text.trim().is_empty());
+                    // The selected goal takes the keys until it is edited, removed or left.
+                    if key != child_sessions::Key::Interrupt
+                        && !children.is_open()
+                        && self.dock().is_some_and(|dock| dock.is_goal_selected())
+                    {
+                        use child_sessions::dock::GoalKey;
+                        let action = self.dock().map(|dock| dock.goal_key(key));
+                        match action {
+                            Some(GoalKey::Edit(objective)) => {
+                                if let Some(dock) = self.dock() {
+                                    dock.set_input(&format!("/goal {objective}"), usize::MAX);
+                                }
+                            }
+                            Some(GoalKey::Remove) => self.change_goal(None).await,
+                            Some(GoalKey::ToolCalls) => {
+                                let calls = tool_calls::collect(self.messages.messages());
+                                if !calls.is_empty() {
+                                    output::hide_thinking();
+                                    let _ = progress_bars.hide();
+                                    tool_view = tool_calls::ToolCallsView::open(calls);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if let Some(text) = typed {
+                        // `/goal …` during a turn changes the goal at router-acp; steered at
+                        // the agent it would be only text.
+                        if let Some(change) = goal_edit(&text)
+                            .filter(|_| self.dock().is_some_and(|dock| dock.is_routed()))
+                        {
+                            if let Some(dock) = self.dock() {
+                                dock.clear_input();
+                            }
+                            self.change_goal(change).await;
+                            continue;
+                        }
                         let gate = self.shutdown_gate();
                         if text.trim() == "/shutdown" || gate != shutdown::Gate::Open {
                             output::hide_thinking();
@@ -1621,6 +1658,14 @@ impl CliSession {
                                 }
                                 Key::Up if dock.move_vertical(-1) => None,
                                 Key::Down if !dock.is_selecting() && dock.move_vertical(1) => None,
+                                // ↑ reaches the goal first, then the tool calls.
+                                Key::Up
+                                    if !dock.has_queued()
+                                        && dock.input_text().is_empty()
+                                        && dock.select_goal() =>
+                                {
+                                    None
+                                }
                                 // Nothing queued to take back: ↑ moves into the tool calls.
                                 Key::Up if !dock.has_queued() => {
                                     let calls = tool_calls::collect(self.messages.messages());
@@ -2781,6 +2826,21 @@ impl CliSession {
         quitting
     }
 
+    /// Sets (`Some`) or removes (`None`) the goal router-acp holds this session to, without a
+    /// prompt, as while a turn runs.
+    async fn change_goal(&self, objective: Option<String>) {
+        let Ok(provider) = self.agent.provider(&self.session_id).await else {
+            return;
+        };
+        let params = match &objective {
+            Some(objective) => serde_json::json!({"action": "set", "objective": objective}),
+            None => serde_json::json!({"action": "clear"}),
+        };
+        if let Err(error) = provider.extension_request("_router/goal", params).await {
+            output::print_status_line(&format!("the goal did not change: {error}"));
+        }
+    }
+
     /// A background task chosen from the children list, full screen until q or Esc; its
     /// output keeps arriving while it shows.
     async fn view_background(&self, row: &child_sessions::ChildRow) {
@@ -3057,6 +3117,18 @@ async fn next_key(keys: &mut Option<child_sessions::KeyReader>) -> child_session
             },
             None => std::future::pending::<()>().await,
         }
+    }
+}
+
+/// The change a `/goal …` line asks for: `Some(Some(objective))` to set, `Some(None)` to
+/// remove, `None` when the line is something else (a bare `/goal` only asks what the goal is,
+/// which the status line shows).
+fn goal_edit(text: &str) -> Option<Option<String>> {
+    let rest = text.trim().strip_prefix("/goal ")?.trim();
+    match rest {
+        "" => None,
+        "clear" | "off" | "none" | "stop" | "cancel" => Some(None),
+        objective => Some(Some(objective.to_string())),
     }
 }
 
