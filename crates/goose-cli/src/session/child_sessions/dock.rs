@@ -93,6 +93,8 @@ struct State {
     /// A one-time notice under the input box, cleared by the next key (e.g. "Ctrl-C again
     /// to exit").
     notice: Option<String>,
+    /// A question is open in the transcript above and takes the keys, not the input box.
+    question: bool,
 }
 
 struct Shared {
@@ -571,6 +573,7 @@ pub struct Hidden;
 
 impl Hidden {
     pub fn new() -> Self {
+        with_active(|shared| shared.state.lock().unwrap().question = true);
         suspend();
         Self
     }
@@ -584,6 +587,7 @@ impl Default for Hidden {
 
 impl Drop for Hidden {
     fn drop(&mut self) {
+        with_active(|shared| shared.state.lock().unwrap().question = false);
         resume();
     }
 }
@@ -665,7 +669,15 @@ fn pane(state: &State, cols: usize, lines: usize) -> Vec<String> {
     let width = cols.saturating_sub(1);
     let rule = style("─".repeat(width)).dim().to_string();
     let mut out = vec![status_line(state, width), rule.clone()];
-    out.extend(input_rows(state, cols));
+    if state.question {
+        out.push(format!(
+            "{} {}",
+            style("↑").yellow().bold(),
+            style("Answer the question above: ↑↓ to move, Enter to choose, Esc to cancel").yellow()
+        ));
+    } else {
+        out.extend(input_rows(state, cols));
+    }
     out.push(rule);
     if let Some(notice) = &state.notice {
         out.push(style(format!("  {notice}")).yellow().to_string());
