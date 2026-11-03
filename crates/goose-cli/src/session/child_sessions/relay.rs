@@ -148,8 +148,13 @@ fn start() -> Option<Arc<Relay>> {
             close_all(&[master, slave, wake[0], wake[1]]);
             return None;
         }
-        // The session keeps the terminal settings it had; the relay reads the real terminal raw.
-        libc::tcsetattr(slave, libc::TCSANOW, &real_termios);
+        // The session keeps the terminal settings it had, but without echo: keys typed while
+        // nothing reads them (an extension still loading, a turn starting) would otherwise be
+        // printed into the transcript as `^[` and stray letters. The pane shows what is typed;
+        // a program that wants echo turns it on. The relay reads the real terminal raw.
+        let mut session_termios = real_termios;
+        session_termios.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        libc::tcsetattr(slave, libc::TCSANOW, &session_termios);
         let real_out = libc::dup(libc::STDOUT_FILENO);
         let real_in = libc::dup(libc::STDIN_FILENO);
         let saved = [
