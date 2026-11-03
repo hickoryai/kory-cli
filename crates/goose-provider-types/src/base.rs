@@ -850,6 +850,14 @@ pub trait Provider: MaybeSend + MaybeSync {
     ) -> bool {
         false
     }
+
+    /// The user's answer to a question this provider raised itself (an
+    /// `action_required_elicitation` it yielded), as the MCP/ACP result:
+    /// `{"action":"accept","content":{…}}`, `{"action":"decline"}` or `{"action":"cancel"}`.
+    /// False when `request_id` is not one of its questions.
+    async fn handle_elicitation_response(&self, _request_id: &str, _response: &Value) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

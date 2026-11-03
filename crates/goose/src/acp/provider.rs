@@ -1,11 +1,11 @@
 use agent_client_protocol::schema::v1::{
     Annotations as AcpAnnotations, ClientCapabilities, CloseSessionRequest, ContentBlock,
-    ContentChunk, EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
-    ElicitationCapabilities, ElicitationFormCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    ContentChunk, CreateElicitationRequest, CreateElicitationResponse, ElicitationCapabilities,
+    ElicitationFormCapabilities, EnvVariable, HttpHeader, ImageContent, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, Role as AcpRole,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallContent, ToolCallStatus, ToolKind,
@@ -167,6 +167,13 @@ enum AcpUpdate {
         request: Box<RequestPermissionRequest>,
         response_tx: oneshot::Sender<RequestPermissionResponse>,
     },
+    /// The agent asks the user something (`elicitation/create`, form mode); the answer is the
+    /// ACP result as JSON (`{"action":"accept","content":{…}}`, `decline` or `cancel`).
+    Elicitation {
+        message: String,
+        schema: serde_json::Value,
+        response_tx: oneshot::Sender<serde_json::Value>,
+    },
     Complete(StopReason, Option<AcpUsage>),
     Error(agent_client_protocol::Error),
 }
@@ -293,7 +300,9 @@ async fn relay_unsolicited(
                     runs.end();
                     tool_response_message(id, raw_output, content, is_error)
                 }
+                // No turn to ask in: dropping the answer channel cancels the question.
                 AcpUpdate::PermissionRequest { .. }
+                | AcpUpdate::Elicitation { .. }
                 | AcpUpdate::Complete(..)
                 | AcpUpdate::Error(_) => continue,
             },
@@ -424,6 +433,8 @@ pub struct AcpProvider {
 
     pending_confirmations:
         Arc<TokioMutex<HashMap<String, oneshot::Sender<PermissionConfirmation>>>>,
+    /// Questions the agent asked, by the action-required id the session answers.
+    pending_elicitations: Arc<TokioMutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     /// True after the first ACP prompt completes with the handoff context committed.
     /// Failed or abandoned first prompts reset this so the next prompt can retry it.
@@ -612,6 +623,7 @@ impl AcpProvider {
             mode_mapping,
             session: Mutex::new(session),
             pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
+            pending_elicitations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_tool_updates,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
@@ -1074,6 +1086,20 @@ impl Provider for AcpProvider {
         false
     }
 
+    async fn handle_elicitation_response(
+        &self,
+        request_id: &str,
+        response: &serde_json::Value,
+    ) -> bool {
+        match self.pending_elicitations.lock().await.remove(request_id) {
+            Some(tx) => {
+                let _ = tx.send(response.clone());
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn stream(
         &self,
         model_config: &ModelConfig,
@@ -1159,6 +1185,7 @@ impl Provider for AcpProvider {
             bare_retry_blocks.map(|blocks| (self.tx.as_ref().unwrap().clone(), session_id, blocks));
 
         let pending_confirmations = self.pending_confirmations.clone();
+        let pending_elicitations = self.pending_elicitations.clone();
         let goose_mode = *self
             .goose_mode
             .lock()
@@ -1224,6 +1251,17 @@ impl Provider for AcpProvider {
                                 tool_response_message(id, raw_output, content, is_error);
                             yield (Some(message), None);
                         }
+                    }
+                    AcpUpdate::Elicitation { message, schema, response_tx } => {
+                        runs.end();
+                        // The session shows the question and answers it through
+                        // `handle_elicitation_response`; the stream goes on meanwhile.
+                        let id = uuid::Uuid::new_v4().to_string();
+                        pending_elicitations.lock().await.insert(id.clone(), response_tx);
+                        let question = Message::assistant().with_content(
+                            MessageContent::action_required_elicitation(id, message, schema),
+                        );
+                        yield (Some(question), None);
                     }
                     AcpUpdate::PermissionRequest { request, response_tx } => {
                         runs.end();
@@ -1682,6 +1720,45 @@ impl AcpClientLoop {
                         let response = response_rx.await.unwrap_or_else(|_| {
                             RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
                         });
+                        responder.respond(response)
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            // A question from the agent (Claude's AskUserQuestion, Grok's ask_user_question,
+            // both as `elicitation/create` through router-acp) goes to the running turn, which
+            // shows it and sends the answer back. Without a turn, or for a mode the CLI cannot
+            // show, the question is cancelled rather than left waiting.
+            .on_receive_request(
+                {
+                    let prompt_response_tx = prompt_response_tx.clone();
+                    async move |request: CreateElicitationRequest, responder, _connection_cx| {
+                        let cancelled = serde_json::json!({"action": "cancel"});
+                        let (message, schema) = elicitation_form(&request);
+                        let handler = prompt_response_tx
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.as_ref().cloned())
+                            .filter(|tx| !tx.is_closed());
+                        let answer = match (schema, handler) {
+                            (Some(schema), Some(tx)) => {
+                                let (response_tx, response_rx) = oneshot::channel();
+                                match tx.try_send(AcpUpdate::Elicitation {
+                                    message,
+                                    schema,
+                                    response_tx,
+                                }) {
+                                    Ok(()) => response_rx.await.unwrap_or(cancelled),
+                                    Err(_) => cancelled,
+                                }
+                            }
+                            _ => cancelled,
+                        };
+                        let response = serde_json::from_value::<CreateElicitationResponse>(answer)
+                            .unwrap_or_else(|_| {
+                                serde_json::from_value(serde_json::json!({"action": "cancel"}))
+                                    .expect("a cancel elicitation response parses")
+                            });
                         responder.respond(response)
                     }
                 },
@@ -2379,6 +2456,16 @@ fn acp_tool_call_content_to_rmcp(
     out
 }
 
+/// An `elicitation/create` request's question and its form's JSON schema; no schema for a
+/// mode other than a form (a URL to open), which the CLI cannot show.
+fn elicitation_form(request: &CreateElicitationRequest) -> (String, Option<serde_json::Value>) {
+    let value = serde_json::to_value(request).unwrap_or_default();
+    let schema = (value.get("mode").and_then(serde_json::Value::as_str) == Some("form"))
+        .then(|| value.get("requestedSchema").cloned())
+        .flatten();
+    (request.message.clone(), schema)
+}
+
 fn build_action_required_message(request: &RequestPermissionRequest) -> Option<Message> {
     let tool_title = request
         .tool_call
@@ -2814,6 +2901,7 @@ mod tests {
                     response: NewSessionResponse::new("test-session"),
                 }),
                 pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
+                pending_elicitations: Arc::new(TokioMutex::new(HashMap::new())),
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),
@@ -5276,6 +5364,133 @@ mod tests {
             SteerOutcome::Unsupported
         );
         assert!(provider.steering_unsupported.load(Ordering::Acquire));
+    }
+
+    /// The operator's report: an `/implement` parent asked a question (Claude's
+    /// AskUserQuestion, an `elicitation/create` through router-acp) and waited 45 minutes,
+    /// because the client advertised form elicitation and never handled the request. The
+    /// question now reaches the session as an action-required elicitation and its answer
+    /// goes back to the agent.
+    #[tokio::test]
+    async fn an_agent_question_reaches_the_session_and_its_answer_returns() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+            PromptRequest, PromptResponse,
+        };
+        use agent_client_protocol::{on_receive_request, Agent as ScriptedAgent, ByteStreams};
+        use futures::StreamExt;
+
+        let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, client_write) = tokio::io::duplex(64 * 1024);
+        let answers = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let agent_answers = answers.clone();
+        tokio::spawn(async move {
+            ScriptedAgent
+                .builder()
+                .on_receive_request(
+                    async |_req: InitializeRequest, responder, _cx| {
+                        responder.respond(
+                            InitializeResponse::new(ProtocolVersion::LATEST)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |_req: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new(SessionId::new("asks")))
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: PromptRequest, responder, cx| {
+                        let answers = agent_answers.clone();
+                        let asker = cx.clone();
+                        cx.spawn(async move {
+                            let question: CreateElicitationRequest =
+                                serde_json::from_value(serde_json::json!({
+                                    "mode": "form",
+                                    "sessionId": "asks",
+                                    "message": "Apply the router fix?",
+                                    "requestedSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "choice": {"type": "string", "enum": ["Apply", "Decline"]}
+                                        },
+                                        "required": ["choice"]
+                                    }
+                                }))
+                                .unwrap();
+                            let answer = asker.send_request(question).block_task().await;
+                            answers
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::to_value(answer.unwrap()).unwrap());
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })
+                    },
+                    on_receive_request!(),
+                )
+                .connect_to(ByteStreams::new(agent_write.compat_write(), agent_read.compat()))
+                .await
+        });
+        let provider = AcpProvider::connect_with_transport(
+            "router-acp".to_string(),
+            GooseMode::Auto,
+            test_acp_config(HashMap::new(), None),
+            ByteStreams::new(client_write.compat_write(), client_read.compat()),
+        )
+        .await
+        .unwrap();
+
+        let model = ModelConfig::new("test-model");
+        let mut stream = provider
+            .stream(&model, "", &[Message::user().with_text("work")], &[])
+            .await
+            .unwrap();
+        let mut asked = None;
+        while let Some(item) = stream.next().await {
+            let (message, _) = item.unwrap();
+            let Some(message) = message else { continue };
+            for content in &message.content {
+                if let MessageContent::ActionRequired(required) = content {
+                    if let crate::conversation::message::ActionRequiredData::Elicitation {
+                        id,
+                        message,
+                        requested_schema,
+                    } = &required.data
+                    {
+                        assert_eq!(message, "Apply the router fix?");
+                        assert_eq!(requested_schema["required"][0], "choice");
+                        asked = Some(id.clone());
+                    }
+                }
+            }
+            if let Some(id) = asked.take() {
+                assert!(
+                    provider
+                        .handle_elicitation_response(
+                            &id,
+                            &serde_json::json!({"action": "accept", "content": {"choice": "Apply"}}),
+                        )
+                        .await
+                );
+                assert!(
+                    !provider
+                        .handle_elicitation_response(&id, &serde_json::json!({"action": "cancel"}))
+                        .await,
+                    "an answered question is not answered twice"
+                );
+            }
+        }
+        let answers = answers.lock().unwrap().clone();
+        assert_eq!(
+            answers.len(),
+            1,
+            "the agent got its answer and finished the turn"
+        );
+        assert_eq!(answers[0]["action"], "accept");
+        assert_eq!(answers[0]["content"]["choice"], "Apply");
     }
 
     /// An extension request carries the session id and returns the agent's answer; the

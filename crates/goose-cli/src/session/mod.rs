@@ -75,6 +75,7 @@ use tracing::warn;
 const SHELL_STATUS_FALLBACK_WIDTH: usize = 120;
 /// How often a message the running turn declined is offered to it again.
 const STEER_RETRY: Duration = Duration::from_secs(2);
+const CONTEXT_REFRESH: Duration = Duration::from_secs(3);
 /// How long a turn that ended waits for a message on its way to it.
 const STEER_SETTLE: Duration = Duration::from_secs(5);
 /// How long a message may be on its way to the running turn before it counts as declined.
@@ -1530,6 +1531,9 @@ impl CliSession {
         }
         let mut deferred_messages: Vec<Message> = Vec::new();
         let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
+        // An ACP agent reports its context in `usage_update`s, not turn usage, so the pane's
+        // context bar reads it on a clock while the turn runs.
+        let mut refresh_context = tokio::time::interval(CONTEXT_REFRESH);
         // Messages queued in the footer reach the running turn one at a time.
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut steer_retry = tokio::time::interval(STEER_RETRY);
@@ -1683,6 +1687,9 @@ impl CliSession {
                 }
                 _ = steer_retry.tick(), if self.dock().is_some_and(|dock| dock.has_queued()) => {
                     self.start_steer(&steer_tx);
+                }
+                _ = refresh_context.tick(), if self.dock().is_some() => {
+                    let _ = self.display_context_usage().await;
                 }
                 _ = refresh_children.tick(), if children.is_open() || children.watches_router() => {
                     if children.is_open() {

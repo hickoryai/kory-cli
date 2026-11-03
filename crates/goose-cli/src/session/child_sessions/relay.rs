@@ -36,6 +36,10 @@ const SUSPEND: &str = "\x1b]7799;kory-pane;suspend\x07";
 const RESUME: &str = "\x1b]7799;kory-pane;resume\x07";
 /// Transcript lines kept above the screen.
 const SCROLLBACK: usize = 20_000;
+/// Ctrl-C this many times within the window ends the process even when the session does not
+/// answer it (a hung turn or shutdown).
+const FORCE_QUIT_PRESSES: usize = 3;
+const FORCE_QUIT_WINDOW: Duration = Duration::from_secs(2);
 /// Output kept for replaying at a new size; past it the older half goes.
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 /// Rows one wheel notch scrolls.
@@ -285,11 +289,30 @@ impl Relay {
         }
     }
 
+    /// Ctrl-C pressed again and again: the session is not answering it, so the terminal comes
+    /// back now (transcript printed, settings restored) and the process ends, whatever it was
+    /// waiting on.
+    fn force_quit(&self, view: &mut View) -> ! {
+        let mut out = view.forwarded();
+        out.extend_from_slice(LEAVE.as_bytes());
+        // SAFETY: the real terminal's own settings back, then an immediate exit; nothing else
+        // in the process can be trusted to finish.
+        unsafe { libc::tcsetattr(self.real_in, libc::TCSANOW, &self.real_termios) };
+        write_fd(self.real_out, &out);
+        write_fd(self.real_out, &view.transcript());
+        write_fd(
+            self.real_out,
+            b"\r\n  kory: force quit (Ctrl-C pressed 3 times)\r\n",
+        );
+        unsafe { libc::_exit(130) }
+    }
+
     fn run(&self, (cols, lines): (usize, usize)) {
         let mut view = View::new(cols, lines);
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_frame = Instant::now() - FRAME;
         let mut dirty = true;
+        let mut interrupts: Vec<Instant> = Vec::new();
         loop {
             let stopping = self.stop.load(Ordering::SeqCst);
             let timeout = if stopping {
@@ -325,11 +348,21 @@ impl Relay {
             if input.scrolled {
                 dirty = true;
             }
-            if input.interrupt && self.signals_on() {
-                // SAFETY: the signal the terminal would have raised for Ctrl-C.
-                unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
-            } else if input.interrupt {
-                write_fd(self.master, b"\x03");
+            if input.interrupt > 0 {
+                let now = Instant::now();
+                interrupts.retain(|at| now.duration_since(*at) < FORCE_QUIT_WINDOW);
+                interrupts.extend(std::iter::repeat_n(now, input.interrupt));
+                if interrupts.len() >= FORCE_QUIT_PRESSES {
+                    self.force_quit(&mut view);
+                }
+            }
+            for sequence in &input.interrupts {
+                if self.signals_on() {
+                    // SAFETY: the signal the terminal would have raised for Ctrl-C.
+                    unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+                } else {
+                    write_fd(self.master, sequence);
+                }
             }
             if !input.forward.is_empty() {
                 write_fd(self.master, &input.forward);
@@ -418,11 +451,17 @@ impl vt100::Callbacks for Sink {
             (Some(b'>'), 'u', _) | (Some(b'<'), 'u', _) | (Some(b'='), 'u', _) => {
                 self.forward.extend_from_slice(b"\x1b[");
                 self.forward.push(i1.unwrap_or(b'>'));
-                let numbers: Vec<String> = params
-                    .iter()
-                    .map(|p| p.iter().map(u16::to_string).collect::<Vec<_>>().join(":"))
-                    .collect();
-                self.forward.extend_from_slice(numbers.join(";").as_bytes());
+                // The emulator reports an omitted parameter as 0, and `CSI < 0 u` pops nothing:
+                // a pop sent that way left the protocol on after every turn, so Ctrl-C arrived
+                // as `ESC[99;5u` text. An omitted parameter stays omitted.
+                let omitted = params.iter().all(|p| p.iter().all(|n| *n == 0));
+                if !omitted {
+                    let numbers: Vec<String> = params
+                        .iter()
+                        .map(|p| p.iter().map(u16::to_string).collect::<Vec<_>>().join(":"))
+                        .collect();
+                    self.forward.extend_from_slice(numbers.join(";").as_bytes());
+                }
                 self.forward.push(b'u');
             }
             // The cursor position report and the device attributes, as a terminal answers.
@@ -457,7 +496,11 @@ impl vt100::Callbacks for Sink {
 #[derive(Default, Debug)]
 struct Input {
     forward: Vec<u8>,
-    interrupt: bool,
+    /// Ctrl-C presses, plain or in the kitty keyboard protocol's encoding.
+    interrupt: usize,
+    /// Each press as it was typed, sent to the session as a key when its terminal settings do
+    /// not make Ctrl-C a signal.
+    interrupts: Vec<Vec<u8>>,
     scrolled: bool,
 }
 
@@ -610,6 +653,12 @@ impl View {
                             b"\x1b[6~" if !full_screen => {
                                 input.scrolled |= self.scroll(-(self.page() as isize))
                             }
+                            sequence if is_kitty_ctrl_c(sequence) => {
+                                input.interrupt += 1;
+                                input.interrupts.push(sequence.to_vec());
+                            }
+                            // A key release the protocol reports separately means nothing here.
+                            sequence if is_kitty_release(sequence) => {}
                             _ => {
                                 input.scrolled |= self.follow();
                                 input.forward.extend_from_slice(sequence);
@@ -620,7 +669,8 @@ impl View {
                 }
             }
             if rest[0] == 0x03 {
-                input.interrupt = true;
+                input.interrupt += 1;
+                input.interrupts.push(vec![0x03]);
             } else {
                 input.scrolled |= self.follow();
                 input.forward.push(rest[0]);
@@ -825,6 +875,34 @@ impl View {
     }
 }
 
+/// Ctrl+C as the kitty keyboard protocol reports a press or repeat: `CSI 99 ; 5 u`, with an
+/// optional `:1`/`:2` event type and other modifier bits (Caps Lock, Num Lock) set.
+fn is_kitty_ctrl_c(sequence: &[u8]) -> bool {
+    let Some(body) = sequence
+        .strip_prefix(b"\x1b[")
+        .and_then(|rest| rest.strip_suffix(b"u"))
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(body);
+    let mut fields = text.split(';');
+    let code = fields
+        .next()
+        .and_then(|f| f.split(':').next()?.parse::<u32>().ok());
+    let mut modifier = fields.next().unwrap_or("1").split(':');
+    let mods = modifier
+        .next()
+        .and_then(|m| m.parse::<u32>().ok())
+        .unwrap_or(1);
+    let event = modifier.next().unwrap_or("1");
+    let bits = mods.saturating_sub(1);
+    code == Some(99) && bits & 4 != 0 && bits & !(4 | 64 | 128) == 0 && event != "3"
+}
+
+fn is_kitty_release(sequence: &[u8]) -> bool {
+    sequence.starts_with(b"\x1b[") && sequence.ends_with(b":3u")
+}
+
 /// The pill's first and last column (0-based), centered.
 fn pill_columns(cols: usize) -> (usize, usize) {
     let width = console::measure_text_width(PILL);
@@ -954,12 +1032,49 @@ mod tests {
         assert_eq!(view.scroll_up, 0);
     }
 
+    /// The operator's report: after a turn left the kitty keyboard protocol on, Ctrl-C reached
+    /// the session as `ESC[99;5u` and only echoed, so nothing could end the app.
+    #[test]
+    fn a_kitty_encoded_ctrl_c_is_an_interrupt() {
+        let mut view = View::new(40, 6);
+        let input = view.input(
+            b"\x1b[99;5u\x1b[99;5:1u\x1b[99;69u\x1b[99;5:3u",
+            Instant::now(),
+        );
+        assert_eq!(
+            input.interrupt, 3,
+            "press, explicit press and Caps Lock held"
+        );
+        assert_eq!(
+            input.interrupts[0], b"\x1b[99;5u",
+            "kept for a session reading keys"
+        );
+        assert!(
+            input.forward.is_empty(),
+            "the release means nothing: {:?}",
+            input.forward
+        );
+        assert!(!is_kitty_ctrl_c(b"\x1b[99;7u"), "Ctrl+Alt+C is another key");
+        assert!(!is_kitty_ctrl_c(b"\x1b[99u"), "a plain c");
+    }
+
+    #[test]
+    fn kitty_keyboard_push_and_pop_reach_the_real_terminal() {
+        let mut view = View::new(40, 6);
+        view.output(b"\x1b[>1u");
+        view.output(b"\x1b[<u");
+        assert_eq!(
+            String::from_utf8(view.forwarded()).unwrap(),
+            "\x1b[>1u\x1b[<u"
+        );
+    }
+
     #[test]
     fn ctrl_c_and_split_sequences() {
         let mut view = View::new(40, 6);
         let now = Instant::now();
         let input = view.input(b"a\x03\x1b[", now);
-        assert!(input.interrupt);
+        assert_eq!(input.interrupt, 1);
         assert_eq!(input.forward, b"a");
         assert!(view.holding_input());
         let input = view.input(b"B", now);
