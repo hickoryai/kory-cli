@@ -646,6 +646,11 @@ async fn configure_session_prompts(
 }
 
 pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
+    // The pane's relay owns the terminal from the first line, so the session header is in the
+    // transcript rather than left behind on the screen the session then switches away from.
+    if session_config.interactive && session_config.output_format == "text" {
+        super::child_sessions::dock::begin_session();
+    }
     #[cfg(feature = "telemetry")]
     goose::posthog::set_session_context("cli", session_config.resume);
 

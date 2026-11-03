@@ -506,6 +506,14 @@ impl InputLine {
     }
 }
 
+/// An interactive session takes over the terminal before it prints its header, so the header
+/// opens the transcript the pane is drawn under.
+pub fn begin_session() {
+    if is_capable() {
+        relay::begin();
+    }
+}
+
 /// The kitty keyboard protocol's "disambiguate" level for as long as it lives: Ctrl+Enter
 /// arrives as its own key. Ctrl-C then arrives as a key too, so its holder must cancel on
 /// `Key::Interrupt` itself.

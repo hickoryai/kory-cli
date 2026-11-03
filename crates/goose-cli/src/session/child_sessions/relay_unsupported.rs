@@ -8,6 +8,10 @@ pub fn install(_painter: Painter) -> bool {
     false
 }
 
+pub fn begin() -> bool {
+    false
+}
+
 pub fn remove_painter() {}
 
 pub fn repaint() {}

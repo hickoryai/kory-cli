@@ -76,6 +76,12 @@ pub fn install(painter: Painter) -> bool {
     true
 }
 
+/// Routes the session's terminal through the relay before anything is printed, so the
+/// session's header and everything after it are in the transcript; the pane comes later.
+pub fn begin() -> bool {
+    RELAY.get_or_init(start).is_some()
+}
+
 /// The pane goes away; the transcript stays on screen.
 pub fn remove_painter() {
     if let Some(relay) = active() {
