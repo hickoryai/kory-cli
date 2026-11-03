@@ -805,7 +805,9 @@ fn children_summary(state: &State, width: usize) -> String {
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    let keys = if state.selected.is_some() {
+    let keys = if state.question {
+        String::new()
+    } else if state.selected.is_some() {
         "↑↓ select · Enter open · Esc back".to_string()
     } else {
         let mut keys = vec![if state.turn_started.is_some() {
