@@ -28,10 +28,24 @@ pub struct KeyListener {
 
 impl KeyListener {
     pub fn start() -> std::io::Result<Self> {
+        Self::start_with(false)
+    }
+
+    /// For the prompt, where Ctrl-C and Ctrl-D are keys rather than signals and end of input.
+    pub fn start_for_prompt() -> std::io::Result<Self> {
+        Self::start_with(true)
+    }
+
+    fn start_with(ctrl_keys: bool) -> std::io::Result<Self> {
         let fd = std::io::stdin().as_raw_fd();
         let original = get_termios(fd)?;
         let mut cbreak = original;
         cbreak.c_lflag &= !(libc::ICANON | libc::ECHO);
+        if ctrl_keys {
+            cbreak.c_lflag &= !libc::ISIG;
+        }
+        // Enter arrives as CR and Ctrl+J as LF, so they stay two keys.
+        cbreak.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IXON);
         cbreak.c_cc[libc::VMIN] = 1;
         cbreak.c_cc[libc::VTIME] = 0;
         set_termios(fd, &cbreak)?;

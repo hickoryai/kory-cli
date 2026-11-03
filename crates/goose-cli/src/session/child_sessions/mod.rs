@@ -4,6 +4,11 @@
 
 pub mod dock;
 mod keys;
+#[cfg(unix)]
+mod relay;
+#[cfg(not(unix))]
+#[path = "relay_unsupported.rs"]
+mod relay;
 pub mod router;
 #[cfg(unix)]
 mod terminal;

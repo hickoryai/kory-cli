@@ -651,11 +651,11 @@ impl CliSession {
                 self.ensure_extensions_loaded(true).await?;
             }
 
+            self.sync_unsolicited(Some(&mut editor)).await;
             if show_status {
                 self.display_context_usage().await?;
             }
             show_status = true;
-            self.sync_unsolicited(Some(&mut editor)).await;
             // A `/shutdown` still draining holds the prompt back until it ends.
             if self.shutdown_gate() == shutdown::Gate::Draining {
                 if let Some(dock) = self.dock() {
@@ -713,7 +713,9 @@ impl CliSession {
                 &mut editor,
                 Some(&conversation_strings),
                 self.unsolicited.as_ref(),
-            )?;
+                self.dock.as_ref().map(|(_, dock)| dock),
+            )
+            .await?;
             if matches!(input, InputResult::Interrupt) {
                 let step = self
                     .completion_cache
@@ -742,8 +744,10 @@ impl CliSession {
             }
             if matches!(input, InputResult::DockFocus | InputResult::ToolFocus) {
                 // The line editor accepted the empty line to hand over the keys; take that
-                // line back so the prompt returns where it was.
-                erase_accepted_prompt_line();
+                // line back so the prompt returns where it was. The pane's input box left none.
+                if self.dock().is_none() {
+                    erase_accepted_prompt_line();
+                }
                 show_status = false;
             }
             self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
@@ -1597,6 +1601,8 @@ impl CliSession {
                                     dock.step(-1);
                                     None
                                 }
+                                Key::Up if dock.move_vertical(-1) => None,
+                                Key::Down if !dock.is_selecting() && dock.move_vertical(1) => None,
                                 // Nothing queued to take back: ↑ moves into the tool calls.
                                 Key::Up if !dock.has_queued() => {
                                     let calls = tool_calls::collect(self.messages.messages());
@@ -1616,7 +1622,6 @@ impl CliSession {
                                     dock.clear_selection();
                                     None
                                 }
-                                Key::Click { row, .. } => dock.select_row(row),
                                 key => {
                                     match dock.type_key(key) {
                                         child_sessions::dock::Typed::SendNow => {
@@ -1695,6 +1700,10 @@ impl CliSession {
                             let needs_terminal = find_tool_confirmation(&message).is_some()
                                 || find_elicitation_request(&message).is_some()
                                 || output::get_credits_top_up_url(&message).is_some();
+                            // The question draws into the transcript and takes the cursor.
+                            let _question = needs_terminal
+                                .then(|| self.dock().map(|_| child_sessions::dock::Hidden::new()))
+                                .flatten();
                             if needs_terminal {
                                 drop(extended_keys.take());
                                 tool_view = None;
@@ -1855,6 +1864,10 @@ impl CliSession {
                         }
                         Some(Ok(AgentEvent::Usage(usage))) => {
                             last_usage = Some(usage);
+                            // The pane's context bar follows the turn as it goes.
+                            if self.dock().is_some() {
+                                let _ = self.display_context_usage().await;
+                            }
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
                         Some(Ok(AgentEvent::McpNotification(_)))
@@ -2349,6 +2362,11 @@ impl CliSession {
             .get_goose_provider()
             .unwrap_or_else(|_| "unknown".to_string());
 
+        // The pane keeps the context on its status line; only a plain terminal prints it.
+        let show = |used: usize| match self.dock() {
+            Some(dock) => dock.set_context(Some((used, context_limit))),
+            None => output::display_context_usage(used, context_limit),
+        };
         match self.get_session().await {
             Ok(metadata) => {
                 if let Some(used) = context_in_use(
@@ -2356,7 +2374,7 @@ impl CliSession {
                     provider.manages_own_context(),
                     metadata.usage.total_tokens,
                 ) {
-                    output::display_context_usage(used, context_limit);
+                    show(used);
                 }
 
                 if show_cost {
@@ -2373,7 +2391,7 @@ impl CliSession {
                     provider.manages_own_context(),
                     Some(0),
                 ) {
-                    output::display_context_usage(used, context_limit);
+                    show(used);
                 }
             }
         }
@@ -2525,7 +2543,7 @@ impl CliSession {
             session_id: self.session_id.clone(),
             router,
         });
-        self.dock = Some((root, dock));
+        self.dock = dock.map(|dock| (root, dock));
     }
 
     fn dock(&self) -> Option<&child_sessions::dock::Dock> {
@@ -2752,7 +2770,6 @@ impl CliSession {
                     None
                 }
                 child_sessions::Key::Enter => dock.selected(),
-                child_sessions::Key::Click { row, .. } => dock.select_row(row),
                 child_sessions::Key::Escape | child_sessions::Key::Char('q') => break,
                 _ => None,
             };
