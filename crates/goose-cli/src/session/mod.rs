@@ -248,6 +248,43 @@ impl HistoryManager {
     }
 }
 
+/// How long background extension loading may run before the session says so. It usually ends
+/// well inside this.
+const EXTENSION_BANNER_GRACE: Duration = Duration::from_secs(2);
+
+/// Says "extensions ready" as soon as loading ends, without waiting for the next prompt, and
+/// only when the session said it was loading.
+#[derive(Default)]
+struct ExtensionProgress {
+    announced: std::sync::atomic::AtomicBool,
+    finished: std::sync::atomic::AtomicBool,
+    ready_shown: std::sync::atomic::AtomicBool,
+}
+
+impl ExtensionProgress {
+    fn announced(&self) {
+        self.announced
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.show_ready();
+    }
+
+    fn finished(&self) {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.show_ready();
+    }
+
+    fn show_ready(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.announced.load(SeqCst)
+            && self.finished.load(SeqCst)
+            && !self.ready_shown.swap(true, SeqCst)
+        {
+            output::show_extensions_ready();
+        }
+    }
+}
+
 pub struct CliSession {
     agent: Arc<Agent>,
     messages: Conversation,
@@ -263,7 +300,7 @@ pub struct CliSession {
     /// [`CliSession::ensure_extensions_loaded`], the session's single loading
     /// gate.
     extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
-    loading_announced: bool,
+    extension_progress: Arc<ExtensionProgress>,
     /// Records (and at the prompt, shows) what the agent says while no turn of ours runs.
     unsolicited: Option<unsolicited::UnsolicitedRelay>,
     /// The persistent child list under the prompt, and the router session it follows.
@@ -330,18 +367,26 @@ impl CliSession {
             .map(|session| session.conversation.unwrap_or_default())
             .unwrap();
         let completion_cache = Arc::new(std::sync::RwLock::new(CompletionCache::new()));
+        let extension_progress = Arc::new(ExtensionProgress::default());
         let extension_loading = extension_loading.map(|handle| {
             let agent = agent.clone();
             let session_id = session_id.clone();
             let completion_cache = completion_cache.clone();
+            let progress = extension_progress.clone();
             AbortOnDropHandle::new(tokio::spawn(async move {
-                let failures = handle.await.map_err(|error| {
-                    anyhow::anyhow!("Extension loading task failed: {}", error)
-                })??;
-                if refresh_completions {
-                    Self::refresh_completion_cache(&agent, &session_id, &completion_cache).await?;
+                let loaded = async {
+                    let failures = handle.await.map_err(|error| {
+                        anyhow::anyhow!("Extension loading task failed: {}", error)
+                    })??;
+                    if refresh_completions {
+                        Self::refresh_completion_cache(&agent, &session_id, &completion_cache)
+                            .await?;
+                    }
+                    Ok(failures)
                 }
-                Ok(failures)
+                .await;
+                progress.finished();
+                loaded
             }))
         });
 
@@ -357,7 +402,7 @@ impl CliSession {
             output_format,
             stats,
             extension_loading,
-            loading_announced: false,
+            extension_progress,
             unsolicited: None,
             dock: None,
             shutdown: std::sync::Mutex::new(None),
@@ -624,13 +669,9 @@ impl CliSession {
             let msg = Message::user().with_text(&prompt);
             self.process_message(msg, CancellationToken::default(), true)
                 .await?;
-        } else if self
-            .extension_loading
-            .as_ref()
-            .is_some_and(|h| !h.is_finished())
-        {
-            self.loading_announced = true;
+        } else if !self.extensions_loaded_within(EXTENSION_BANNER_GRACE).await {
             output::show_loading_extensions_background();
+            self.extension_progress.announced();
         }
 
         // The completion cache starts empty: populating it here would issue
@@ -2275,12 +2316,28 @@ impl CliSession {
                 .map_err(|e| anyhow::anyhow!("Extension loading task failed: {}", e))??;
             output::show_extension_failures(&failures);
 
-            if interactive && (was_in_progress || self.loading_announced) {
-                output::show_extensions_ready();
+            if interactive && was_in_progress {
+                self.extension_progress.announced();
             }
-            self.loading_announced = false;
         }
         Ok(())
+    }
+
+    /// Whether background loading ended within `grace`; nothing needs saying if it did.
+    async fn extensions_loaded_within(&self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            let Some(handle) = self.extension_loading.as_ref() else {
+                return true;
+            };
+            if handle.is_finished() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     pub async fn update_completion_cache(&mut self) -> Result<()> {
