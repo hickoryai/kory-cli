@@ -846,6 +846,14 @@ impl AcpProvider {
     }
 
     fn claim_handoff_context(&self, messages: &[Message]) -> HandoffContextClaim {
+        // A slash command has to reach the agent or router as typed, and it is no conversation
+        // to hand off: the next real prompt carries the context instead.
+        if latest_prompt_is_slash_command(messages) {
+            return HandoffContextClaim {
+                first_prompt: false,
+                include_context: false,
+            };
+        }
         let first_prompt = !self.handoff_context_sent.swap(true, Ordering::AcqRel);
         HandoffContextClaim {
             first_prompt,
@@ -2505,6 +2513,20 @@ fn last_user_message_index(messages: &[Message]) -> Option<usize> {
         .rposition(|m| m.role == Role::User && m.is_agent_visible() && !m.is_turn_context())
 }
 
+/// `/login`, `/usage extra`; not a path such as `/Users/me/file`.
+fn latest_prompt_is_slash_command(messages: &[Message]) -> bool {
+    last_user_message_index(messages).is_some_and(|index| {
+        let text = messages[index].as_concat_text();
+        text.trim_start()
+            .strip_prefix('/')
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|name| {
+                name.chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ':')
+            })
+    })
+}
+
 fn has_handoff_context(messages: &[Message]) -> bool {
     last_user_message_index(messages).is_some_and(|last_user_index| {
         messages[..last_user_index]
@@ -3484,6 +3506,24 @@ mod tests {
         let second_claim = provider.claim_handoff_context(&messages);
         assert!(!second_claim.first_prompt);
         assert!(!second_claim.include_context);
+    }
+
+    #[test]
+    fn a_slash_command_carries_no_handoff_and_leaves_it_for_the_next_prompt() {
+        let (provider, _) = test_provider();
+        let history = vec![
+            Message::user().with_text("/login"),
+            Message::assistant().with_text("Manage logins"),
+        ];
+        let mut command = history.clone();
+        command.push(Message::user().with_text("/login"));
+        assert!(!provider.claim_handoff_context(&command).include_context);
+        let mut path = history.clone();
+        path.push(Message::user().with_text("/Users/me/file.rs explain this"));
+        assert!(!latest_prompt_is_slash_command(&path));
+        let mut prompt = history;
+        prompt.push(Message::user().with_text("what next?"));
+        assert!(provider.claim_handoff_context(&prompt).include_context);
     }
 
     #[test]

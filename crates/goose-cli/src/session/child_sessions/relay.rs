@@ -49,10 +49,12 @@ const IDLE_POLL_MS: i32 = 200;
 const FRAME: Duration = Duration::from_millis(16);
 /// An escape sequence typed in pieces waits this long for its rest.
 const HELD_INPUT: Duration = Duration::from_millis(30);
-const ENTER: &str = "\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[H\x1b[2J";
+const ENTER: &str = "\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[H\x1b[2J";
 const LEAVE: &str =
-    "\x1b[?2026l\x1b[0m\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[<u\x1b[?25h\x1b[?1049l";
+    "\x1b[?2026l\x1b[0m\x1b[?1006l\x1b[?1002l\x1b[?2004l\x1b[<u\x1b[?25h\x1b[?1049l";
 const PILL: &str = " Jump to bottom (click) ↓ ";
+
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 
 struct Relay {
     real_out: RawFd,
@@ -509,6 +511,35 @@ struct Input {
     scrolled: bool,
 }
 
+/// Text dragged over with the mouse, as (transcript row, column) from where the drag began to
+/// where it is now.
+#[derive(Clone, Copy)]
+struct Selection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+}
+
+impl Selection {
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// The columns of transcript row `row` it covers, as (first column, width), when any.
+    fn columns(&self, row: usize, cols: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.ordered();
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        let first = if row == start.0 { start.1 } else { 0 };
+        let past = if row == end.0 { end.1 + 1 } else { cols };
+        (past > first).then(|| (first, past.min(cols) - first))
+    }
+}
+
 /// The transcript, how far it is scrolled up, and the rows on the real screen.
 struct View {
     parser: vt100::Parser<Sink>,
@@ -523,6 +554,11 @@ struct View {
     held_since: Option<Instant>,
     /// The transcript rows on screen at the last frame, for clicks on the pill.
     transcript_rows: usize,
+    /// The transcript row at the top of the screen at the last frame, for mouse positions.
+    view_start: usize,
+    selection: Option<Selection>,
+    /// A copied selection waiting to reach the real terminal.
+    clipboard: Vec<u8>,
     /// Whether the real terminal has bracketed paste on.
     paste_mode: bool,
     /// The session's output, replayed into a new emulator when the size changes.
@@ -544,6 +580,9 @@ impl View {
             held: Vec::new(),
             held_since: None,
             transcript_rows: 0,
+            view_start: 0,
+            selection: None,
+            clipboard: Vec::new(),
             paste_mode: false,
             log: Vec::new(),
         }
@@ -581,6 +620,7 @@ impl View {
     /// Sequences meant for the real terminal, and the bracketed-paste mode the session wants.
     fn forwarded(&mut self) -> Vec<u8> {
         let mut out = std::mem::take(&mut self.parser.callbacks_mut().forward);
+        out.append(&mut self.clipboard);
         let paste = self.parser.screen().bracketed_paste();
         if paste != self.paste_mode {
             out.extend_from_slice(if paste {
@@ -607,6 +647,7 @@ impl View {
         // What replaying asked of the real terminal was done the first time.
         *parser.callbacks_mut() = Sink::default();
         self.parser = parser;
+        self.selection = None;
         self.last_end = self.end();
     }
 
@@ -690,9 +731,10 @@ impl View {
         self.transcript_rows.saturating_sub(2).max(1)
     }
 
-    /// Back to the live end; true when the view moved.
+    /// Back to the live end, dropping any selection; true when the view changed.
     fn follow(&mut self) -> bool {
-        std::mem::replace(&mut self.scroll_up, 0) != 0
+        let selected = self.selection.take().is_some();
+        std::mem::replace(&mut self.scroll_up, 0) != 0 || selected
     }
 
     fn scroll(&mut self, rows: isize) -> bool {
@@ -715,11 +757,101 @@ impl View {
                 if (start..=end).contains(&(col as usize)) {
                     self.follow()
                 } else {
-                    false
+                    self.begin_selection(col, row)
                 }
             }
+            0 if pressed => self.begin_selection(col, row),
+            // Motion with the left button held.
+            32 => self.drag_selection(col, row),
+            0 => self.end_selection(col, row),
             _ => false,
         }
+    }
+
+    /// The transcript position under the mouse, held inside the transcript's rows.
+    fn position(&self, col: u16, row: u16) -> (usize, usize) {
+        let row = (row as usize).min(self.transcript_rows.saturating_sub(1));
+        (self.view_start + row, col as usize)
+    }
+
+    fn begin_selection(&mut self, col: u16, row: u16) -> bool {
+        let had_one = self.selection.is_some();
+        self.selection = ((row as usize) < self.transcript_rows).then(|| {
+            let at = self.position(col, row);
+            Selection {
+                anchor: at,
+                head: at,
+            }
+        });
+        had_one
+    }
+
+    /// A drag to the top or bottom row keeps the view moving, so a selection can pass the screen.
+    fn drag_selection(&mut self, col: u16, row: u16) -> bool {
+        if self.selection.is_none() {
+            return false;
+        }
+        if row == 0 {
+            self.scroll(1);
+        } else if row as usize + 1 >= self.transcript_rows {
+            self.scroll(-1);
+        }
+        let at = self.position(col, row);
+        if let Some(selection) = &mut self.selection {
+            selection.head = at;
+        }
+        true
+    }
+
+    /// Letting go copies the text; a click that dragged nowhere selects nothing.
+    fn end_selection(&mut self, col: u16, row: u16) -> bool {
+        let at = self.position(col, row);
+        let Some(selection) = &mut self.selection else {
+            return false;
+        };
+        selection.head = at;
+        let selection = *selection;
+        if selection.anchor == selection.head {
+            self.selection = None;
+        } else {
+            let text = self.selected_text(selection);
+            self.clipboard
+                .extend(format!("\x1b]52;c;{}\x07", BASE64_STANDARD.encode(text)).into_bytes());
+        }
+        true
+    }
+
+    /// Lines the terminal wrapped join back up, so a copied line is the line the session wrote.
+    fn selected_text(&mut self, selection: Selection) -> String {
+        let (cols, _) = self.size();
+        let (start, end) = selection.ordered();
+        let mut text = String::new();
+        for row in start.0..=end.0 {
+            let (first, width) = selection.columns(row, cols).unwrap_or((0, 0));
+            let (line, wrapped) = self.row_text(row, first, width);
+            text.push_str(line.trim_end());
+            if row < end.0 && !wrapped {
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    /// Unstyled columns of a transcript row, and whether the row wraps onto the next.
+    fn row_text(&mut self, at: usize, first_col: usize, width: usize) -> (String, bool) {
+        let scrollback = self.scrollback_len();
+        let offset = scrollback.saturating_sub(at);
+        let row = at - (scrollback - offset);
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(offset);
+        let found = (row as u16) < screen.size().0;
+        let line = screen
+            .rows(first_col as u16, width as u16)
+            .nth(row)
+            .unwrap_or_default();
+        let wrapped = found && screen.row_wrapped(row as u16);
+        screen.set_scrollback(0);
+        (line, wrapped)
     }
 
     /// The last screen row holding output (or the cursor, once it has moved along its row).
@@ -839,12 +971,30 @@ impl View {
         self.scroll_up = self.scroll_up.min(end.saturating_sub(rows));
         let view_end = end - self.scroll_up;
         let view_start = view_end.saturating_sub(rows);
+        self.view_start = view_start;
         let shown = self.rows(view_start, view_end);
         for row in 0..rows {
             out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", row + 1).into_bytes());
             if let Some(text) = shown.get(row) {
                 out.extend_from_slice(text);
                 out.extend_from_slice(b"\x1b[0m");
+            }
+        }
+        if let Some(selection) = self.selection {
+            for at in view_start..view_end {
+                let Some((first, width)) = selection.columns(at, cols) else {
+                    continue;
+                };
+                let (text, _) = self.row_text(at, first, width);
+                out.extend(
+                    format!(
+                        "\x1b[{};{}H\x1b[0m\x1b[7m{}\x1b[0m",
+                        at - view_start + 1,
+                        first + 1,
+                        text.trim_end()
+                    )
+                    .into_bytes(),
+                );
             }
         }
         if self.scroll_up > 0 && rows > 0 {
@@ -1039,6 +1189,43 @@ mod tests {
 
     /// The operator's report: after a turn left the kitty keyboard protocol on, Ctrl-C reached
     /// the session as `ESC[99;5u` and only echoed, so nothing could end the app.
+    #[test]
+    fn dragging_highlights_and_copies_the_text_through_the_terminal() {
+        let mut view = View::new(40, 8);
+        view.output(b"first line\r\nsecond line\r\nthird\r\n");
+        view.frame(&pane());
+        assert!(!view.input(b"\x1b[<0;3;1M", Instant::now()).scrolled);
+        let drag = view.input(b"\x1b[<32;4;2M", Instant::now());
+        assert!(drag.scrolled && drag.forward.is_empty());
+        let frame = view.frame(&pane());
+        assert!(
+            String::from_utf8_lossy(&frame).contains("\x1b[7mrst line"),
+            "the selection is highlighted"
+        );
+        assert!(view.input(b"\x1b[<0;4;2m", Instant::now()).scrolled);
+        let copied = BASE64_STANDARD.encode("rst line\nseco");
+        assert!(
+            String::from_utf8_lossy(&view.forwarded()).contains(&format!("]52;c;{copied}\x07")),
+            "the text reaches the clipboard"
+        );
+        assert!(view.selection.is_some(), "it stays highlighted");
+        assert!(view.input(b"x", Instant::now()).scrolled);
+        assert!(view.selection.is_none(), "typing drops it");
+    }
+
+    #[test]
+    fn a_click_copies_nothing_and_a_wrapped_line_copies_as_one() {
+        let mut view = View::new(10, 8);
+        view.output(b"abcdefghijklmn\r\nnext\r\n");
+        view.frame(&pane());
+        view.input(b"\x1b[<0;1;1M\x1b[<0;1;1m", Instant::now());
+        assert!(view.selection.is_none());
+        assert!(!String::from_utf8_lossy(&view.forwarded()).contains("]52;"));
+        view.input(b"\x1b[<0;1;1M\x1b[<32;2;3M\x1b[<0;2;3m", Instant::now());
+        let copied = BASE64_STANDARD.encode("abcdefghijklmn\nne");
+        assert!(String::from_utf8_lossy(&view.forwarded()).contains(&copied));
+    }
+
     #[test]
     fn a_kitty_encoded_ctrl_c_is_an_interrupt() {
         let mut view = View::new(40, 6);
