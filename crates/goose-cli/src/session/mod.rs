@@ -1513,7 +1513,7 @@ impl CliSession {
         let cancel_token_clone = cancel_token.clone();
         let mut markdown_buffer = streaming_buffer::MarkdownBuffer::new();
         let mut prompted_credits_urls: HashSet<String> = HashSet::new();
-        let mut thinking_header_shown = false;
+        let mut thinking_block = output::ThinkingBlock::default();
         let run_started = Instant::now();
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
@@ -1558,7 +1558,7 @@ impl CliSession {
                         } else if !view.key(key) {
                             background = None;
                             print_held_status(&mut held_status);
-                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                         }
                         continue;
                     }
@@ -1569,7 +1569,7 @@ impl CliSession {
                         } else if !view.key(key) {
                             tool_view = None;
                             print_held_status(&mut held_status);
-                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                         }
                         continue;
                     }
@@ -1720,7 +1720,7 @@ impl CliSession {
                     children.handle_key(key, true).await;
                     if was_open && !children.is_open() {
                         print_held_status(&mut held_status);
-                        render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                        render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                     }
                 }
                 notification = shutdown::next_notification(&mut shutdown_rx) => {
@@ -1743,7 +1743,7 @@ impl CliSession {
                         } else {
                             output::hide_thinking();
                             let _ = progress_bars.hide();
-                            output::render_message_streaming(echo, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                            output::render_message_streaming(echo, &mut markdown_buffer, &mut thinking_block, self.debug);
                         }
                     }
                     if delivered {
@@ -1784,7 +1784,7 @@ impl CliSession {
                                 tool_view = None;
                                 background = None;
                                 children.suspend();
-                                render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                                render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                             }
                             if let Some(confirmation_request) = find_tool_confirmation(&message) {
                                 let selected_permission = if interactive {
@@ -1929,7 +1929,7 @@ impl CliSession {
                                 } else if children.is_open() || background.is_some() {
                                     deferred_messages.push(message);
                                 } else if !is_json_mode {
-                                    output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                                    output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_block, self.debug);
                                     maybe_open_credits_top_up_url(
                                         &message,
                                         interactive,
@@ -1966,7 +1966,7 @@ impl CliSession {
                             tool_view = None;
                             background = None;
                             children.suspend();
-                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                             if interactive || !is_stream_json_mode {
                                 handle_agent_error(&e, is_stream_json_mode);
                             }
@@ -1992,7 +1992,7 @@ impl CliSession {
                     tool_view = None;
                     background = None;
                     children.suspend();
-                    render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                    render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                     drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
                     drop(stream);
                     if let Err(e) = self.handle_interrupted_messages(true).await {
@@ -2032,9 +2032,10 @@ impl CliSession {
         render_deferred(
             &mut deferred_messages,
             &mut markdown_buffer,
-            &mut thinking_header_shown,
+            &mut thinking_block,
             self.debug,
         );
+        thinking_block.close();
 
         let failed = input_failed
             || stream_error.is_some()
@@ -3144,11 +3145,11 @@ fn erase_accepted_prompt_line() {
 fn render_deferred(
     messages: &mut Vec<Message>,
     markdown_buffer: &mut streaming_buffer::MarkdownBuffer,
-    thinking_header_shown: &mut bool,
+    thinking_block: &mut output::ThinkingBlock,
     debug: bool,
 ) {
     for message in messages.drain(..) {
-        output::render_message_streaming(&message, markdown_buffer, thinking_header_shown, debug);
+        output::render_message_streaming(&message, markdown_buffer, thinking_block, debug);
     }
 }
 

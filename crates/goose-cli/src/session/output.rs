@@ -417,7 +417,8 @@ pub fn render_message(message: &Message, debug: bool) {
             },
             MessageContent::Text(text) => {
                 let mut buffer = MarkdownBuffer::new();
-                render_reply_text(&text.text, &mut buffer, theme);
+                let shown = text.text.trim_start_matches(['\n', '\r']);
+                render_reply_text(shown, &mut buffer, theme);
                 flush_markdown_buffer(&mut buffer, theme);
             }
             MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
@@ -425,11 +426,12 @@ pub fn render_message(message: &Message, debug: bool) {
             MessageContent::Image(image) => {
                 outln!("Image: [data: {}, type: {}]", image.data, image.mime_type);
             }
-            MessageContent::Thinking(t) => render_thinking(&t.thinking, theme),
-            MessageContent::RedactedThinking(_) => {
-                outln!("\n{}", style("Thinking:").dim().italic());
-                print_markdown("Thinking was redacted", theme);
+            MessageContent::Thinking(t) => {
+                if should_show_thinking() {
+                    print_thinking_block(&t.thinking);
+                }
             }
+            MessageContent::RedactedThinking(_) => print_thinking_block("Thinking was redacted"),
             MessageContent::SystemNotification(notification) => {
                 match notification.notification_type {
                     SystemNotificationType::ThinkingMessage
@@ -467,7 +469,7 @@ pub fn render_message(message: &Message, debug: bool) {
 pub fn render_message_streaming(
     message: &Message,
     buffer: &mut MarkdownBuffer,
-    thinking_header_shown: &mut bool,
+    thinking: &mut ThinkingBlock,
     debug: bool,
 ) {
     if !message.is_user_visible() {
@@ -475,6 +477,8 @@ pub fn render_message_streaming(
     }
     // A message typed during the turn and handed to it, shown the way it was typed.
     if message.metadata.steer && message.role == Role::User {
+        thinking.close();
+        thinking.in_reply = false;
         flush_markdown_buffer(buffer, get_theme());
         outln!("\n{} {}", accent(">"), message.as_concat_text());
         let _ = std::io::stdout().flush();
@@ -484,15 +488,39 @@ pub fn render_message_streaming(
     let theme = get_theme();
 
     for content in &message.content {
-        if !matches!(content, MessageContent::Thinking(_)) {
-            if *thinking_header_shown {
-                outln!();
-            }
-            *thinking_header_shown = false;
+        // Blank text and progress notices print nothing, so they do not split a thinking block.
+        let continues_thinking = match content {
+            MessageContent::Thinking(_) => true,
+            MessageContent::Text(text) => text.text.trim().is_empty(),
+            MessageContent::SystemNotification(notification) => matches!(
+                notification.notification_type,
+                SystemNotificationType::ThinkingMessage | SystemNotificationType::ProgressMessage
+            ),
+            _ => false,
+        };
+        if !continues_thinking {
+            thinking.close();
+        }
+        if !matches!(
+            content,
+            MessageContent::Text(_) | MessageContent::SystemNotification(_)
+        ) {
+            thinking.in_reply = false;
         }
 
         match content {
-            MessageContent::Text(text) => render_reply_text(&text.text, buffer, theme),
+            MessageContent::Text(text) => {
+                // A reply starts on the line under whatever came before it, with no gap.
+                let shown = if thinking.in_reply {
+                    text.text.as_str()
+                } else {
+                    text.text.trim_start_matches(['\n', '\r'])
+                };
+                if !thinking.open && !shown.is_empty() {
+                    thinking.in_reply = true;
+                    render_reply_text(shown, buffer, theme);
+                }
+            }
             MessageContent::ToolRequest(req) => {
                 flush_markdown_buffer(buffer, theme);
                 render_tool_request(req, theme, debug);
@@ -523,12 +551,13 @@ pub fn render_message_streaming(
                 outln!("Image: [data: {}, type: {}]", image.data, image.mime_type);
             }
             MessageContent::Thinking(t) => {
-                render_thinking_streaming(&t.thinking, buffer, thinking_header_shown, theme);
+                if should_show_thinking() {
+                    render_thinking_streaming(&t.thinking, buffer, thinking, theme);
+                }
             }
             MessageContent::RedactedThinking(_) => {
                 flush_markdown_buffer(buffer, theme);
-                outln!("\n{}", style("Thinking:").dim().italic());
-                print_markdown("Thinking was redacted", theme);
+                print_thinking_block("Thinking was redacted");
             }
             MessageContent::SystemNotification(notification) => {
                 match notification.notification_type {
@@ -607,9 +636,13 @@ pub fn get_credits_top_up_url(message: &Message) -> Option<String> {
 }
 
 pub fn flush_markdown_buffer(buffer: &mut MarkdownBuffer, theme: Theme) {
+    // Whatever follows a reply sits directly under it: its trailing blank lines stop here.
     let remaining = buffer.flush();
-    if !remaining.is_empty() {
-        print_markdown(&remaining, theme);
+    let body = remaining.trim_end_matches(['\n', '\r']);
+    if !body.is_empty() {
+        print_markdown(&format!("{body}\n"), theme);
+    } else if !remaining.is_empty() && !at_line_start() {
+        outln!();
     }
 }
 
@@ -653,28 +686,119 @@ fn should_show_thinking() -> bool {
     thinking_enabled(Config::global()) && std::io::stdout().is_terminal()
 }
 
-fn render_thinking(text: &str, theme: Theme) {
-    if should_show_thinking() && !text.is_empty() {
-        outln!("\n{}", style("Thinking:").dim().italic());
-        print_markdown(text, theme);
+/// Where a thinking block's lines start, under the text after its `  ▸ `.
+const THINKING_INDENT: usize = 4;
+const THINKING_LABEL: &str = "Thinking:";
+
+/// One thinking block as it streams: `  ▸ Thinking: ` and gray prose wrapped at the terminal's
+/// edge under a hanging indent, with no blank line above, below or inside it.
+///
+/// Every word carries its own color. Styling a whole chunk would put line ends inside one
+/// color span, and the printer, which splits output at line ends, would then show the words
+/// after the split in white.
+#[derive(Default)]
+pub struct ThinkingBlock {
+    open: bool,
+    column: usize,
+    width: Option<usize>,
+    word: String,
+    space_before_word: bool,
+    break_before_word: bool,
+    /// Reply text is in progress, so its blank lines separate paragraphs.
+    in_reply: bool,
+}
+
+impl ThinkingBlock {
+    fn push(&mut self, text: &str, width: Option<usize>) {
+        self.width = width.map(|width| width.saturating_sub(1));
+        for character in text.chars() {
+            if character == '\n' || character == '\r' {
+                self.end_word();
+                self.break_before_word = self.open;
+                self.space_before_word = false;
+            } else if character.is_whitespace() {
+                self.end_word();
+                self.space_before_word = self.open && !self.break_before_word;
+            } else if !character.is_control() {
+                self.word.push(character);
+            }
+        }
     }
+
+    fn end_word(&mut self) {
+        if self.word.is_empty() {
+            return;
+        }
+        let word = std::mem::take(&mut self.word);
+        let word_width = console::measure_text_width(&word);
+        if !self.open {
+            if !at_line_start() {
+                outln!();
+            }
+            out!(
+                "{} {} ",
+                style("  ▸").dim(),
+                style(THINKING_LABEL).dim().italic()
+            );
+            self.column = THINKING_INDENT + THINKING_LABEL.len() + 1;
+            self.open = true;
+        }
+        let spaced_width = word_width + usize::from(self.space_before_word);
+        let overflows = self
+            .width
+            .is_some_and(|width| self.column + spaced_width > width);
+        if self.break_before_word || (overflows && self.column > THINKING_INDENT) {
+            outln!();
+            out!("{}", " ".repeat(THINKING_INDENT));
+            self.column = THINKING_INDENT;
+        } else if self.space_before_word {
+            out!(" ");
+            self.column += 1;
+        }
+        out!("{}", style(word).dim());
+        self.column += word_width;
+        self.space_before_word = false;
+        self.break_before_word = false;
+    }
+
+    /// Ends the block's last line. The next thinking text starts a new block.
+    pub fn close(&mut self) {
+        self.end_word();
+        if self.open {
+            outln!();
+            let _ = std::io::stdout().flush();
+        }
+        *self = Self {
+            in_reply: self.in_reply,
+            ..Self::default()
+        };
+    }
+}
+
+fn terminal_width() -> Option<usize> {
+    std::io::stdout()
+        .is_terminal()
+        .then(|| Term::stdout().size().1 as usize)
+}
+
+fn print_thinking_block(text: &str) {
+    let mut block = ThinkingBlock::default();
+    block.push(text, terminal_width());
+    block.close();
 }
 
 fn render_thinking_streaming(
     text: &str,
     buffer: &mut MarkdownBuffer,
-    header_shown: &mut bool,
+    block: &mut ThinkingBlock,
     theme: Theme,
 ) {
-    if should_show_thinking() && !text.is_empty() {
-        flush_markdown_buffer(buffer, theme);
-        if !*header_shown {
-            outln!("\n{}", style("Thinking:").dim().italic());
-            *header_shown = true;
-        }
-        out!("{}", style(text).dim());
-        let _ = std::io::stdout().flush();
+    if !block.open && text.trim().is_empty() {
+        return;
     }
+    flush_markdown_buffer(buffer, theme);
+    block.push(text, terminal_width());
+    let _ = std::io::stdout().flush();
 }
 
 /// A tool call is one line of the transcript: `▸` and what the call does. Everything else
@@ -775,10 +899,7 @@ fn print_tool_call_line(summary: &str) {
     if !at_line_start() {
         outln!();
     }
-    let width = std::io::stdout()
-        .is_terminal()
-        .then(|| Term::stdout().size().1 as usize);
-    outln!("{}", style(tool_call_line(summary, width)).dim());
+    outln!("{}", style(tool_call_line(summary, terminal_width())).dim());
 }
 
 /// A session status line (e.g. `◼ shutdown · …`), dim and on a line of its own like a tool
@@ -844,7 +965,17 @@ fn render_reply_text(text: &str, buffer: &mut MarkdownBuffer, theme: Theme) {
         match segment {
             super::router_notices::Segment::Text(text) => {
                 if let Some(safe_content) = buffer.push(&text) {
-                    print_markdown(&safe_content, theme);
+                    // A blank line waits for the next paragraph, so it never ends up as a gap
+                    // above a thinking block or tool call.
+                    let body = safe_content.trim_end_matches('\n');
+                    let trailing = safe_content.len() - body.len();
+                    if body.is_empty() {
+                        buffer.hold(&safe_content);
+                    } else {
+                        let line_end = if trailing > 0 { "\n" } else { "" };
+                        print_markdown(&format!("{body}{line_end}"), theme);
+                        buffer.hold(&"\n".repeat(trailing.saturating_sub(1)));
+                    }
                 }
             }
             super::router_notices::Segment::Notice(notice) => {
@@ -1885,12 +2016,12 @@ mod tests {
     #[test]
     fn captured_rendering_collects_what_would_print() {
         let mut buffer = MarkdownBuffer::new();
-        let mut thinking_header_shown = false;
+        let mut thinking_block = ThinkingBlock::default();
         let rendered = capture_output(|| {
             render_message_streaming(
                 &Message::assistant().with_text("Admitted the worker.\n"),
                 &mut buffer,
-                &mut thinking_header_shown,
+                &mut thinking_block,
                 false,
             );
             flush_markdown_buffer_current_theme(&mut buffer);
@@ -1906,7 +2037,7 @@ mod tests {
     #[test]
     fn an_external_message_is_shown_with_its_sender_and_body() {
         let mut buffer = MarkdownBuffer::new();
-        let mut thinking_header_shown = false;
+        let mut thinking_block = ThinkingBlock::default();
         let rendered = capture_output(|| {
             render_message_streaming(
                 &Message::assistant().with_text(
@@ -1914,7 +2045,7 @@ mod tests {
                      > Stop run 7 now.\n\nStopping run 7.\n",
                 ),
                 &mut buffer,
-                &mut thinking_header_shown,
+                &mut thinking_block,
                 false,
             );
             flush_markdown_buffer_current_theme(&mut buffer);
@@ -2179,13 +2310,92 @@ mod tests {
     fn stream(messages: &[Message]) -> String {
         let printed = capture_output(|| {
             let mut buffer = MarkdownBuffer::new();
-            let mut thinking = false;
+            let mut thinking = ThinkingBlock::default();
             for message in messages {
                 render_message_streaming(message, &mut buffer, &mut thinking, false);
             }
             flush_markdown_buffer(&mut buffer, Theme::Dark);
         });
         console::strip_ansi_codes(&printed).into_owned()
+    }
+
+    fn thinking_output(chunks: &[&str], width: Option<usize>) -> String {
+        capture_output(|| {
+            let mut block = ThinkingBlock::default();
+            for chunk in chunks {
+                block.push(chunk, width);
+            }
+            block.close();
+        })
+    }
+
+    #[test]
+    fn thinking_is_one_arrowed_block_with_no_gaps() {
+        let printed = thinking_output(
+            &[
+                "\n\nChecking the ",
+                "build.\n",
+                "\n\n",
+                "Then the tests.\n\n",
+            ],
+            None,
+        );
+        assert_eq!(
+            console::strip_ansi_codes(&printed),
+            "  ▸ Thinking: Checking the build.\n    Then the tests.\n"
+        );
+    }
+
+    #[test]
+    fn thinking_wraps_at_the_side_under_its_indent() {
+        let printed = thinking_output(&["one two three four five six seven"], Some(25));
+        assert_eq!(
+            console::strip_ansi_codes(&printed),
+            "  ▸ Thinking: one two\n    three four five six\n    seven\n"
+        );
+    }
+
+    #[test]
+    fn empty_thinking_prints_nothing() {
+        assert_eq!(thinking_output(&["", " \n\n "], None), "");
+    }
+
+    /// The printer splits output at line ends. Each line has to open its own color, or the
+    /// words after the split show white among the gray.
+    #[test]
+    fn every_line_of_thinking_opens_its_own_color() {
+        console::set_colors_enabled(true);
+        let printed = thinking_output(&["first line\n\nsecond line"], None);
+        console::set_colors_enabled(false);
+        for line in printed.lines() {
+            assert!(line.contains("\u{1b}[2m"), "{line:?}");
+            assert!(line.ends_with("\u{1b}[0m"), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_restored_reply_has_no_gap_around_it() {
+        let printed = capture_output(|| {
+            render_message(
+                &Message::assistant().with_text("\n\nThe build passed.\n\n"),
+                false,
+            )
+        });
+        assert_eq!(console::strip_ansi_codes(&printed), "The build passed.\n");
+    }
+
+    #[test]
+    fn replies_keep_paragraphs_but_leave_no_gap_around_other_output() {
+        let printed = stream(&[
+            Message::assistant().with_text("\n\nFirst paragraph.\n"),
+            Message::assistant().with_text("\nSecond paragraph.\n\n"),
+            terminal_request("t1"),
+            Message::assistant().with_text("\n\nDone.\n\n"),
+        ]);
+        assert_eq!(
+            printed,
+            "First paragraph.\n\nSecond paragraph.\n  ▸ Terminal\nDone.\n"
+        );
     }
 
     #[test]
