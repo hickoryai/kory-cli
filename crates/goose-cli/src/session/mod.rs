@@ -2804,10 +2804,13 @@ impl CliSession {
             return;
         };
         match shutdown::request(provider.as_ref()).await {
-            Ok(notifications) => {
+            Ok(requested) => {
+                if !requested.answered {
+                    output::print_status_line(shutdown::UNANSWERED);
+                }
                 *self.shutdown.lock().unwrap() = Some(shutdown::Run {
                     session_id,
-                    notifications,
+                    notifications: requested.notifications,
                     drained: false,
                 });
                 if let Some(dock) = self.dock() {
