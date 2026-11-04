@@ -1,15 +1,15 @@
 //! The pane under the session's output, laid out like Claude Code's footer:
 //!
 //! ```text
-//!   ✻ working 1m 12s · 1 queued                    ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌ 40% 102k/258k
-//!   ─────────────────────────────────────────────────────────────────────────────────────
+//!   ✻ working 1m 12s · 1 queued ────────────────── ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌ 40% 102k/258k
 //!   › the message being written
 //!   ─────────────────────────────────────────────────────────────────────────────────────
 //!   12 running                         Enter queues · Ctrl+Enter interrupts · ↓ children
 //!     opus[1m] [6m] jam-packet-map  01a19fae  → Read file …
 //! ```
 //!
-//! A status and context line, the input box between two rules, and the session's running
+//! The input box between two rules, the upper one carrying the status on its left and the
+//! context bar on its right, and the session's running
 //! children. The relay (`relay.rs`) draws it below the output and takes it off the screen
 //! before every write, so none of it ever enters the terminal's history; nothing here
 //! positions the cursor or reserves rows. The pane reads no input itself: the session feeds
@@ -42,6 +42,8 @@ const MAX_ROWS: usize = 6;
 const MAX_INPUT_ROWS: usize = 6;
 /// The input box's "› " gutter.
 const GUTTER: usize = 2;
+/// Columns of rule always shown between the status and the context bar.
+const MIN_RULE: usize = 3;
 
 /// The live pane, so a full-screen view or child process can hand the screen back and forth.
 static ACTIVE: OnceLock<Mutex<Weak<Shared>>> = OnceLock::new();
@@ -702,8 +704,8 @@ fn child_slots(state: &State, cols: usize, lines: usize) -> usize {
         .rows
         .len()
         .min(MAX_INPUT_ROWS);
-    // Status line, two rules, the input, the children's summary, and two rows of output.
-    let fixed = 3 + input + 1 + 2 + usize::from(state.notice.is_some());
+    // Two rules, the input, the children's summary, and two rows of output.
+    let fixed = 2 + input + 1 + 2 + usize::from(state.notice.is_some());
     lines.saturating_sub(fixed).min(MAX_ROWS)
 }
 
@@ -737,7 +739,7 @@ fn follow_selection(state: &mut State) {
 fn pane(state: &State, cols: usize, lines: usize) -> Vec<String> {
     let width = cols.saturating_sub(1);
     let rule = style("─".repeat(width)).dim().to_string();
-    let mut out = vec![status_line(state, width), rule.clone()];
+    let mut out = vec![top_rule(state, width)];
     if state.question {
         out.push(format!(
             "{} {}",
@@ -797,8 +799,9 @@ fn goal_label(goal: &goose::providers::base::SessionGoal, selected: bool) -> Str
     }
 }
 
-/// What the session is doing on the left, the context window on the right.
-fn status_line(state: &State, width: usize) -> String {
+/// The rule over the input box: what the session is doing on its left, the context window on
+/// its right.
+fn top_rule(state: &State, width: usize) -> String {
     let mut left = Vec::new();
     if let Some(status) = &state.status {
         left.push(style(status.clone()).yellow().to_string());
@@ -817,12 +820,22 @@ fn status_line(state: &State, width: usize) -> String {
     if let Some(goal) = &state.goal {
         left.push(goal_label(goal, state.goal_selected));
     }
-    let left = format!("  {}", left.join(&style(" · ").dim().to_string()));
+    let left = left.join(&style(" · ").dim().to_string());
+    let left = if left.is_empty() {
+        left
+    } else {
+        format!("  {left} ")
+    };
     let right = state
         .context
-        .map(|(used, limit)| context_bar(used, limit))
+        .map(|(used, limit)| format!(" {}", context_bar(used, limit)))
         .unwrap_or_default();
-    spread(&left, &right, width)
+    let right_width = console::measure_text_width(&right);
+    // The status gives way to the bar, and always leaves a stretch of rule between them.
+    let room = width.saturating_sub(right_width + MIN_RULE);
+    let left = console::truncate_str(&left, room, "… ");
+    let fill = width.saturating_sub(console::measure_text_width(&left) + right_width);
+    format!("{left}{}{right}", style("─".repeat(fill)).dim())
 }
 
 /// `left` and `right` on one line, `right` flush right; `left` gives way when both do not fit.
@@ -1138,18 +1151,19 @@ mod tests {
             ..State::default()
         };
         let lines = painted(&state, 80, 40);
-        assert!(lines[0].ends_with("40% 102k/258k"), "{lines:?}");
+        // The context bar is part of the rule over the input box, not a row of its own.
         assert!(
-            lines[1].starts_with("───") && lines[3].starts_with("───"),
+            lines[0].starts_with("───") && lines[0].ends_with("40% 102k/258k"),
             "{lines:?}"
         );
-        assert_eq!(lines[2], "› hi");
+        assert!(lines[2].starts_with("───"), "{lines:?}");
+        assert_eq!(lines[1], "› hi");
         assert!(
-            lines[4].contains("2 running") && lines[4].ends_with("↓ children"),
+            lines[3].contains("2 running") && lines[3].ends_with("↓ children"),
             "{lines:?}"
         );
-        assert!(lines[5].contains("opus 5.5") && lines[6].contains("opus 5.5"));
-        assert_eq!(lines.len(), 7);
+        assert!(lines[4].contains("opus 5.5") && lines[5].contains("opus 5.5"));
+        assert_eq!(lines.len(), 6);
         let styled = pane(&state, 80, 40);
         assert!(
             styled
@@ -1160,24 +1174,32 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_shows_its_time_and_queue_on_the_status_line() {
+    fn a_turn_shows_its_time_and_queue_on_the_rule_over_the_input() {
         let mut state = State {
             turn_started: Some(Instant::now() - Duration::from_secs(75)),
             queued: vec!["x".into()],
             status: Some("shutting down 1/3".into()),
+            context: Some((160_000, 1_000_000)),
             ..State::default()
         };
-        let lines = painted(&state, 80, 40);
+        let lines = painted(&state, 120, 40);
         assert!(
-            lines[0].contains("shutting down 1/3 · ✻ working 1m 15s · 1 queued"),
+            lines[0].contains("shutting down 1/3 · ✻ working 1m 15s · 1 queued ──")
+                && lines[0].ends_with("16% 160k/1.0M"),
             "{lines:?}"
         );
         assert!(
-            lines[4].ends_with("Enter queues · Ctrl+Enter interrupts"),
+            lines[3].ends_with("Enter queues · Ctrl+Enter interrupts"),
             "{lines:?}"
+        );
+        // A status too long for the row gives way; the bar and some rule stay.
+        let narrow = painted(&state, 60, 40);
+        assert!(
+            narrow[0].contains("… ───") && narrow[0].ends_with("16% 160k/1.0M"),
+            "{narrow:?}"
         );
         state.turn_started = None;
-        assert!(painted(&state, 80, 40)[4].ends_with("Enter sends · Ctrl+J newline"));
+        assert!(painted(&state, 120, 40)[3].ends_with("Enter sends · Ctrl+J newline"));
     }
 
     #[test]
@@ -1189,15 +1211,16 @@ mod tests {
             size: (80, 12),
             ..State::default()
         };
-        // Twelve lines: status, two rules, one input row, the summary and two output rows
-        // leave five child slots, the last of them saying what is out of view.
-        assert_eq!(child_slots(&state, 80, 12), 5);
+        // Eleven lines: two rules, one input row, the summary and two output rows leave five
+        // child slots, the last of them saying what is out of view.
+        state.size = (80, 11);
+        assert_eq!(child_slots(&state, 80, 11), 5);
         for _ in 0..6 {
             state.selected = next_selection(state.selected, state.rows.len(), 1);
             follow_selection(&mut state);
         }
         assert_eq!((state.selected, state.offset), (Some(5), 2));
-        let lines = painted(&state, 80, 12);
+        let lines = painted(&state, 80, 11);
         assert!(
             lines.iter().any(|line| line.contains("› opus 5.5")),
             "{lines:?}"
@@ -1486,7 +1509,7 @@ mod tests {
         assert!(dock.select_goal());
         let lines = painted(&dock.shared.state.lock().unwrap(), 100, 40);
         assert!(
-            lines[4].contains("goal: Enter edit · Delete remove"),
+            lines[3].contains("goal: Enter edit · Delete remove"),
             "{lines:?}"
         );
         assert_eq!(dock.goal_key(Key::Char('x')), GoalKey::Stay);
@@ -1517,6 +1540,6 @@ mod tests {
             always_list: true,
             ..State::default()
         };
-        assert!(painted(&state, 80, 40)[4].contains("no children running"));
+        assert!(painted(&state, 80, 40)[3].contains("no children running"));
     }
 }
