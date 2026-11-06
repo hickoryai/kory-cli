@@ -596,6 +596,103 @@ pub fn render_message_streaming(
     let _ = std::io::stdout().flush();
 }
 
+/// One piece of a child session's transcript: a goose message, or what a router-acp delegate
+/// logged (a tool call's one line, or a notice).
+pub enum TranscriptEntry {
+    Message(Message),
+    ToolCall(String),
+    Notice(String),
+}
+
+/// A child session's whole transcript, rendered exactly as its parent renders its own output
+/// (the submitted prompt's `›` line, thinking blocks, markdown replies, tool-call lines), into a
+/// string instead of the terminal.
+pub fn render_transcript(entries: &[TranscriptEntry], debug: bool) -> String {
+    capture_output(|| {
+        let mut buffer = MarkdownBuffer::new();
+        let mut thinking = ThinkingBlock::default();
+        let theme = get_theme();
+        let settle = |buffer: &mut MarkdownBuffer, thinking: &mut ThinkingBlock| {
+            thinking.close();
+            thinking.in_reply = false;
+            flush_markdown_buffer(buffer, theme);
+        };
+        for entry in entries {
+            match entry {
+                TranscriptEntry::Message(message) => {
+                    if !message.is_user_visible() {
+                        continue;
+                    }
+                    let message = transcript_message(&message.user_visible_content());
+                    if message.role == Role::User && !message.metadata.steer {
+                        let prompt = message.as_concat_text();
+                        if !prompt.trim().is_empty() {
+                            settle(&mut buffer, &mut thinking);
+                            print_submitted(&prompt);
+                        }
+                        let mut rest = message.clone();
+                        rest.content
+                            .retain(|content| !matches!(content, MessageContent::Text(_)));
+                        if !rest.content.is_empty() {
+                            render_message_streaming(&rest, &mut buffer, &mut thinking, debug);
+                        }
+                    } else {
+                        render_message_streaming(&message, &mut buffer, &mut thinking, debug);
+                    }
+                }
+                TranscriptEntry::ToolCall(summary) => {
+                    settle(&mut buffer, &mut thinking);
+                    print_tool_call_line(&sanitize_terminal_line(summary));
+                }
+                TranscriptEntry::Notice(notice) => {
+                    settle(&mut buffer, &mut thinking);
+                    if !at_line_start() {
+                        outln!();
+                    }
+                    outln!("{} {}", style("·").dim(), sanitize_terminal_line(notice));
+                }
+            }
+        }
+        settle(&mut buffer, &mut thinking);
+    })
+}
+
+/// A message without what only a live turn shows (the thinking spinner's notices), so
+/// replaying it draws nothing outside the transcript.
+fn transcript_message(message: &Message) -> Message {
+    let mut message = message.clone();
+    message.content.retain(|content| {
+        !matches!(
+            content,
+            MessageContent::SystemNotification(notification)
+                if matches!(
+                    notification.notification_type,
+                    SystemNotificationType::ThinkingMessage
+                        | SystemNotificationType::ProgressMessage
+                )
+        )
+    });
+    message
+}
+
+/// A submitted prompt as the transcript keeps it: `›` and its first line, the rest indented.
+fn print_submitted(text: &str) {
+    if !at_line_start() {
+        outln!();
+    }
+    let mut lines = text.trim_matches(['\n', '\r']).lines();
+    if let Some(first) = lines.next() {
+        outln!(
+            "{} {}",
+            style("›").cyan().bold(),
+            sanitize_terminal_line(first)
+        );
+    }
+    for line in lines {
+        outln!("  {}", sanitize_terminal_line(line));
+    }
+}
+
 fn reached_output_token_limit(message: &Message) -> bool {
     message.role == Role::Assistant && message.metadata.output_token_limit_reached
 }
@@ -1702,6 +1799,32 @@ pub fn display_session_info(
         },
         format!("{}", style("🌱 kory is ready").white()),
     ];
+    print_seedling(&info);
+}
+
+/// The header a child session's transcript opens with: the parent's seedling, with the child's
+/// state, model and id beside it.
+pub fn child_session_header(status: &str, model: &str, label: &str, id: &str) -> String {
+    capture_output(|| {
+        print_seedling(&[
+            format!(
+                "{} {} {} {}",
+                style("●").green(),
+                style(format!("child session · {status}")).dim(),
+                style("·").dim(),
+                style(sanitize_terminal_line(model)).cyan(),
+            ),
+            format!(
+                "{} {}",
+                style(sanitize_terminal_line(id)).dim(),
+                style(format!("· {}", sanitize_terminal_line(label))).dim()
+            ),
+            style("↩ Esc returns to the parent").dim().to_string(),
+        ]);
+    })
+}
+
+fn print_seedling(info: &[String]) {
     // A wrapped info line would split the seedling, so each fits beside it.
     let room = (console::Term::stdout().size().1 as usize)
         .saturating_sub(2 + SEEDLING[0].len() + 3)
@@ -2012,6 +2135,32 @@ mod tests {
     use serde_json::json;
     use std::env;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn a_child_transcript_renders_as_the_session_renders_its_own() {
+        let rendered = render_transcript(
+            &[
+                TranscriptEntry::Message(Message::user().with_text("Map the jam packets\nfast")),
+                TranscriptEntry::Message(Message::assistant().with_text("Reading the code.\n")),
+                TranscriptEntry::ToolCall("Read file · completed".into()),
+                TranscriptEntry::Notice("error: \x1b[2Jboom".into()),
+            ],
+            false,
+        );
+        let plain = strip_str(&rendered).to_string();
+        let lines: Vec<&str> = plain.lines().map(str::trim_end).collect();
+        assert_eq!(lines[0], "› Map the jam packets");
+        assert_eq!(lines[1], "  fast");
+        assert!(lines.contains(&"Reading the code."), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("▸") && line.contains("Read file")),
+            "{lines:?}"
+        );
+        assert!(!rendered.contains("\x1b[2J"));
+        assert!(plain.ends_with('\n'));
+    }
 
     #[test]
     fn captured_rendering_collects_what_would_print() {

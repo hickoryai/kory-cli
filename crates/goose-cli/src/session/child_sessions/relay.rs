@@ -65,8 +65,57 @@ struct Relay {
     real_termios: libc::termios,
     wake: [RawFd; 2],
     painter: Mutex<Option<Painter>>,
+    /// A child session shown in place of the session's own transcript and pane.
+    child: Mutex<Option<ChildFeed>>,
     stop: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// A child session's rendered transcript and its pane; `generation` changes with either.
+struct ChildFeed {
+    generation: u64,
+    transcript: Arc<Vec<u8>>,
+    painter: Painter,
+}
+
+/// The child session on screen: its own emulator, so it scrolls, selects and rewraps exactly
+/// as the session's transcript does.
+struct ChildView {
+    view: View,
+    generation: u64,
+    fed: Arc<Vec<u8>>,
+}
+
+impl ChildView {
+    fn new(size: (usize, usize)) -> Self {
+        Self {
+            view: View::new(size.0, size.1),
+            generation: u64::MAX,
+            fed: Arc::default(),
+        }
+    }
+
+    /// The child's transcript as rendered now. Output that only grew is appended, so a view
+    /// scrolled up stays on its rows; anything else is drawn afresh.
+    fn update(&mut self, feed: &ChildFeed) -> bool {
+        if self.generation == feed.generation {
+            return false;
+        }
+        self.generation = feed.generation;
+        if !Arc::ptr_eq(&self.fed, &feed.transcript) {
+            match feed.transcript.strip_prefix(self.fed.as_slice()) {
+                Some(more) => self.view.output(more),
+                None => {
+                    let scroll_up = self.view.scroll_up;
+                    self.view = View::new(self.view.size().0, self.view.size().1);
+                    self.view.output(&feed.transcript);
+                    self.view.scroll_up = scroll_up;
+                }
+            }
+            self.fed = feed.transcript.clone();
+        }
+        true
+    }
 }
 
 static RELAY: OnceLock<Option<Arc<Relay>>> = OnceLock::new();
@@ -94,6 +143,61 @@ pub fn remove_painter() {
         *relay.painter.lock().unwrap() = None;
         relay.wake();
     }
+}
+
+/// Shows child session output (`transcript`, as the session itself would have printed it) and
+/// `painter`'s pane in place of the session's own, until `hide_child`. Called again as the
+/// child goes on. False when no relay hosts the terminal.
+pub fn show_child(transcript: &str, painter: Painter) -> bool {
+    let Some(relay) = active() else {
+        return false;
+    };
+    {
+        let mut child = relay.child.lock().unwrap();
+        let bytes = crlf(transcript);
+        let generation = child
+            .as_ref()
+            .map_or(0, |feed| feed.generation.wrapping_add(1));
+        let transcript = match child.as_ref() {
+            Some(feed) if *feed.transcript == bytes => feed.transcript.clone(),
+            _ => Arc::new(bytes),
+        };
+        *child = Some(ChildFeed {
+            generation,
+            transcript,
+            painter,
+        });
+    }
+    relay.wake();
+    true
+}
+
+/// Back to the session's own transcript and pane.
+pub fn hide_child() {
+    if let Some(relay) = active() {
+        if relay.child.lock().unwrap().take().is_some() {
+            relay.wake();
+        }
+    }
+}
+
+/// Whether a relay hosts the terminal, so a child session can be shown in it.
+pub fn is_active() -> bool {
+    active().is_some()
+}
+
+/// Captured output ends lines with `\n` alone; the pseudo-terminal would have added the `\r`.
+fn crlf(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + text.len() / 32);
+    let mut previous = 0u8;
+    for &byte in text.as_bytes() {
+        if byte == b'\n' && previous != b'\r' {
+            bytes.push(b'\r');
+        }
+        bytes.push(byte);
+        previous = byte;
+    }
+    bytes
 }
 
 /// Draw again: what the pane shows changed.
@@ -196,6 +300,7 @@ fn start() -> Option<Arc<Relay>> {
             real_termios,
             wake,
             painter: Mutex::new(None),
+            child: Mutex::new(None),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
         });
@@ -316,6 +421,7 @@ impl Relay {
 
     fn run(&self, (cols, lines): (usize, usize)) {
         let mut view = View::new(cols, lines);
+        let mut child: Option<ChildView> = None;
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_frame = Instant::now() - FRAME;
         let mut dirty = true;
@@ -324,7 +430,12 @@ impl Relay {
             let stopping = self.stop.load(Ordering::SeqCst);
             let timeout = if stopping {
                 30
-            } else if dirty || view.holding_input() {
+            } else if dirty
+                || view.holding_input()
+                || child
+                    .as_ref()
+                    .is_some_and(|shown| shown.view.holding_input())
+            {
                 FRAME.as_millis() as i32
             } else {
                 IDLE_POLL_MS
@@ -347,11 +458,34 @@ impl Relay {
             if !replies.is_empty() {
                 write_fd(self.master, &replies);
             }
+            let child_painter = {
+                let feed = self.child.lock().unwrap();
+                match (feed.as_ref(), child.as_mut()) {
+                    (None, Some(_)) => {
+                        child = None;
+                        dirty = true;
+                        None
+                    }
+                    (None, None) => None,
+                    (Some(feed), shown) => {
+                        let shown = match shown {
+                            Some(shown) => shown,
+                            None => child.insert(ChildView::new(view.size())),
+                        };
+                        dirty |= shown.update(feed);
+                        Some(feed.painter.clone())
+                    }
+                }
+            };
             let mut typed = Vec::new();
             if !stopping {
                 read_all(self.real_in, &mut buf, &mut typed);
             }
-            let input = view.input(&typed, Instant::now());
+            // A child on screen scrolls and selects in its own transcript.
+            let input = match child.as_mut() {
+                Some(shown) => shown.view.input(&typed, Instant::now()),
+                None => view.input(&typed, Instant::now()),
+            };
             if input.scrolled {
                 dirty = true;
             }
@@ -383,6 +517,10 @@ impl Relay {
                 view.resize(size);
                 dirty = true;
             }
+            if let Some(shown) = child.as_mut().filter(|shown| shown.view.size() != size) {
+                shown.view.resize(size);
+                dirty = true;
+            }
             if stopping && output.is_empty() {
                 let mut out = view.forwarded();
                 out.extend_from_slice(LEAVE.as_bytes());
@@ -394,12 +532,18 @@ impl Relay {
                 return;
             }
             if dirty && last_frame.elapsed() >= FRAME {
-                let painter = self.painter.lock().unwrap().clone();
+                let painter = child_painter.or_else(|| self.painter.lock().unwrap().clone());
                 let pane = painter
                     .map(|painter| painter(size.0, size.1))
                     .unwrap_or_default();
                 let mut out = view.forwarded();
-                out.extend_from_slice(&view.frame(&pane));
+                match child.as_mut() {
+                    Some(shown) => {
+                        out.append(&mut shown.view.clipboard);
+                        out.extend_from_slice(&shown.view.frame(&pane));
+                    }
+                    None => out.extend_from_slice(&view.frame(&pane)),
+                }
                 write_fd(self.real_out, &out);
                 last_frame = Instant::now();
                 dirty = false;
@@ -1116,6 +1260,47 @@ mod tests {
 
     fn pane() -> Vec<String> {
         vec!["── rule".into(), "› typed".into()]
+    }
+
+    fn feed(generation: u64, text: &str) -> ChildFeed {
+        ChildFeed {
+            generation,
+            transcript: Arc::new(crlf(text)),
+            painter: Arc::new(|_, _| Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_child_is_drawn_like_the_session_with_its_own_pane() {
+        let mut child = ChildView::new((40, 6));
+        assert!(child.update(&feed(0, "› task\nreply\n")));
+        let rows = screen(&child.view.frame(&pane()), 40, 6);
+        assert_eq!(rows, ["› task", "reply", "", "", "── rule", "› typed"]);
+        assert!(!child.update(&feed(0, "› task\nreply\n")));
+    }
+
+    #[test]
+    fn a_child_that_grew_keeps_a_scrolled_view_on_its_rows() {
+        let text: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let mut child = ChildView::new((60, 8));
+        child.update(&feed(0, &text));
+        child.view.frame(&pane());
+        child.view.input(b"\x1b[<64;1;1M", Instant::now());
+        let before = screen(&child.view.frame(&pane()), 60, 8);
+
+        child.update(&feed(1, &format!("{text}line 30\nline 31\n")));
+        assert_eq!(screen(&child.view.frame(&pane()), 60, 8)[0], before[0]);
+
+        // A transcript that changed rather than grew is drawn afresh.
+        child.view.follow();
+        child.update(&feed(2, "other\n"));
+        let rows = screen(&child.view.frame(&pane()), 60, 8);
+        assert_eq!(rows[0], "other");
+    }
+
+    #[test]
+    fn captured_line_ends_get_their_carriage_return_once() {
+        assert_eq!(crlf("a\nb\r\nc"), b"a\r\nb\r\nc");
     }
 
     #[test]

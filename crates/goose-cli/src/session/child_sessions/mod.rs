@@ -1,6 +1,11 @@
 //! Read-only navigator for the subagent sessions a parent session delegates to.
 //! Opened with Tab while a turn runs, with `/children` between turns, or on a child chosen
 //! from the dock (`dock.rs`), the persistent child list under the prompt.
+//!
+//! A child chosen from either is shown the way the session shows itself: through the relay,
+//! its transcript rendered by the session's own renderer and pinned under it the same status
+//! rule (working time, context bar) and input box. A child has no children, so nothing is
+//! drawn below its input box. Esc on an empty input box goes back.
 
 pub mod dock;
 mod keys;
@@ -17,6 +22,7 @@ mod terminal;
 mod terminal;
 mod view;
 
+use super::output;
 use console::style;
 use goose::agents::state_machine::{subagent_states, SubagentState};
 use goose::conversation::message::{Message, MessageContent};
@@ -25,6 +31,7 @@ use goose::session::SessionManager;
 use goose::utils::safe_truncate;
 pub use keys::Key;
 use rmcp::model::{ContentBlock, Role};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 pub use terminal::EchoOff;
@@ -39,10 +46,167 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const TOOL_RESULT_CHARS: usize = 200;
 
 struct OpenView {
-    screen: terminal::Screen,
+    /// The list of children; `None` while a child session is on screen instead.
+    screen: Option<terminal::Screen>,
     navigator: Navigator,
     snapshot: Snapshot,
     frame: view::Frame,
+    child: Option<ChildScreen>,
+    /// Opened on a child from the dock: leaving that child closes the view.
+    from_dock: bool,
+}
+
+impl OpenView {
+    fn list(navigator: Navigator) -> Self {
+        let mut view = Self::empty(navigator);
+        view.screen = Some(terminal::Screen::enter());
+        view
+    }
+
+    /// Straight into `child`, chosen from the dock.
+    fn child(child: &ChildRow) -> Self {
+        let mut navigator = Navigator::default();
+        navigator.enter(child);
+        let mut view = Self::empty(navigator);
+        view.from_dock = true;
+        view.show_child(Some(child.clone()));
+        if view.child.is_none() {
+            view.screen = Some(terminal::Screen::enter());
+        }
+        view
+    }
+
+    fn empty(navigator: Navigator) -> Self {
+        Self {
+            screen: None,
+            navigator,
+            snapshot: Snapshot::default(),
+            frame: view::Frame::default(),
+            child: None,
+            from_dock: false,
+        }
+    }
+
+    /// The child at the top of the path, shown the way the session shows itself, when the relay
+    /// hosts the terminal (otherwise the navigator's own transcript view stays).
+    fn show_child(&mut self, row: Option<ChildRow>) {
+        let Some(id) = self.navigator.current() else {
+            return;
+        };
+        if self.child.is_some() || !relay::is_active() {
+            return;
+        }
+        let row = row.filter(|row| row.id == id).or_else(|| {
+            self.snapshot
+                .children
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+        });
+        self.child = Some(ChildScreen::new(id.to_string(), row));
+        // The list's screen goes; the child is drawn over the transcript from now on.
+        self.screen = None;
+    }
+}
+
+/// A child session on screen, drawn through the relay exactly as the session draws itself: its
+/// transcript rendered by the session's own renderer, and the status rule and input box under
+/// it, with nothing below them.
+struct ChildScreen {
+    id: String,
+    row: Option<ChildRow>,
+    pane: Arc<dock::ChildPane>,
+    /// What the transcript was rendered from (and at what width), and the rendering.
+    rendered: Option<(u64, String)>,
+    /// When the child was first seen running, for a child that does not say when it started.
+    seen_running: Option<std::time::Instant>,
+}
+
+impl ChildScreen {
+    fn new(id: String, row: Option<ChildRow>) -> Self {
+        Self {
+            id,
+            row,
+            pane: dock::ChildPane::new(),
+            rendered: None,
+            seen_running: None,
+        }
+    }
+
+    fn update(&mut self, loaded: ChildTranscript, width: usize) {
+        if let Some(row) = loaded.row {
+            self.row = Some(row);
+        }
+        let running = self
+            .row
+            .as_ref()
+            .is_some_and(|row| row.status == ChildStatus::Running);
+        let started = running.then(|| {
+            let seen = *self
+                .seen_running
+                .get_or_insert_with(std::time::Instant::now);
+            self.row
+                .as_ref()
+                .and_then(|row| row.started_at)
+                .and_then(|started| (chrono::Utc::now() - started).to_std().ok())
+                .and_then(|elapsed| std::time::Instant::now().checked_sub(elapsed))
+                .unwrap_or(seen)
+        });
+        if !running {
+            self.seen_running = None;
+        }
+        self.pane.set_turn(started);
+        self.pane.set_context(loaded.context);
+
+        let status = self
+            .row
+            .as_ref()
+            .map_or("unknown", |row| row.status.label());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(loaded.fingerprint, width, status), &mut hasher);
+        let key = std::hash::Hasher::finish(&hasher);
+        if self.rendered.as_ref().is_some_and(|(seen, _)| *seen == key) {
+            return;
+        }
+        let (model, label) = self
+            .row
+            .as_ref()
+            .map_or(("unknown model", self.id.as_str()), |row| {
+                (row.model.as_str(), row.label.as_str())
+            });
+        let mut text = output::child_session_header(status, model, label, &self.id);
+        text.push_str(&output::render_transcript(&loaded.entries, false));
+        if let Some(notice) = loaded.notice {
+            text.push_str(&output::render_transcript(
+                &[output::TranscriptEntry::Notice(notice)],
+                false,
+            ));
+        }
+        self.rendered = Some((key, text));
+    }
+
+    fn draw(&self) {
+        if let Some((_, text)) = &self.rendered {
+            relay::show_child(text, self.pane.painter());
+        }
+    }
+}
+
+impl Drop for ChildScreen {
+    fn drop(&mut self) {
+        relay::hide_child();
+    }
+}
+
+/// A child session's transcript as loaded, with what the pane shows for it.
+#[derive(Default)]
+struct ChildTranscript {
+    row: Option<ChildRow>,
+    entries: Vec<output::TranscriptEntry>,
+    context: Option<(usize, usize)>,
+    notice: Option<String>,
+    /// Changes whenever the transcript does.
+    fingerprint: u64,
 }
 
 pub struct ChildSessionNavigator {
@@ -149,21 +313,36 @@ impl ChildSessionNavigator {
     pub async fn handle_key(&mut self, key: Key, turn_active: bool) {
         let Some(view) = self.open.as_mut() else {
             if key == Key::Open {
-                self.open = Some(OpenView {
-                    screen: terminal::Screen::enter(),
-                    navigator: Navigator::default(),
-                    snapshot: Snapshot::default(),
-                    frame: view::Frame::default(),
-                });
+                self.open = Some(OpenView::list(Navigator::default()));
                 self.refresh(turn_active).await;
             }
             return;
         };
-        if view.navigator.handle(key, &view.snapshot, &view.frame) == Outcome::Close {
-            self.close();
+        if let Some(child) = &view.child {
+            match key {
+                Key::Open => return self.close(),
+                // Esc on an empty input box leaves the child: back to the dock it was chosen
+                // from, or to the list.
+                Key::Escape if child.pane.input_is_empty() => {
+                    if view.from_dock {
+                        return self.close();
+                    }
+                    view.screen = Some(terminal::Screen::enter());
+                    view.navigator.ascend();
+                    view.child = None;
+                }
+                key => {
+                    child.pane.type_key(key);
+                    relay::repaint();
+                    return;
+                }
+            }
+        } else if view.navigator.handle(key, &view.snapshot, &view.frame) == Outcome::Close {
+            return self.close();
         } else {
-            self.refresh(turn_active).await;
+            view.show_child(None);
         }
+        self.refresh(turn_active).await;
     }
 
     pub async fn refresh(&mut self, turn_active: bool) {
@@ -179,6 +358,20 @@ impl ChildSessionNavigator {
                 .collect();
             router.follow(&router_path);
         }
+        if let Some(child) = view.child.as_mut() {
+            let loaded = load_child(
+                &self.session_manager,
+                &self.root_id,
+                self.router.as_ref(),
+                &child.id,
+                turn_active,
+            )
+            .await;
+            let (width, _) = terminal_size();
+            child.update(loaded, width);
+            child.draw();
+            return;
+        }
         if let Ok(snapshot) = load_snapshot(
             &self.session_manager,
             &self.root_id,
@@ -190,9 +383,11 @@ impl ChildSessionNavigator {
         {
             view.snapshot = snapshot;
         }
-        let (width, height) = view.screen.size();
-        view.frame = view.navigator.render(&view.snapshot, width, height);
-        view.screen.draw(&view.frame.lines);
+        if let Some(screen) = &view.screen {
+            let (width, height) = screen.size();
+            view.frame = view.navigator.render(&view.snapshot, width, height);
+            screen.draw(&view.frame.lines);
+        }
     }
 
     pub fn close(&mut self) {
@@ -211,14 +406,7 @@ impl ChildSessionNavigator {
         if !self.available {
             return;
         }
-        let mut navigator = Navigator::default();
-        navigator.enter(child);
-        self.open = Some(OpenView {
-            screen: terminal::Screen::enter(),
-            navigator,
-            snapshot: Snapshot::default(),
-            frame: view::Frame::default(),
-        });
+        self.open = Some(OpenView::child(child));
         self.refresh(turn_active).await;
     }
 
@@ -328,6 +516,124 @@ async fn load_snapshot(
         Some(_) => {}
     }
     Ok(snapshot)
+}
+
+/// A child session's transcript and its row in the parent's list, for showing it the way the
+/// parent shows itself.
+async fn load_child(
+    session_manager: &SessionManager,
+    root_id: &str,
+    router: Option<&router::RouterChildren>,
+    id: &str,
+    turn_active: bool,
+) -> ChildTranscript {
+    let mut loaded = ChildTranscript::default();
+    if let Ok(snapshot) = load_snapshot(session_manager, root_id, router, None, turn_active).await {
+        loaded.row = snapshot.children.into_iter().find(|row| row.id == id);
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if is_router_delegate(id) {
+        match router.map(router::RouterChildren::latest) {
+            Some(router::Fetched::Ready(delegates)) => {
+                match delegates.iter().find(|delegate| delegate.id == id) {
+                    Some(delegate) => {
+                        loaded.entries = router_entries(router::transcript_lines(&delegate.log));
+                        delegate.log.len().hash(&mut hasher);
+                        if let Some(last) = delegate.log.last() {
+                            (&last.kind, &last.summary, last.ts).hash(&mut hasher);
+                        }
+                    }
+                    None => loaded.notice = Some("router-acp no longer lists this delegate".into()),
+                }
+            }
+            Some(router::Fetched::Pending) => {
+                loaded.notice = Some("Loading router-acp delegates…".into())
+            }
+            Some(router::Fetched::Failed(error)) => {
+                loaded.notice = Some(format!("router-acp delegates unavailable: {error}"))
+            }
+            None => loaded.notice = Some("router-acp delegates unavailable".into()),
+        }
+    } else {
+        match session_manager.get_session(id, true).await {
+            Ok(session) => {
+                let messages = session
+                    .conversation
+                    .map(|conversation| conversation.messages().clone())
+                    .unwrap_or_default();
+                messages.len().hash(&mut hasher);
+                if let Some(last) = messages.last() {
+                    serde_json::to_string(last)
+                        .unwrap_or_default()
+                        .hash(&mut hasher);
+                }
+                loaded.context = session
+                    .usage
+                    .total_tokens
+                    .zip(session.model_config.as_ref())
+                    .map(|(used, config)| (used.max(0) as usize, config.context_limit()));
+                loaded.entries = messages
+                    .into_iter()
+                    .map(output::TranscriptEntry::Message)
+                    .collect();
+            }
+            Err(error) => loaded.notice = Some(format!("child session unavailable: {error}")),
+        }
+    }
+    loaded.notice.hash(&mut hasher);
+    loaded.fingerprint = hasher.finish();
+    loaded
+}
+
+/// A router-acp delegate's log, read as a transcript, in the entries a session renders: its
+/// tasks as submitted prompts, its streamed text and response as replies, its tool calls.
+fn router_entries(lines: Vec<TranscriptLine>) -> Vec<output::TranscriptEntry> {
+    let mut entries = Vec::new();
+    let mut speaker = String::new();
+    let mut text = String::new();
+    let flush = |entries: &mut Vec<output::TranscriptEntry>, speaker: &str, text: &mut String| {
+        let body = std::mem::take(text);
+        let body = body.trim_matches('\n');
+        if body.trim().is_empty() {
+            return;
+        }
+        let message = if speaker == "task" {
+            Message::user()
+        } else {
+            Message::assistant()
+        };
+        entries.push(output::TranscriptEntry::Message(message.with_text(body)));
+    };
+    for line in lines {
+        match line.kind {
+            LineKind::Heading => {
+                flush(&mut entries, &speaker, &mut text);
+                speaker = line.text;
+            }
+            LineKind::Body => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&line.text);
+            }
+            LineKind::Tool => {
+                flush(&mut entries, &speaker, &mut text);
+                entries.push(match line.text.strip_prefix("→ ") {
+                    Some(call) => output::TranscriptEntry::ToolCall(call.to_string()),
+                    None => output::TranscriptEntry::Notice(
+                        line.text.trim_start_matches("· ").to_string(),
+                    ),
+                });
+            }
+        }
+    }
+    flush(&mut entries, &speaker, &mut text);
+    entries
+}
+
+fn terminal_size() -> (usize, usize) {
+    let (rows, cols) = console::Term::stdout().size();
+    (cols as usize, rows as usize)
 }
 
 /// A session's own goose subagents as top-level rows, for the dock.
@@ -490,6 +796,86 @@ mod tests {
                 (LineKind::Heading, "assistant".to_string()),
                 (LineKind::Body, "Working on it".to_string()),
                 (LineKind::Body, String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_screen_opens_like_a_session_and_its_pane_has_nothing_under_the_input() {
+        let row = ChildRow {
+            id: "child-1".into(),
+            label: "jam-packet-map".into(),
+            status: ChildStatus::Running,
+            model: "opus 5.5".into(),
+            started_at: Some(chrono::Utc::now() - chrono::Duration::seconds(75)),
+            activity: String::new(),
+        };
+        let mut child = ChildScreen::new("child-1".into(), Some(row));
+        let loaded = || ChildTranscript {
+            entries: vec![
+                output::TranscriptEntry::Message(Message::user().with_text("Map the packets")),
+                output::TranscriptEntry::Message(Message::assistant().with_text("Mapped.\n")),
+            ],
+            context: Some((1_000, 10_000)),
+            fingerprint: 7,
+            ..Default::default()
+        };
+        child.update(loaded(), 100);
+        let text = console::strip_ansi_codes(&child.rendered.as_ref().unwrap().1).into_owned();
+        assert!(text.contains("child session · running"), "{text}");
+        assert!(text.contains("child-1 · jam-packet-map"), "{text}");
+        assert!(text.contains("\n› Map the packets\n"), "{text}");
+        assert!(text.contains("Mapped."), "{text}");
+
+        let pane: Vec<String> = (child.pane.painter())(100, 30)
+            .iter()
+            .map(|line| console::strip_ansi_codes(line).trim_end().to_string())
+            .collect();
+        assert_eq!(pane.len(), 3, "{pane:?}");
+        assert!(pane[0].contains("✻ working 1m 1"), "{pane:?}");
+        assert!(pane[0].ends_with("10% 1k/10k"), "{pane:?}");
+        assert_eq!(pane[1], "›");
+
+        // The same transcript is not rendered again.
+        let before = child.rendered.as_ref().unwrap().0;
+        child.update(loaded(), 100);
+        assert_eq!(child.rendered.as_ref().unwrap().0, before);
+    }
+
+    #[test]
+    fn a_router_delegates_log_becomes_the_entries_a_session_renders() {
+        let line = |kind, text: &str| TranscriptLine {
+            kind,
+            text: text.to_string(),
+        };
+        let entries = router_entries(vec![
+            line(LineKind::Heading, "task"),
+            line(LineKind::Body, "Map the packets"),
+            line(LineKind::Tool, "… 3 more lines"),
+            line(LineKind::Body, String::new().as_str()),
+            line(LineKind::Heading, "assistant"),
+            line(LineKind::Body, "Reading."),
+            line(LineKind::Tool, "→ Read file · completed"),
+            line(LineKind::Body, "Done."),
+        ]);
+        let shown: Vec<String> = entries
+            .iter()
+            .map(|entry| match entry {
+                output::TranscriptEntry::Message(message) => {
+                    format!("{:?}: {}", message.role, message.as_concat_text())
+                }
+                output::TranscriptEntry::ToolCall(call) => format!("tool: {call}"),
+                output::TranscriptEntry::Notice(notice) => format!("notice: {notice}"),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "User: Map the packets",
+                "notice: … 3 more lines",
+                "Assistant: Reading.",
+                "tool: Read file · completed",
+                "Assistant: Done.",
             ]
         );
     }

@@ -44,6 +44,8 @@ const MAX_INPUT_ROWS: usize = 6;
 const GUTTER: usize = 2;
 /// Columns of rule always shown between the status and the context bar.
 const MIN_RULE: usize = 3;
+/// Enter in a child session's input box.
+const CHILD_TAKES_NO_MESSAGES: &str = "a child session takes no messages · Esc returns";
 
 /// The live pane, so a full-screen view or child process can hand the screen back and forth.
 static ACTIVE: OnceLock<Mutex<Weak<Shared>>> = OnceLock::new();
@@ -259,120 +261,125 @@ impl Dock {
 
     /// A key for the input box (the caller handles the children's keys first).
     pub fn type_key(&self, key: Key) -> Typed {
-        let typed = {
-            let mut state = self.shared.state.lock().unwrap();
-            state.notice = None;
-            let turn = state.turn_started.is_some();
-            let state = &mut *state;
-            let input = &mut state.input;
-            if let Some(paste) = input.paste.as_mut() {
-                match key {
-                    Key::Char(c) => paste.push(c),
-                    Key::Newline | Key::Enter => paste.push('\n'),
-                    Key::PasteEnd => {
-                        let text = input.paste.take().unwrap_or_default();
-                        input.insert(&text);
-                    }
-                    _ => {}
-                }
-                Typed::Edited
-            } else {
-                match key {
-                    Key::Char(c) => {
-                        input.insert(&c.to_string());
-                        Typed::Edited
-                    }
-                    Key::Newline => {
-                        input.insert("\n");
-                        Typed::Edited
-                    }
-                    Key::PasteStart => {
-                        input.paste = Some(String::new());
-                        Typed::Edited
-                    }
-                    Key::Backspace if input.cursor > 0 => {
-                        input.cursor -= 1;
-                        input.text.remove(input.cursor);
-                        Typed::Edited
-                    }
-                    Key::Delete if input.cursor < input.text.len() => {
-                        input.text.remove(input.cursor);
-                        Typed::Edited
-                    }
-                    Key::Left => {
-                        input.cursor = input.cursor.saturating_sub(1);
-                        Typed::Edited
-                    }
-                    Key::Right => {
-                        input.cursor = (input.cursor + 1).min(input.text.len());
-                        Typed::Edited
-                    }
-                    Key::WordLeft => {
-                        input.cursor = input.word_start();
-                        Typed::Edited
-                    }
-                    Key::WordRight => {
-                        input.cursor = input.word_end();
-                        Typed::Edited
-                    }
-                    Key::Home => {
-                        input.cursor = input.line_start();
-                        Typed::Edited
-                    }
-                    Key::End => {
-                        input.cursor = input.line_end();
-                        Typed::Edited
-                    }
-                    Key::KillLine => {
-                        let start = input.line_start();
-                        input.text.drain(start..input.cursor);
-                        input.cursor = start;
-                        Typed::Edited
-                    }
-                    Key::KillToEnd => {
-                        let end = input.line_end();
-                        input.text.drain(input.cursor..end);
-                        Typed::Edited
-                    }
-                    Key::KillWord => {
-                        let start = input.word_start();
-                        input.text.drain(start..input.cursor);
-                        input.cursor = start;
-                        Typed::Edited
-                    }
-                    Key::Escape => {
-                        *input = InputLine::default();
-                        Typed::Edited
-                    }
-                    // The newest undelivered message comes back for editing; Enter queues it
-                    // again.
-                    Key::Up if input.text.is_empty() && turn => match state.queued.pop() {
-                        Some(text) => {
-                            input.set(&text);
-                            Typed::Edited
-                        }
-                        None => Typed::Ignored,
-                    },
-                    Key::Enter | Key::SendNow if !turn => Typed::Submitted(input.take()),
-                    Key::Enter | Key::SendNow => {
-                        let text = input.take();
-                        if !text.trim().is_empty() {
-                            state.queued.push(text.trim().to_string());
-                        }
-                        match key {
-                            Key::SendNow if !state.queued.is_empty() => Typed::SendNow,
-                            _ if text.trim().is_empty() => Typed::Ignored,
-                            _ => Typed::Queued,
-                        }
-                    }
-                    _ => Typed::Ignored,
-                }
-            }
-        };
+        let typed = type_into(&mut self.shared.state.lock().unwrap(), key);
         relay::repaint();
         typed
     }
+}
 
+/// A key typed into `state`'s input box.
+fn type_into(state: &mut State, key: Key) -> Typed {
+    {
+        state.notice = None;
+        let turn = state.turn_started.is_some();
+        let input = &mut state.input;
+        if let Some(paste) = input.paste.as_mut() {
+            match key {
+                Key::Char(c) => paste.push(c),
+                Key::Newline | Key::Enter => paste.push('\n'),
+                Key::PasteEnd => {
+                    let text = input.paste.take().unwrap_or_default();
+                    input.insert(&text);
+                }
+                _ => {}
+            }
+            Typed::Edited
+        } else {
+            match key {
+                Key::Char(c) => {
+                    input.insert(&c.to_string());
+                    Typed::Edited
+                }
+                Key::Newline => {
+                    input.insert("\n");
+                    Typed::Edited
+                }
+                Key::PasteStart => {
+                    input.paste = Some(String::new());
+                    Typed::Edited
+                }
+                Key::Backspace if input.cursor > 0 => {
+                    input.cursor -= 1;
+                    input.text.remove(input.cursor);
+                    Typed::Edited
+                }
+                Key::Delete if input.cursor < input.text.len() => {
+                    input.text.remove(input.cursor);
+                    Typed::Edited
+                }
+                Key::Left => {
+                    input.cursor = input.cursor.saturating_sub(1);
+                    Typed::Edited
+                }
+                Key::Right => {
+                    input.cursor = (input.cursor + 1).min(input.text.len());
+                    Typed::Edited
+                }
+                Key::WordLeft => {
+                    input.cursor = input.word_start();
+                    Typed::Edited
+                }
+                Key::WordRight => {
+                    input.cursor = input.word_end();
+                    Typed::Edited
+                }
+                Key::Home => {
+                    input.cursor = input.line_start();
+                    Typed::Edited
+                }
+                Key::End => {
+                    input.cursor = input.line_end();
+                    Typed::Edited
+                }
+                Key::KillLine => {
+                    let start = input.line_start();
+                    input.text.drain(start..input.cursor);
+                    input.cursor = start;
+                    Typed::Edited
+                }
+                Key::KillToEnd => {
+                    let end = input.line_end();
+                    input.text.drain(input.cursor..end);
+                    Typed::Edited
+                }
+                Key::KillWord => {
+                    let start = input.word_start();
+                    input.text.drain(start..input.cursor);
+                    input.cursor = start;
+                    Typed::Edited
+                }
+                Key::Escape => {
+                    *input = InputLine::default();
+                    Typed::Edited
+                }
+                // The newest undelivered message comes back for editing; Enter queues it
+                // again.
+                Key::Up if input.text.is_empty() && turn => match state.queued.pop() {
+                    Some(text) => {
+                        input.set(&text);
+                        Typed::Edited
+                    }
+                    None => Typed::Ignored,
+                },
+                Key::Enter | Key::SendNow if !turn => Typed::Submitted(input.take()),
+                Key::Enter | Key::SendNow => {
+                    let text = input.take();
+                    if !text.trim().is_empty() {
+                        state.queued.push(text.trim().to_string());
+                    }
+                    match key {
+                        Key::SendNow if !state.queued.is_empty() => Typed::SendNow,
+                        _ if text.trim().is_empty() => Typed::Ignored,
+                        _ => Typed::Queued,
+                    }
+                }
+                _ => Typed::Ignored,
+            }
+        }
+    }
+}
+
+impl Dock {
     /// ↑/↓ inside a message that spans rows; false at its first or last row, where the key
     /// means something else (history, tool calls, the children).
     pub fn move_vertical(&self, delta: isize) -> bool {
@@ -738,18 +745,7 @@ fn follow_selection(state: &mut State) {
 /// Every line of the pane, top first, for a terminal `cols` wide and `lines` tall.
 fn pane(state: &State, cols: usize, lines: usize) -> Vec<String> {
     let width = cols.saturating_sub(1);
-    let rule = style("─".repeat(width)).dim().to_string();
-    let mut out = vec![top_rule(state, width)];
-    if state.question {
-        out.push(format!(
-            "{} {}",
-            style("↑").yellow().bold(),
-            style("Answer the question above: ↑↓ to move, Enter to choose, Esc to cancel").yellow()
-        ));
-    } else {
-        out.extend(input_rows(state, cols));
-    }
-    out.push(rule);
+    let mut out = input_box(state, cols);
     if let Some(notice) = &state.notice {
         out.push(style(format!("  {notice}")).yellow().to_string());
     }
@@ -776,6 +772,81 @@ fn pane(state: &State, cols: usize, lines: usize) -> Vec<String> {
         out.push(style(format!("  {}", parts.join(" · "))).dim().to_string());
     }
     out
+}
+
+/// The input box between its two rules, the upper one carrying the status and context bar.
+fn input_box(state: &State, cols: usize) -> Vec<String> {
+    let width = cols.saturating_sub(1);
+    let mut out = vec![top_rule(state, width)];
+    if state.question {
+        out.push(format!(
+            "{} {}",
+            style("↑").yellow().bold(),
+            style("Answer the question above: ↑↓ to move, Enter to choose, Esc to cancel").yellow()
+        ));
+    } else {
+        out.extend(input_rows(state, cols));
+    }
+    out.push(style("─".repeat(width)).dim().to_string());
+    out
+}
+
+/// The pane of a child session on screen: the session's own status rule and input box, with
+/// nothing under them, since a child has no children.
+pub struct ChildPane {
+    state: Mutex<State>,
+}
+
+impl ChildPane {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(State {
+                size: terminal_size(),
+                ..State::default()
+            }),
+        })
+    }
+
+    /// The pane's painter for the relay.
+    pub fn painter(self: &Arc<Self>) -> relay::Painter {
+        let weak = Arc::downgrade(self);
+        Arc::new(move |cols, lines| match weak.upgrade() {
+            Some(pane) => {
+                let mut state = pane.state.lock().unwrap();
+                state.size = (cols, lines);
+                input_box(&state, cols)
+            }
+            None => Vec::new(),
+        })
+    }
+
+    /// The child's turn: running since `started` (the status line counts its time), or not.
+    pub fn set_turn(&self, started: Option<Instant>) {
+        self.state.lock().unwrap().turn_started = started;
+    }
+
+    pub fn set_context(&self, context: Option<(usize, usize)>) {
+        self.state.lock().unwrap().context = context;
+    }
+
+    pub fn input_is_empty(&self) -> bool {
+        self.state.lock().unwrap().input.text.is_empty()
+    }
+
+    /// A key for the input box. What it would send stays in the box: a child takes no
+    /// messages from here, so Enter says so on the status line instead of queueing a message
+    /// nobody delivers.
+    pub fn type_key(&self, key: Key) -> Typed {
+        let mut state = self.state.lock().unwrap();
+        state.status = None;
+        if matches!(key, Key::Enter | Key::SendNow) && state.input.paste.is_none() {
+            if !state.input.text.iter().all(|c| c.is_whitespace()) {
+                state.status = Some(CHILD_TAKES_NO_MESSAGES.to_string());
+            }
+            return Typed::Ignored;
+        }
+        type_into(&mut state, key)
+    }
 }
 
 /// The goal on the status line: its state and its objective's first line, reversed while
@@ -1171,6 +1242,44 @@ mod tests {
                 .all(|line| console::measure_text_width(line) < 80),
             "the last column stays free: {lines:?}"
         );
+    }
+
+    #[test]
+    fn a_child_pane_is_the_sessions_input_box_with_nothing_under_it() {
+        let child = ChildPane::new();
+        child.set_turn(Some(Instant::now() - Duration::from_secs(72)));
+        child.set_context(Some((102_000, 258_000)));
+        for c in "hi".chars() {
+            child.type_key(Key::Char(c));
+        }
+        let lines = plain(&(child.painter())(80, 40));
+        // The same rule, timer and context bar as the session's own pane...
+        let parent = State {
+            turn_started: child.state.lock().unwrap().turn_started,
+            context: Some((102_000, 258_000)),
+            input: input("hi", 2),
+            ..State::default()
+        };
+        assert_eq!(lines[..], painted(&parent, 80, 40)[..3]);
+        assert!(lines[0].contains("✻ working 1m 12s") && lines[0].ends_with("40% 102k/258k"));
+        // ...and no children summary, keys or rows below it.
+        assert_eq!(lines.len(), 3, "{lines:?}");
+    }
+
+    #[test]
+    fn enter_in_a_child_queues_nothing_and_keeps_the_text() {
+        let child = ChildPane::new();
+        child.set_turn(Some(Instant::now()));
+        child.type_key(Key::Char('x'));
+        assert_eq!(child.type_key(Key::Enter), Typed::Ignored);
+        let lines = plain(&(child.painter())(80, 40));
+        assert!(lines[0].contains("takes no messages"), "{lines:?}");
+        assert!(!lines[0].contains("queued"), "{lines:?}");
+        assert_eq!(lines[1], "› x");
+        child.type_key(Key::Escape);
+        assert!(child.input_is_empty());
+        let lines = plain(&(child.painter())(80, 40));
+        assert!(!lines[0].contains("takes no messages"), "{lines:?}");
     }
 
     #[test]

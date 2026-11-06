@@ -14,6 +14,16 @@ pub fn begin() -> bool {
 
 pub fn remove_painter() {}
 
+pub fn show_child(_transcript: &str, _painter: Painter) -> bool {
+    false
+}
+
+pub fn hide_child() {}
+
+pub fn is_active() -> bool {
+    false
+}
+
 pub fn repaint() {}
 
 pub fn suspend() {}
