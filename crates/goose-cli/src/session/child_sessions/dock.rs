@@ -1,7 +1,7 @@
 //! The pane under the session's output, laid out like Claude Code's footer:
 //!
 //! ```text
-//!   ✻ working 1m 12s · 1 queued ────────────────── ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌ 40% 102k/258k
+//!   ◓ working 1m 12s · 1 queued ────────────────── ━━━━━━━━╌╌╌╌╌╌╌╌╌╌╌╌ 40% 102k/258k
 //!   › the message being written
 //!   ─────────────────────────────────────────────────────────────────────────────────────
 //!   12 running                         Enter queues · Ctrl+Enter interrupts · ↓ children
@@ -44,6 +44,30 @@ const MAX_INPUT_ROWS: usize = 6;
 const GUTTER: usize = 2;
 /// Columns of rule always shown between the status and the context bar.
 const MIN_RULE: usize = 3;
+/// The working spinner's frames and pace: the thinking spinner's (cliclack's), which the pane's
+/// status line replaces.
+const SPINNER: [&str; 4] = ["◒", "◐", "◓", "◑"];
+const SPINNER_FRAME: Duration = Duration::from_millis(100);
+
+/// A child pane on screen is working, so the spinner needs drawing on.
+static CHILD_WORKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A finished turn: how long it ran and the local time it ended, `1h 30m (12:34am)`.
+fn turn_stamp(elapsed: Duration, ended: chrono::DateTime<chrono::Local>) -> String {
+    format!("{} ({})", format_elapsed(elapsed), ended.format("%-I:%M%P"))
+}
+
+/// The working spinner `elapsed` into a turn.
+fn spinner_frame(elapsed: Duration) -> &'static str {
+    SPINNER[(elapsed.as_millis() / SPINNER_FRAME.as_millis()) as usize % SPINNER.len()]
+}
+
+/// Whether the session's pane is up: its status line then shows that the agent works, and the
+/// thinking spinner above it would say so twice.
+pub fn is_up() -> bool {
+    with_active(|_| ()).is_some()
+}
+
 /// Enter in a child session's input box.
 const CHILD_TAKES_NO_MESSAGES: &str = "goose subagents take no messages · Esc returns";
 
@@ -90,6 +114,9 @@ struct State {
     focus_requested: bool,
     /// When the running turn started; `None` at the prompt.
     turn_started: Option<Instant>,
+    /// How long the last turn took and when it ended (`1h 30m (12:34am)`), shown at the prompt
+    /// where `working` was.
+    finished: Option<String>,
     /// A session-wide state the status line leads with, e.g. `shutting down 1/3`.
     status: Option<String>,
     /// Tokens in the context and the model's limit.
@@ -163,7 +190,21 @@ impl Dock {
         write_raw("\x1b[?2004h");
         *ACTIVE.get_or_init(Mutex::default).lock().unwrap() = Arc::downgrade(&shared);
         let painter = shared.clone();
+        let ticking = Arc::downgrade(&shared);
         let task = tokio::spawn(async move {
+            // The spinner turns while the session, or a child on screen, works.
+            let _ticker = AbortOnDropHandle::new(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(SPINNER_FRAME).await;
+                    let Some(shared) = ticking.upgrade() else {
+                        return;
+                    };
+                    let working = shared.state.lock().unwrap().turn_started.is_some();
+                    if working || CHILD_WORKING.load(std::sync::atomic::Ordering::Relaxed) {
+                        relay::repaint();
+                    }
+                }
+            }));
             loop {
                 let turn_active = painter.state.lock().unwrap().turn_started.is_some();
                 let goal = load_goal(&sources).await;
@@ -186,13 +227,24 @@ impl Dock {
 
     /// A turn starts: Enter now queues instead of sending, and the status line counts time.
     pub fn begin_turn(&self) {
-        self.shared.state.lock().unwrap().turn_started = Some(Instant::now());
+        let mut state = self.shared.state.lock().unwrap();
+        state.turn_started = Some(Instant::now());
+        state.finished = None;
+        drop(state);
         relay::repaint();
     }
 
-    /// Back to the prompt. What was typed and never sent stays in the input box.
+    /// Back to the prompt. What was typed and never sent stays in the input box. A turn that
+    /// was running leaves how long it took and when it ended on the status line, and the same
+    /// stamp in the transcript (`🕐 1h 30m (12:34am)`), so the history shows where it stopped.
     pub fn end_turn(&self) {
-        self.shared.state.lock().unwrap().turn_started = None;
+        let mut state = self.shared.state.lock().unwrap();
+        if let Some(started) = state.turn_started.take() {
+            let stamp = turn_stamp(started.elapsed(), chrono::Local::now());
+            state.finished = Some(stamp.clone());
+            drop(state);
+            super::super::output::print_turn_stamp(&stamp);
+        }
         relay::repaint();
     }
 
@@ -849,6 +901,7 @@ impl ChildPane {
     /// The child's turn: running since `started` (the status line counts its time), or not.
     pub fn set_turn(&self, started: Option<Instant>) {
         self.state.lock().unwrap().turn_started = started;
+        CHILD_WORKING.store(started.is_some(), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_context(&self, context: Option<(usize, usize)>) {
@@ -876,6 +929,12 @@ impl ChildPane {
             return Typed::Submitted(state.input.take().trim().to_string());
         }
         type_into(&mut state, key)
+    }
+}
+
+impl Drop for ChildPane {
+    fn drop(&mut self) {
+        CHILD_WORKING.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -910,8 +969,18 @@ fn top_rule(state: &State, width: usize) -> String {
     if let Some(started) = state.turn_started {
         left.push(format!(
             "{} {}",
-            super::super::output::sapling_green("✻ working"),
+            super::super::output::sapling_green(format!(
+                "{} working",
+                spinner_frame(started.elapsed())
+            )),
             style(format_elapsed(started.elapsed())).dim()
+        ));
+    } else if let Some(finished) = &state.finished {
+        // The last turn's length and end, where `working` was.
+        left.push(format!(
+            "{} {}",
+            super::super::output::sapling_green("⏹"),
+            style(finished).dim()
         ));
     }
     let queued = state.queued.len() + usize::from(state.steering.is_some());
@@ -1277,6 +1346,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_finished_turn_says_how_long_it_ran_and_when_it_stopped() {
+        use chrono::TimeZone;
+        let at = |h, m| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 11, 6, h, m, 0)
+                .unwrap()
+        };
+        assert_eq!(
+            turn_stamp(Duration::from_secs(5400), at(0, 34)),
+            "1h 30m (12:34am)"
+        );
+        assert_eq!(
+            turn_stamp(Duration::from_secs(75), at(14, 5)),
+            "1m 15s (2:05pm)"
+        );
+
+        let dock = typing();
+        dock.begin_turn();
+        dock.end_turn();
+        let lines = painted(&dock.shared.state.lock().unwrap(), 100, 40);
+        assert!(
+            lines[0].starts_with("  ⏹ 0s (") && !lines[0].contains("working"),
+            "{lines:?}"
+        );
+        // Ending again (the prompt loop does at every prompt) keeps the turn's stamp.
+        let stamp = dock.shared.state.lock().unwrap().finished.clone();
+        dock.end_turn();
+        assert_eq!(dock.shared.state.lock().unwrap().finished, stamp);
+        dock.begin_turn();
+        let lines = painted(&dock.shared.state.lock().unwrap(), 100, 40);
+        assert!(
+            lines[0].contains(" working") && !lines[0].contains('⏹'),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_working_spinner_turns_at_the_thinking_spinners_pace() {
+        let frames: Vec<&str> = (0..6)
+            .map(|n| spinner_frame(Duration::from_millis(n * 100 + 50)))
+            .collect();
+        assert_eq!(frames, ["◒", "◐", "◓", "◑", "◒", "◐"]);
+    }
+
     #[test]
     fn working_and_the_selected_child_are_the_saplings_green() {
         let green = |text: &str| super::super::super::output::sapling_green(text);
@@ -1287,7 +1401,10 @@ mod tests {
             ..State::default()
         };
         let lines = pane(&state, 80, 40);
-        assert!(lines[0].contains(&green("✻ working")), "{lines:?}");
+        let working = SPINNER
+            .iter()
+            .any(|frame| lines[0].contains(&green(&format!("{frame} working"))));
+        assert!(working && !lines[0].contains('✻'), "{lines:?}");
         assert!(lines[1].contains(&green("›")), "{lines:?}");
         let selected = lines.iter().find(|line| line.contains("opus 5.5")).unwrap();
         let opening = green("").replace("\x1b[39m", "");
@@ -1314,7 +1431,7 @@ mod tests {
             ..State::default()
         };
         assert_eq!(lines[..], painted(&parent, 80, 40)[..3]);
-        assert!(lines[0].contains("✻ working 1m 12s") && lines[0].ends_with("40% 102k/258k"));
+        assert!(lines[0].contains(" working 1m 12s") && lines[0].ends_with("40% 102k/258k"));
         // ...and no children summary, keys or rows below it.
         assert_eq!(lines.len(), 3, "{lines:?}");
     }
@@ -1363,7 +1480,8 @@ mod tests {
         };
         let lines = painted(&state, 120, 40);
         assert!(
-            lines[0].contains("shutting down 1/3 · ✻ working 1m 15s · 1 queued ──")
+            lines[0].contains("shutting down 1/3 · ")
+                && lines[0].contains(" working 1m 15s · 1 queued ──")
                 && lines[0].ends_with("16% 160k/1.0M"),
             "{lines:?}"
         );
@@ -1680,7 +1798,7 @@ mod tests {
         dock.shared.state.lock().unwrap().goal = Some(goal("active"));
         let lines = painted(&dock.shared.state.lock().unwrap(), 100, 40);
         assert!(
-            lines[0].contains("✻ working 0s · ◎ goal: ship the release"),
+            lines[0].contains(" working 0s · ◎ goal: ship the release"),
             "{lines:?}"
         );
         assert!(!lines[0].contains("smokes"), "its first line: {lines:?}");

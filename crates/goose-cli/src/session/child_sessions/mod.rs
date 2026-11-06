@@ -957,7 +957,7 @@ mod tests {
             .map(|line| console::strip_ansi_codes(line).trim_end().to_string())
             .collect();
         assert_eq!(pane.len(), 3, "{pane:?}");
-        assert!(pane[0].contains("✻ working 1m 1"), "{pane:?}");
+        assert!(pane[0].contains(" working 1m 1"), "{pane:?}");
         assert!(pane[0].ends_with("10% 1k/10k"), "{pane:?}");
         assert_eq!(pane[1], "›");
 

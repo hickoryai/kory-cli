@@ -307,7 +307,8 @@ thread_local! {
 }
 
 pub fn show_thinking() {
-    if std::io::stdout().is_terminal() {
+    // The pane's status line already shows the session working, with its own spinner.
+    if std::io::stdout().is_terminal() && !super::child_sessions::dock::is_up() {
         THINKING.with(|t| t.borrow_mut().show());
     }
 }
@@ -1035,6 +1036,11 @@ pub fn print_status_line(line: &str) {
     }
     outln!("{}", style(sanitize_terminal_line(line)).dim());
     let _ = std::io::stdout().flush();
+}
+
+/// Where a turn stopped, in the transcript: `🕐 1h 30m (12:34am)`, how long it ran and when.
+pub fn print_turn_stamp(stamp: &str) {
+    print_status_line(&format!("🕐 {stamp}"));
 }
 
 /// Body lines an external message shows inline; the tool-call list (↑) holds the rest.
