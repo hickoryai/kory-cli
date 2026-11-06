@@ -4425,7 +4425,7 @@ dependencies = [
 
 [[package]]
 name = "goose-agent"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4516,7 +4516,7 @@ dependencies = [
 
 [[package]]
 name = "goose-context-management"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4532,7 +4532,7 @@ dependencies = [
 
 [[package]]
 name = "goose-download-manager"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -4544,7 +4544,7 @@ dependencies = [
 
 [[package]]
 name = "goose-local-inference"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4606,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "goose-provider-types"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4638,7 +4638,7 @@ dependencies = [
 
 [[package]]
 name = "goose-providers"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4694,7 +4694,7 @@ dependencies = [
 
 [[package]]
 name = "goose-sdk"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
@@ -4714,7 +4714,7 @@ dependencies = [
 
 [[package]]
 name = "goose-sdk-types"
-version = "0.1.0-alpha.12"
+version = "0.1.0-alpha.13"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
