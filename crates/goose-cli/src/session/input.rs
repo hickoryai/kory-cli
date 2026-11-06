@@ -435,7 +435,11 @@ fn echo_submitted(text: &str) {
     }
     let mut lines = text.lines();
     if let Some(first) = lines.next() {
-        println!("{} {}", console::style("›").cyan().bold(), first);
+        println!(
+            "{} {}",
+            console::style(super::output::sapling_green("›")).bold(),
+            first
+        );
     }
     for line in lines {
         println!("  {line}");

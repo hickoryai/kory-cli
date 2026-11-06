@@ -910,7 +910,7 @@ fn top_rule(state: &State, width: usize) -> String {
     if let Some(started) = state.turn_started {
         left.push(format!(
             "{} {}",
-            style("✻ working").cyan(),
+            super::super::output::sapling_green("✻ working"),
             style(format_elapsed(started.elapsed())).dim()
         ));
     }
@@ -1108,7 +1108,10 @@ fn input_rows(state: &State, cols: usize) -> Vec<String> {
         .map(|row| {
             let (start, end) = layout.rows[row];
             let mut text = if row == 0 {
-                format!("{} ", style("›").cyan().bold())
+                format!(
+                    "{} ",
+                    style(super::super::output::sapling_green("›")).bold()
+                )
             } else {
                 " ".repeat(GUTTER)
             };
@@ -1271,6 +1274,26 @@ mod tests {
                 .iter()
                 .all(|line| console::measure_text_width(line) < 80),
             "the last column stays free: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn working_and_the_selected_child_are_the_saplings_green() {
+        let green = |text: &str| super::super::super::output::sapling_green(text);
+        let state = State {
+            rows: vec![row("a", ChildStatus::Running)],
+            selected: Some(0),
+            turn_started: Some(Instant::now()),
+            ..State::default()
+        };
+        let lines = pane(&state, 80, 40);
+        assert!(lines[0].contains(&green("✻ working")), "{lines:?}");
+        assert!(lines[1].contains(&green("›")), "{lines:?}");
+        let selected = lines.iter().find(|line| line.contains("opus 5.5")).unwrap();
+        let opening = green("").replace("\x1b[39m", "");
+        assert!(
+            selected.contains(&format!("{opening}› opus 5.5")) && !selected.contains("\x1b[36"),
+            "{selected:?}"
         );
     }
 

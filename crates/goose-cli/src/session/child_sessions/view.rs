@@ -295,7 +295,9 @@ pub(super) fn child_row(child: &ChildRow, selected: bool, width: usize) -> Strin
         sanitize(&child.activity)
     );
     if selected {
-        fit(&row, width, |s| style(s).cyan().bold())
+        fit(&row, width, |s| {
+            style(super::super::output::sapling_green(s)).bold()
+        })
     } else {
         fit(&row, width, style)
     }

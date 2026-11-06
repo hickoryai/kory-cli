@@ -2,6 +2,7 @@
 //! state, not goose sessions, so they are read through router-acp's versioned read-only
 //! `state-query` boundary — off the render path, on a timer.
 
+use super::super::tool_calls::{CallStatus, ToolCall};
 use super::view::{ChildRow, ChildStatus, LineKind, TranscriptLine};
 use chrono::{DateTime, Utc};
 use goose::providers::router_acp::{RouterDelegate, RouterDelegateLog, RouterStateSource};
@@ -215,6 +216,13 @@ fn latest_activity(log: &[RouterDelegateLog]) -> String {
 /// The delegate's chronological log as a transcript: its task, its streamed text joined back
 /// into paragraphs, its tool calls with their latest status, and its final response.
 pub fn transcript_lines(log: &[RouterDelegateLog]) -> Vec<TranscriptLine> {
+    transcript(log).0
+}
+
+/// `transcript_lines`, with the delegate's tool calls: one per tool-call line, in the order
+/// those lines appear, so the n-th tool line is the n-th call.
+pub fn transcript(log: &[RouterDelegateLog]) -> (Vec<TranscriptLine>, Vec<ToolCall>) {
+    let mut calls: Vec<(usize, ToolCall)> = Vec::new();
     let mut lines: Vec<TranscriptLine> = Vec::new();
     let mut speaker: Option<&str> = None;
     let mut open_tool: Option<usize> = None;
@@ -276,10 +284,26 @@ pub fn transcript_lines(log: &[RouterDelegateLog]) -> Vec<TranscriptLine> {
                             title.to_string()
                         };
                         lines[index].text = tool_line(&title, status);
+                        if let Some((_, call)) = calls.iter_mut().find(|(at, _)| *at == index) {
+                            update_call(call, &title, status, entry);
+                        }
                     }
                     _ => {
                         lines.push(line(LineKind::Tool, tool_line(title, status)));
                         open_tool = Some(lines.len() - 1);
+                        let mut call = ToolCall {
+                            id: format!("router-call-{}", calls.len()),
+                            name: title.to_string(),
+                            summary: title.to_string(),
+                            kind: None,
+                            arguments: None,
+                            output: Vec::new(),
+                            error: None,
+                            status: CallStatus::Running,
+                            notice: false,
+                        };
+                        update_call(&mut call, title, status, entry);
+                        calls.push((lines.len() - 1, call));
                     }
                 }
                 if matches!(status, Some("completed" | "failed")) {
@@ -295,7 +319,48 @@ pub fn transcript_lines(log: &[RouterDelegateLog]) -> Vec<TranscriptLine> {
             _ => {}
         }
     }
-    lines
+    (lines, calls.into_iter().map(|(_, call)| call).collect())
+}
+
+/// One `tool_call` log entry's ACP update folded into its call: title, status, kind, input
+/// and the text it returned.
+fn update_call(call: &mut ToolCall, title: &str, status: Option<&str>, entry: &RouterDelegateLog) {
+    call.name = title.to_string();
+    call.summary = title.to_string();
+    call.status = match status {
+        Some("completed") => CallStatus::Done,
+        Some("failed") => CallStatus::Failed,
+        _ => CallStatus::Running,
+    };
+    let Some(update) = entry.detail.as_ref() else {
+        return;
+    };
+    if let Some(kind) = update.get("kind").and_then(serde_json::Value::as_str) {
+        call.kind = Some(kind.to_string());
+    }
+    if let Some(serde_json::Value::Object(input)) = update.get("rawInput") {
+        call.arguments = Some(input.clone());
+    }
+    let text: Vec<String> = update
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            block
+                .pointer("/content/text")
+                .or_else(|| block.get("text"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .flat_map(|text| text.lines().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    if !text.is_empty() {
+        if call.status == CallStatus::Failed {
+            call.error = Some(text.join("\n"));
+        } else {
+            call.output = text;
+        }
+    }
 }
 
 fn line(kind: LineKind, text: String) -> TranscriptLine {

@@ -122,6 +122,18 @@ fn accent<T: Display>(value: T) -> StyledObject<T> {
     style(value).cyan()
 }
 
+/// The sapling's leaf green (the seedling's `l` pixels).
+const SAPLING_GREEN: (u8, u8, u8) = (129, 199, 132);
+
+/// `text` in the sapling's green: what is working, selected or being written.
+pub fn sapling_green(text: impl Display) -> String {
+    if !console::colors_enabled() {
+        return text.to_string();
+    }
+    let (r, g, b) = SAPLING_GREEN;
+    format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[39m")
+}
+
 fn success<T: Display>(value: T) -> StyledObject<T> {
     style(value).green()
 }
@@ -600,7 +612,11 @@ pub fn render_message_streaming(
 /// logged (a tool call's one line, or a notice).
 pub enum TranscriptEntry {
     Message(Message),
-    ToolCall(String),
+    /// A tool call's line, and the id its entry in the child's tool-call list has.
+    ToolCall {
+        summary: String,
+        id: Option<String>,
+    },
     Notice(String),
 }
 
@@ -640,9 +656,9 @@ pub fn render_transcript(entries: &[TranscriptEntry], debug: bool) -> String {
                         render_message_streaming(&message, &mut buffer, &mut thinking, debug);
                     }
                 }
-                TranscriptEntry::ToolCall(summary) => {
+                TranscriptEntry::ToolCall { summary, id } => {
                     settle(&mut buffer, &mut thinking);
-                    print_tool_call_line(&sanitize_terminal_line(summary));
+                    print_marked_tool_call_line(&sanitize_terminal_line(summary), id.as_deref());
                 }
                 TranscriptEntry::Notice(notice) => {
                     settle(&mut buffer, &mut thinking);
@@ -684,7 +700,7 @@ fn print_submitted(text: &str) {
     if let Some(first) = lines.next() {
         outln!(
             "{} {}",
-            style("›").cyan().bold(),
+            style(sapling_green("›")).bold(),
             sanitize_terminal_line(first)
         );
     }
@@ -907,16 +923,7 @@ fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
             let Some(summary) = tool_call_summary(call, debug) else {
                 return;
             };
-            if !at_line_start() {
-                outln!();
-            }
-            // A click on the line opens this call (the pane's relay reads the mark).
-            // Written as is: it shows nothing and leaves the line where it was.
-            if !is_capturing() {
-                let mark = super::child_sessions::tool_call_mark(&req.id);
-                let _ = std::io::stdout().write_all(mark.as_bytes());
-            }
-            print_tool_call_line(&summary);
+            print_marked_tool_call_line(&summary, Some(&req.id));
             if debug {
                 print_params(&call.arguments, 1, debug);
             }
@@ -1002,10 +1009,22 @@ pub(super) fn tool_call_line(summary: &str, width: Option<usize>) -> String {
 /// One dim line on a line of its own: text streamed without a line end is ended first, so
 /// the call never joins the prose before it (and no blank line is added).
 fn print_tool_call_line(summary: &str) {
+    print_marked_tool_call_line(summary, None);
+}
+
+/// `print_tool_call_line` for call `id`: the line carries the relay's mark, so a click on it
+/// opens that call. The mark shows nothing and is on the line itself, captured or not.
+fn print_marked_tool_call_line(summary: &str, id: Option<&str>) {
     if !at_line_start() {
         outln!();
     }
-    outln!("{}", style(tool_call_line(summary, terminal_width())).dim());
+    let mark = id
+        .map(super::child_sessions::tool_call_mark)
+        .unwrap_or_default();
+    outln!(
+        "{mark}{}",
+        style(tool_call_line(summary, terminal_width())).dim()
+    );
 }
 
 /// A session status line (e.g. `◼ shutdown · …`), dim and on a line of its own like a tool
@@ -1869,7 +1888,7 @@ const SEEDLING: [&str; 14] = [
 fn seedling_rows() -> Vec<String> {
     let color = console::colors_enabled();
     let rgb = |pixel: u8| match pixel {
-        b'l' => Some((129, 199, 132)),
+        b'l' => Some(SAPLING_GREEN),
         b'd' => Some((56, 142, 60)),
         b's' => Some((67, 160, 71)),
         _ => None,
@@ -2151,7 +2170,10 @@ mod tests {
             &[
                 TranscriptEntry::Message(Message::user().with_text("Map the jam packets\nfast")),
                 TranscriptEntry::Message(Message::assistant().with_text("Reading the code.\n")),
-                TranscriptEntry::ToolCall("Read file · completed".into()),
+                TranscriptEntry::ToolCall {
+                    summary: "Read file · completed".into(),
+                    id: Some("router-call-0".into()),
+                },
                 TranscriptEntry::Notice("error: \x1b[2Jboom".into()),
             ],
             false,

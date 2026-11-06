@@ -23,6 +23,7 @@ mod terminal;
 mod view;
 
 use super::output;
+use super::tool_calls::{self, ToolCall, ToolCallsView};
 use console::style;
 use goose::agents::state_machine::{subagent_states, SubagentState};
 use goose::conversation::message::{Message, MessageContent};
@@ -121,11 +122,17 @@ struct ChildScreen {
     rendered: Option<(u64, String)>,
     /// When the child was first seen running, for a child that does not say when it started.
     seen_running: Option<std::time::Instant>,
+    /// The child's tool calls as last loaded, for ↑ and clicks on its tool-call lines.
+    calls: Vec<ToolCall>,
+    /// The child's tool calls, full screen over it, while open.
+    tools: Option<ToolCallsView>,
 }
 
 impl ChildScreen {
     fn new(id: String, row: Option<ChildRow>) -> Self {
         Self {
+            calls: Vec::new(),
+            tools: None,
             // router-acp delegates take messages; goose's own subagents do not.
             pane: dock::ChildPane::new(is_router_delegate(&id)),
             id,
@@ -138,6 +145,12 @@ impl ChildScreen {
     fn update(&mut self, loaded: ChildTranscript, width: usize) {
         if let Some(row) = loaded.row {
             self.row = Some(row);
+        }
+        if !loaded.calls.is_empty() {
+            if let Some(tools) = self.tools.as_mut() {
+                tools.refresh(loaded.calls.clone());
+            }
+            self.calls = loaded.calls;
         }
         let running = self
             .row
@@ -188,8 +201,39 @@ impl ChildScreen {
     }
 
     fn draw(&self) {
+        // The tool-call list has the screen while it is open.
+        if self.tools.is_some() {
+            return;
+        }
         if let Some((_, text)) = &self.rendered {
             relay::show_child(text, self.pane.painter());
+        }
+    }
+
+    /// The child's tool calls, full screen: on call `id`'s details (a click on its line), or
+    /// on the newest call (↑). False when the child has made none.
+    fn open_tools(&mut self, id: Option<&str>) -> bool {
+        let calls = self.calls.clone();
+        self.tools = match id {
+            Some(id) => ToolCallsView::open_at(calls, id),
+            None => ToolCallsView::open(calls),
+        };
+        if self.tools.is_none() {
+            return false;
+        }
+        // Over the session's alternate screen, which now holds the list.
+        relay::hide_child();
+        true
+    }
+
+    /// A key for the open tool-call list; once it closes the child is shown again.
+    fn tools_key(&mut self, key: Key) {
+        let Some(tools) = self.tools.as_mut() else {
+            return;
+        };
+        if !tools.key(key) {
+            self.tools = None;
+            self.draw();
         }
     }
 }
@@ -205,6 +249,8 @@ impl Drop for ChildScreen {
 struct ChildTranscript {
     row: Option<ChildRow>,
     entries: Vec<output::TranscriptEntry>,
+    /// Its tool calls, with the ids its tool-call lines carry.
+    calls: Vec<ToolCall>,
     context: Option<(usize, usize)>,
     notice: Option<String>,
     /// Changes whenever the transcript does.
@@ -368,9 +414,26 @@ impl ChildSessionNavigator {
             }
             return;
         };
-        if let Some(child) = &view.child {
+        if let Some(child) = view.child.as_mut() {
+            // The child's tool-call list takes every key until it closes.
+            if child.tools.is_some() {
+                child.tools_key(key);
+                return;
+            }
             match key {
                 Key::Open => return self.close(),
+                // ↑ on an empty input box, as in the session: the child's tool calls.
+                Key::Up if child.pane.input_is_empty() => {
+                    child.open_tools(None);
+                    return;
+                }
+                // A click on one of the child's tool-call lines opens that call.
+                Key::Activate => {
+                    if let Some(relay::Target::ToolCall(id)) = relay::take_activation() {
+                        child.open_tools(Some(&id));
+                    }
+                    return;
+                }
                 // Esc on an empty input box leaves the child: back to the dock it was chosen
                 // from, or to the list.
                 Key::Escape if child.pane.input_is_empty() => {
@@ -591,7 +654,9 @@ async fn load_child(
             Some(router::Fetched::Ready(delegates)) => {
                 match delegates.iter().find(|delegate| delegate.id == id) {
                     Some(delegate) => {
-                        loaded.entries = router_entries(router::transcript_lines(&delegate.log));
+                        let (lines, calls) = router::transcript(&delegate.log);
+                        loaded.entries = router_entries(lines, &calls);
+                        loaded.calls = calls;
                         delegate.log.len().hash(&mut hasher);
                         if let Some(last) = delegate.log.last() {
                             (&last.kind, &last.summary, last.ts).hash(&mut hasher);
@@ -626,6 +691,7 @@ async fn load_child(
                     .total_tokens
                     .zip(session.model_config.as_ref())
                     .map(|(used, config)| (used.max(0) as usize, config.context_limit()));
+                loaded.calls = tool_calls::collect(&messages);
                 loaded.entries = messages
                     .into_iter()
                     .map(output::TranscriptEntry::Message)
@@ -640,9 +706,11 @@ async fn load_child(
 }
 
 /// A router-acp delegate's log, read as a transcript, in the entries a session renders: its
-/// tasks as submitted prompts, its streamed text and response as replies, its tool calls.
-fn router_entries(lines: Vec<TranscriptLine>) -> Vec<output::TranscriptEntry> {
+/// tasks as submitted prompts, its streamed text and response as replies, its tool calls
+/// (the n-th tool-call line carrying the id of `calls[n]`).
+fn router_entries(lines: Vec<TranscriptLine>, calls: &[ToolCall]) -> Vec<output::TranscriptEntry> {
     let mut entries = Vec::new();
+    let mut call_ids = calls.iter().map(|call| call.id.clone());
     let mut speaker = String::new();
     let mut text = String::new();
     let flush = |entries: &mut Vec<output::TranscriptEntry>, speaker: &str, text: &mut String| {
@@ -673,7 +741,10 @@ fn router_entries(lines: Vec<TranscriptLine>) -> Vec<output::TranscriptEntry> {
             LineKind::Tool => {
                 flush(&mut entries, &speaker, &mut text);
                 entries.push(match line.text.strip_prefix("→ ") {
-                    Some(call) => output::TranscriptEntry::ToolCall(call.to_string()),
+                    Some(call) => output::TranscriptEntry::ToolCall {
+                        summary: call.to_string(),
+                        id: call_ids.next(),
+                    },
                     None => output::TranscriptEntry::Notice(
                         line.text.trim_start_matches("· ").to_string(),
                     ),
@@ -902,36 +973,81 @@ mod tests {
             kind,
             text: text.to_string(),
         };
-        let entries = router_entries(vec![
-            line(LineKind::Heading, "task"),
-            line(LineKind::Body, "Map the packets"),
-            line(LineKind::Tool, "… 3 more lines"),
-            line(LineKind::Body, String::new().as_str()),
-            line(LineKind::Heading, "assistant"),
-            line(LineKind::Body, "Reading."),
-            line(LineKind::Tool, "→ Read file · completed"),
-            line(LineKind::Body, "Done."),
-        ]);
-        let shown: Vec<String> = entries
-            .iter()
-            .map(|entry| match entry {
-                output::TranscriptEntry::Message(message) => {
-                    format!("{:?}: {}", message.role, message.as_concat_text())
-                }
-                output::TranscriptEntry::ToolCall(call) => format!("tool: {call}"),
-                output::TranscriptEntry::Notice(notice) => format!("notice: {notice}"),
-            })
-            .collect();
+        let entries = router_entries(
+            vec![
+                line(LineKind::Heading, "task"),
+                line(LineKind::Body, "Map the packets"),
+                line(LineKind::Tool, "… 3 more lines"),
+                line(LineKind::Body, String::new().as_str()),
+                line(LineKind::Heading, "assistant"),
+                line(LineKind::Body, "Reading."),
+                line(LineKind::Tool, "→ Read file · completed"),
+                line(LineKind::Body, "Done."),
+            ],
+            &[],
+        );
+        let shown: Vec<String> = entries.iter().map(shown).collect();
         assert_eq!(
             shown,
             [
                 "User: Map the packets",
                 "notice: … 3 more lines",
                 "Assistant: Reading.",
-                "tool: Read file · completed",
+                "tool: Read file · completed (None)",
                 "Assistant: Done.",
             ]
         );
+    }
+
+    fn shown(entry: &output::TranscriptEntry) -> String {
+        match entry {
+            output::TranscriptEntry::Message(message) => {
+                format!("{:?}: {}", message.role, message.as_concat_text())
+            }
+            output::TranscriptEntry::ToolCall { summary, id } => {
+                format!("tool: {summary} ({id:?})")
+            }
+            output::TranscriptEntry::Notice(notice) => format!("notice: {notice}"),
+        }
+    }
+
+    #[test]
+    fn a_delegates_tool_call_lines_name_the_calls_its_list_opens() {
+        let log: Vec<goose::providers::router_acp::RouterDelegateLog> =
+            serde_json::from_value(serde_json::json!([
+                {"kind": "delegate_task", "summary": "Map the packets"},
+                {"kind": "tool_call", "summary": "Read file [pending]", "detail": {
+                    "toolCallId": "toolu_01A2b3C4d5", "title": "Read file", "kind": "read",
+                    "rawInput": {"path": "src/jam.rs"}, "status": "pending"}},
+                {"kind": "tool_call", "summary": "toolu_01A2b3C4d5 [completed]", "detail": {
+                    "toolCallId": "toolu_01A2b3C4d5", "status": "completed",
+                    "content": [{"type": "content", "content": {"type": "text", "text": "fn jam() {}"}}]}},
+                {"kind": "tool_call", "summary": "Run tests [failed]", "detail": {
+                    "toolCallId": "toolu_2", "title": "Run tests", "status": "failed",
+                    "content": [{"type": "content", "content": {"type": "text", "text": "1 failed"}}]}},
+            ]))
+            .unwrap();
+        let (lines, calls) = router::transcript(&log);
+        let entries = router_entries(lines, &calls);
+        let tools: Vec<String> = entries
+            .iter()
+            .filter(|entry| matches!(entry, output::TranscriptEntry::ToolCall { .. }))
+            .map(shown)
+            .collect();
+        assert_eq!(
+            tools,
+            [
+                format!("tool: Read file · completed ({:?})", Some(&calls[0].id)),
+                format!("tool: Run tests · failed ({:?})", Some(&calls[1].id)),
+            ]
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].status, tool_calls::CallStatus::Done);
+        assert_eq!(calls[0].kind.as_deref(), Some("read"));
+        assert_eq!(calls[0].output, ["fn jam() {}"]);
+        assert!(calls[0].arguments.as_ref().unwrap().contains_key("path"));
+        assert_eq!(calls[1].status, tool_calls::CallStatus::Failed);
+        assert_eq!(calls[1].error.as_deref(), Some("1 failed"));
     }
 
     #[tokio::test]
