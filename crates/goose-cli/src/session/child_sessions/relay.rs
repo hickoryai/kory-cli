@@ -49,12 +49,66 @@ const IDLE_POLL_MS: i32 = 200;
 const FRAME: Duration = Duration::from_millis(16);
 /// An escape sequence typed in pieces waits this long for its rest.
 const HELD_INPUT: Duration = Duration::from_millis(30);
-const ENTER: &str = "\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[H\x1b[2J";
+// Any-motion mouse tracking (1003), so what can be clicked lights up under the pointer.
+const ENTER: &str = "\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[H\x1b[2J";
 const LEAVE: &str =
-    "\x1b[?2026l\x1b[0m\x1b[?1006l\x1b[?1002l\x1b[?2004l\x1b[<u\x1b[?25h\x1b[?1049l";
+    "\x1b[?2026l\x1b[0m\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?2004l\x1b[<u\x1b[?25h\x1b[?1049l";
 const PILL: &str = " Jump to bottom (click) ↓ ";
+/// What can be clicked is drawn white under the pointer.
+const HOVER: &str = "\x1b[0m\x1b[97m";
+/// SGR mouse button code for motion with no button held.
+const MOTION: u16 = 35;
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
+
+/// Something on screen a click opens, as the arrow keys and Enter would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A tool-call line in the transcript, by its tool call id.
+    ToolCall(String),
+    /// A child row in the pane, by its index in the pane's list of children.
+    Child(usize),
+}
+
+/// The last thing clicked; the session takes it on `Key::Activate`.
+static ACTIVATED: Mutex<Option<Target>> = Mutex::new(None);
+
+/// What the click behind the latest `Key::Activate` landed on.
+pub fn take_activation() -> Option<Target> {
+    ACTIVATED.lock().unwrap().take()
+}
+
+/// Printed just before a tool-call line, so a click on the line opens that call. Nothing
+/// when no relay hosts the terminal.
+pub fn tool_call_mark(id: &str) -> String {
+    if active().is_none() {
+        return String::new();
+    }
+    let id: String = id
+        .chars()
+        .filter(|c| !c.is_control() && *c != ';')
+        .collect();
+    format!("\x1b]7799;kory-pane;tool;{id}\x07")
+}
+
+/// Leads a pane line that is child `index`'s row, so a click on it opens that child. The
+/// relay takes it off before the line is drawn.
+pub fn child_row_mark(index: usize) -> String {
+    format!("{CHILD_MARK}{index}\x07")
+}
+
+const CHILD_MARK: &str = "\x1b]7799;kory-pane;child;";
+
+/// A pane line's child mark, taken off: the line and the child it is the row of.
+fn take_child_mark(line: &str) -> (&str, Option<usize>) {
+    let Some(rest) = line.strip_prefix(CHILD_MARK) else {
+        return (line, None);
+    };
+    match rest.split_once('\x07') {
+        Some((index, line)) => (line, index.parse().ok()),
+        None => (line, None),
+    }
+}
 
 struct Relay {
     real_out: RawFd,
@@ -508,6 +562,10 @@ impl Relay {
             if !input.forward.is_empty() {
                 write_fd(self.master, &input.forward);
             }
+            if let Some(target) = input.activate {
+                *ACTIVATED.lock().unwrap() = Some(target);
+                write_fd(self.master, super::keys::ACTIVATE_SEQUENCE);
+            }
             // SAFETY: draining the wake pipe.
             while unsafe { libc::read(self.wake[0], buf.as_mut_ptr().cast(), buf.len()) } > 0 {
                 dirty = true;
@@ -561,6 +619,8 @@ struct Sink {
     replies: Vec<u8>,
     /// Some(true) at a suspend marker, Some(false) at a resume, the last one seen.
     question: Option<bool>,
+    /// Tool-call lines marked since the view last took them: (transcript row, call id).
+    tools: Vec<(usize, String)>,
 }
 
 impl vt100::Callbacks for Sink {
@@ -627,10 +687,19 @@ impl vt100::Callbacks for Sink {
         }
     }
 
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
         match params {
             [MARKER, b"kory-pane", b"suspend"] => self.question = Some(true),
             [MARKER, b"kory-pane", b"resume"] => self.question = Some(false),
+            // The line the cursor starts now is that tool call's.
+            [MARKER, b"kory-pane", b"tool", id @ ..] if !screen.alternate_screen() => {
+                screen.set_scrollback(usize::MAX);
+                let scrollback = screen.scrollback();
+                screen.set_scrollback(0);
+                let row = scrollback + screen.cursor_position().0 as usize;
+                let id = String::from_utf8_lossy(&id.join(&b';')).into_owned();
+                self.tools.push((row, id));
+            }
             [MARKER, ..] => {}
             // Progress (OSC 9;4), notifications and the like are the real terminal's.
             params => {
@@ -653,6 +722,8 @@ struct Input {
     /// not make Ctrl-C a signal.
     interrupts: Vec<Vec<u8>>,
     scrolled: bool,
+    /// A click on a tool call or child, for the session as `Key::Activate`.
+    activate: Option<Target>,
 }
 
 /// Text dragged over with the mouse, as (transcript row, column) from where the drag began to
@@ -707,6 +778,14 @@ struct View {
     paste_mode: bool,
     /// The session's output, replayed into a new emulator when the size changes.
     log: Vec<u8>,
+    /// The transcript rows that are tool-call lines, and their call ids.
+    tool_rows: std::collections::HashMap<usize, String>,
+    /// The child rows of the pane at the last frame: (screen row, child index).
+    pane_children: Vec<(usize, usize)>,
+    /// Where the pointer is, as (col, row) on the screen.
+    hover: Option<(u16, u16)>,
+    /// A click on a target, waiting for `input` to report it.
+    clicked: Option<Target>,
 }
 
 impl View {
@@ -729,7 +808,38 @@ impl View {
             clipboard: Vec::new(),
             paste_mode: false,
             log: Vec::new(),
+            tool_rows: Default::default(),
+            pane_children: Vec::new(),
+            hover: None,
+            clicked: None,
         }
+    }
+
+    /// Tool-call lines the emulator saw marked since the last call.
+    fn take_marks(&mut self) {
+        let marks = std::mem::take(&mut self.parser.callbacks_mut().tools);
+        self.tool_rows.extend(marks);
+    }
+
+    /// What a click at (col, row) on the screen would open: a tool-call line of the
+    /// transcript, or a child row of the pane.
+    fn target_at(&mut self, row: u16) -> Option<Target> {
+        let row = row as usize;
+        if row < self.transcript_rows {
+            let at = self.view_start + row;
+            let id = self.tool_rows.get(&at)?.clone();
+            // A mark from before the scrollback dropped its oldest rows names another row now.
+            let (cols, _) = self.size();
+            let (text, _) = self.row_text(at, 0, cols);
+            return text
+                .trim_start()
+                .starts_with('▸')
+                .then_some(Target::ToolCall(id));
+        }
+        self.pane_children
+            .iter()
+            .find(|(screen_row, _)| *screen_row == row)
+            .map(|(_, index)| Target::Child(*index))
     }
 
     fn size(&self) -> (usize, usize) {
@@ -749,6 +859,7 @@ impl View {
             self.log.drain(..cut);
         }
         self.parser.process(bytes);
+        self.take_marks();
         if let Some(question) = self.parser.callbacks_mut().question.take() {
             self.question = question;
             if question {
@@ -788,9 +899,12 @@ impl View {
             Sink::default(),
         );
         parser.process(&self.log);
+        // The tool-call lines sit on other rows at the new width.
+        let tools = std::mem::take(&mut parser.callbacks_mut().tools);
         // What replaying asked of the real terminal was done the first time.
         *parser.callbacks_mut() = Sink::default();
         self.parser = parser;
+        self.tool_rows = tools.into_iter().collect();
         self.selection = None;
         self.last_end = self.end();
     }
@@ -868,6 +982,7 @@ impl View {
             i += 1;
         }
         self.held_since = None;
+        input.activate = self.clicked.take();
         input
     }
 
@@ -895,21 +1010,40 @@ impl View {
             64 => self.scroll(WHEEL_ROWS as isize),
             65 => self.scroll(-(WHEEL_ROWS as isize)),
             // The pill sits on the last transcript row.
-            0 if pressed && self.scroll_up > 0 && row as usize + 1 == self.transcript_rows => {
-                let (cols, _) = self.size();
-                let (start, end) = pill_columns(cols);
-                if (start..=end).contains(&(col as usize)) {
-                    self.follow()
-                } else {
-                    self.begin_selection(col, row)
-                }
+            0 if pressed
+                && self.scroll_up > 0
+                && row as usize + 1 == self.transcript_rows
+                && (pill_columns(self.size().0).0..=pill_columns(self.size().0).1)
+                    .contains(&(col as usize)) =>
+            {
+                self.follow()
             }
-            0 if pressed => self.begin_selection(col, row),
+            // A tool call or a child opens, as Enter would.
+            0 if pressed => match self.target_at(row) {
+                Some(target) => {
+                    self.selection = None;
+                    self.clicked = Some(target);
+                    false
+                }
+                None => self.begin_selection(col, row),
+            },
+            // The pointer moved: what it is over lights up.
+            MOTION => {
+                let before = self.hovered();
+                self.hover = Some((col, row));
+                self.hovered() != before
+            }
             // Motion with the left button held.
             32 => self.drag_selection(col, row),
             0 => self.end_selection(col, row),
             _ => false,
         }
+    }
+
+    /// The target under the pointer, and the screen row it is on.
+    fn hovered(&mut self) -> Option<(usize, Target)> {
+        let (_, row) = self.hover?;
+        self.target_at(row).map(|target| (row as usize, target))
     }
 
     /// The transcript position under the mouse, held inside the transcript's rows.
@@ -1099,12 +1233,24 @@ impl View {
             return out;
         }
 
+        let mut children = Vec::new();
         let pane: Vec<String> = pane
             .iter()
             .take(lines.saturating_sub(1))
-            .map(|line| console::truncate_str(line, cols.saturating_sub(1), "").into_owned())
+            .enumerate()
+            .map(|(index, line)| {
+                let (line, child) = take_child_mark(line);
+                if let Some(child) = child {
+                    children.push((index, child));
+                }
+                console::truncate_str(line, cols.saturating_sub(1), "").into_owned()
+            })
             .collect();
         let rows = lines - pane.len();
+        self.pane_children = children
+            .into_iter()
+            .map(|(index, child)| (rows + index, child))
+            .collect();
         let end = self.end();
         if self.scroll_up > 0 {
             // A scrolled view stays on the rows it shows while output arrives.
@@ -1141,6 +1287,19 @@ impl View {
                 );
             }
         }
+        // The tool call or child under the pointer, in white.
+        let hovered = self.hovered().map(|(row, _)| row);
+        if let Some(row) = hovered.filter(|row| *row < rows) {
+            let (text, _) = self.row_text(view_start + row, 0, cols);
+            out.extend(
+                format!(
+                    "\x1b[{};1H\x1b[0m\x1b[2K{HOVER}{}\x1b[0m",
+                    row + 1,
+                    text.trim_end()
+                )
+                .into_bytes(),
+            );
+        }
         if self.scroll_up > 0 && rows > 0 {
             let (start, _) = pill_columns(cols);
             out.extend(
@@ -1149,7 +1308,11 @@ impl View {
         }
         for (index, line) in pane.iter().enumerate() {
             out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", rows + index + 1).into_bytes());
-            out.extend_from_slice(line.as_bytes());
+            if hovered == Some(rows + index) {
+                out.extend(format!("{HOVER}{}", console::strip_ansi_codes(line)).into_bytes());
+            } else {
+                out.extend_from_slice(line.as_bytes());
+            }
         }
         out.extend_from_slice(b"\x1b[0m");
         // While a question in the transcript waits for an answer, the cursor is its.
@@ -1296,6 +1459,62 @@ mod tests {
         child.update(&feed(2, "other\n"));
         let rows = screen(&child.view.frame(&pane()), 60, 8);
         assert_eq!(rows[0], "other");
+    }
+
+    fn clickable_view() -> (View, Vec<String>) {
+        let mut view = View::new(60, 8);
+        view.output(
+            b"intro\r\n\x1b]7799;kory-pane;tool;call-1\x07\x1b[2m  \xe2\x96\xb8 Read file\x1b[0m\r\nafter\r\n",
+        );
+        let pane = vec![
+            "── rule".to_string(),
+            format!("{}\x1b[2m  child row\x1b[0m", child_row_mark(3)),
+        ];
+        view.frame(&pane);
+        (view, pane)
+    }
+
+    #[test]
+    fn a_tool_call_line_lights_up_under_the_pointer_and_a_click_opens_it() {
+        let (mut view, pane) = clickable_view();
+        // Over plain output nothing lights up.
+        assert!(!view.input(b"\x1b[<35;3;1M", Instant::now()).scrolled);
+        assert!(!String::from_utf8_lossy(&view.frame(&pane)).contains(HOVER));
+
+        let input = view.input(b"\x1b[<35;5;2M", Instant::now());
+        assert!(input.scrolled && input.forward.is_empty());
+        let frame = String::from_utf8_lossy(&view.frame(&pane)).into_owned();
+        assert!(
+            frame.contains(&format!("{HOVER}  ▸ Read file")),
+            "{frame:?}"
+        );
+
+        let input = view.input(b"\x1b[<0;5;2M\x1b[<0;5;2m", Instant::now());
+        assert_eq!(input.activate, Some(Target::ToolCall("call-1".into())));
+        assert!(input.forward.is_empty() && view.selection.is_none());
+    }
+
+    #[test]
+    fn a_child_row_lights_up_and_opens_and_its_mark_never_reaches_the_screen() {
+        let (mut view, pane) = clickable_view();
+        let frame = view.frame(&pane);
+        assert!(!String::from_utf8_lossy(&frame).contains("kory-pane"));
+        assert_eq!(screen(&frame, 60, 8)[7], "  child row");
+
+        view.input(b"\x1b[<35;4;8M", Instant::now());
+        let frame = String::from_utf8_lossy(&view.frame(&pane)).into_owned();
+        assert!(frame.contains(&format!("{HOVER}  child row")), "{frame:?}");
+        let input = view.input(b"\x1b[<0;4;8M", Instant::now());
+        assert_eq!(input.activate, Some(Target::Child(3)));
+    }
+
+    #[test]
+    fn tool_call_marks_follow_their_lines_through_a_resize() {
+        let (mut view, pane) = clickable_view();
+        view.resize((30, 8));
+        view.frame(&pane);
+        let input = view.input(b"\x1b[<0;5;2M", Instant::now());
+        assert_eq!(input.activate, Some(Target::ToolCall("call-1".into())));
     }
 
     #[test]

@@ -230,10 +230,15 @@ pub fn transcript_lines(log: &[RouterDelegateLog]) -> Vec<TranscriptLine> {
     for entry in log {
         match entry.kind.as_str() {
             "session_update" | "llm_request" | "llm_response" => {}
-            "delegate_task" | "delegate_followup" => {
+            // What the delegate was asked: its task, a parent's follow-up, or a message the
+            // operator typed into it (`_router/delegate_message`).
+            "delegate_task" | "delegate_followup" | "operator_message" => {
                 open_tool = None;
                 heading(&mut lines, "task");
-                let text = detail_text(entry, "task").unwrap_or(&entry.summary);
+                let text = detail_text(entry, "task")
+                    .or_else(|| detail_text(entry, "message"))
+                    .or_else(|| detail_text(entry, "text"))
+                    .unwrap_or(&entry.summary);
                 let task: Vec<&str> = text.lines().collect();
                 for row in task.iter().take(TASK_LINES) {
                     lines.push(line(LineKind::Body, row.to_string()));

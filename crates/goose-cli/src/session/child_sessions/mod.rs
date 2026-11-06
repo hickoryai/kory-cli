@@ -30,6 +30,7 @@ use goose::providers::router_acp::{RouterStateSource, DELEGATE_ID_SEPARATOR};
 use goose::session::SessionManager;
 use goose::utils::safe_truncate;
 pub use keys::Key;
+pub use relay::{take_activation, tool_call_mark, Target};
 use rmcp::model::{ContentBlock, Role};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -125,9 +126,10 @@ struct ChildScreen {
 impl ChildScreen {
     fn new(id: String, row: Option<ChildRow>) -> Self {
         Self {
+            // router-acp delegates take messages; goose's own subagents do not.
+            pane: dock::ChildPane::new(is_router_delegate(&id)),
             id,
             row,
-            pane: dock::ChildPane::new(),
             rendered: None,
             seen_running: None,
         }
@@ -218,6 +220,29 @@ pub struct ChildSessionNavigator {
     listener: Option<terminal::KeyListener>,
     open: Option<OpenView>,
     router: Option<router::RouterChildren>,
+    messenger: Option<Messenger>,
+}
+
+/// Sends a message to a router-acp delegate (by its state session id) and answers how
+/// router-acp delivered it (`steered`, `input`, `turn`).
+pub type Messenger = Arc<
+    dyn Fn(String, String) -> futures::future::BoxFuture<'static, Result<String, String>>
+        + Send
+        + Sync,
+>;
+
+/// The status line after a message went out.
+fn delivery_status(delivery: &str) -> String {
+    match delivery {
+        "steered" => "sent into the running turn".into(),
+        "input" => "sent · the worker's parent picks it up".into(),
+        "turn" => "sent · the child takes a turn on it".into(),
+        other => format!("sent ({other})"),
+    }
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default()
 }
 
 impl ChildSessionNavigator {
@@ -233,6 +258,7 @@ impl ChildSessionNavigator {
             listener: None,
             open: None,
             router: None,
+            messenger: None,
         }
     }
 
@@ -247,6 +273,30 @@ impl ChildSessionNavigator {
             self.router = Some(router::RouterChildren::start(source, router_session_id));
         }
         self
+    }
+
+    /// How a message typed into a router-acp delegate's input box reaches it.
+    pub fn with_messenger(mut self, messenger: Messenger) -> Self {
+        self.messenger = Some(messenger);
+        self
+    }
+
+    /// Sends `text` to child `id` without holding up the keys; the status line says how it
+    /// was delivered, or why it was not.
+    fn send(&self, id: &str, text: String, pane: Arc<dock::ChildPane>) {
+        let Some(messenger) = self.messenger.clone() else {
+            pane.set_status(Some("this child takes no messages here".into()));
+            return;
+        };
+        pane.set_status(Some("sending…".into()));
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let status = match messenger(id, text).await {
+                Ok(delivery) => delivery_status(&delivery),
+                Err(error) => format!("not sent: {}", first_line(&error)),
+            };
+            pane.set_status(Some(status));
+        });
     }
 
     /// Reads keys for the whole turn, so text can be typed while the agent works.
@@ -332,7 +382,11 @@ impl ChildSessionNavigator {
                     view.child = None;
                 }
                 key => {
-                    child.pane.type_key(key);
+                    let typed = child.pane.type_key(key);
+                    let (id, pane) = (child.id.clone(), child.pane.clone());
+                    if let dock::Typed::Submitted(text) = typed {
+                        self.send(&id, text, pane);
+                    }
                     relay::repaint();
                     return;
                 }

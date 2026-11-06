@@ -907,6 +907,15 @@ fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
             let Some(summary) = tool_call_summary(call, debug) else {
                 return;
             };
+            if !at_line_start() {
+                outln!();
+            }
+            // A click on the line opens this call (the pane's relay reads the mark).
+            // Written as is: it shows nothing and leaves the line where it was.
+            if !is_capturing() {
+                let mark = super::child_sessions::tool_call_mark(&req.id);
+                let _ = std::io::stdout().write_all(mark.as_bytes());
+            }
             print_tool_call_line(&summary);
             if debug {
                 print_params(&call.arguments, 1, debug);

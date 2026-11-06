@@ -49,7 +49,13 @@ pub enum Key {
     },
     WheelUp,
     WheelDown,
+    /// The pane's relay saw a click on a tool call or a child; `relay::take_activation`
+    /// says which.
+    Activate,
 }
+
+/// The sequence the relay types for `Key::Activate`.
+pub const ACTIVATE_SEQUENCE: &[u8] = b"\x1b[7799~";
 
 const ESC: u8 = 0x1b;
 const CTRL: u16 = 4;
@@ -220,6 +226,7 @@ fn parse_csi(bytes: &[u8]) -> Parsed {
     let used = end + 1;
     let key = match (params, bytes[end]) {
         ([b'<', mouse @ ..], final_byte @ (b'M' | b'm')) => sgr_mouse(mouse, final_byte == b'M'),
+        (b"7799", b'~') => Some(Key::Activate),
         (b"200", b'~') => Some(Key::PasteStart),
         (b"201", b'~') => Some(Key::PasteEnd),
         (b"3", b'~') => Some(Key::Delete),
@@ -391,6 +398,12 @@ mod tests {
             parse(b"\x1b[99;5u\x1b[27u\x1b[117;5u\x1b[65;2u"),
             [Key::Interrupt, Key::Escape, Key::KillLine, Key::Char('A')]
         );
+    }
+
+    #[test]
+    fn the_relays_click_sequence_is_one_activate_key_and_motion_is_nothing() {
+        assert_eq!(parse(ACTIVATE_SEQUENCE), [Key::Activate]);
+        assert_eq!(parse(b"\x1b[<35;4;2M"), []);
     }
 
     #[test]

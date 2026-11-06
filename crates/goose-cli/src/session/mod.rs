@@ -785,7 +785,10 @@ impl CliSession {
                     *guard = Default::default();
                 }
             }
-            if matches!(input, InputResult::DockFocus | InputResult::ToolFocus) {
+            if matches!(
+                input,
+                InputResult::DockFocus | InputResult::ToolFocus | InputResult::Activate
+            ) {
                 // The line editor accepted the empty line to hand over the keys; take that
                 // line back so the prompt returns where it was. The pane's input box left none.
                 if self.dock().is_none() {
@@ -906,6 +909,7 @@ impl CliSession {
             }
             InputResult::DockFocus => self.focus_dock().await,
             InputResult::ToolFocus => self.browse_tool_calls().await,
+            InputResult::Activate => self.open_clicked().await,
             InputResult::Edit(prefill) => {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
@@ -1693,6 +1697,20 @@ impl CliSession {
                                     children.handle_key(key, true).await;
                                     None
                                 }
+                                // A click on a child row or a tool-call line.
+                                Key::Activate => match child_sessions::take_activation() {
+                                    Some(child_sessions::Target::Child(index)) => dock.row(index),
+                                    Some(child_sessions::Target::ToolCall(id)) => {
+                                        let calls = tool_calls::collect(self.messages.messages());
+                                        if !calls.is_empty() {
+                                            output::hide_thinking();
+                                            let _ = progress_bars.hide();
+                                            tool_view = tool_calls::ToolCallsView::open_at(calls, &id);
+                                        }
+                                        None
+                                    }
+                                    None => None,
+                                },
                                 Key::Up if dock.is_selecting() => {
                                     dock.step(-1);
                                     None
@@ -2718,11 +2736,40 @@ impl CliSession {
     /// ↑ on an empty prompt: the session's tool calls, full screen, until ↓ past the newest,
     /// Esc or q returns to the prompt.
     async fn browse_tool_calls(&mut self) {
+        self.browse_tool_calls_at(None).await;
+    }
+
+    /// A click at the prompt: the child row or tool-call line it landed on opens, as the
+    /// arrow keys and Enter would open it.
+    async fn open_clicked(&mut self) {
+        match child_sessions::take_activation() {
+            Some(child_sessions::Target::Child(index)) => {
+                let Some(row) = self.dock().and_then(|dock| dock.row(index)) else {
+                    return;
+                };
+                if background_view::task_id(&row).is_some() {
+                    self.view_background(&row).await;
+                } else {
+                    self.child_navigator(true).await.browse_at(&row).await;
+                }
+            }
+            Some(child_sessions::Target::ToolCall(id)) => {
+                self.browse_tool_calls_at(Some(&id)).await
+            }
+            None => {}
+        }
+    }
+
+    async fn browse_tool_calls_at(&mut self, id: Option<&str>) {
         let calls = tool_calls::collect(self.messages.messages());
         let Ok(mut keys) = child_sessions::KeyReader::start() else {
             return;
         };
-        let Some(mut view) = tool_calls::ToolCallsView::open(calls) else {
+        let view = match id {
+            Some(id) => tool_calls::ToolCallsView::open_at(calls, id),
+            None => tool_calls::ToolCallsView::open(calls),
+        };
+        let Some(mut view) = view else {
             return;
         };
         while let Some(key) = keys.next().await {
@@ -2980,11 +3027,41 @@ impl CliSession {
             enabled,
         );
         match self.router_session_id().await {
-            Some(router_session_id) => {
-                navigator.with_router(RouterStateSource::configured(), router_session_id)
-            }
+            Some(router_session_id) => navigator
+                .with_router(RouterStateSource::configured(), router_session_id)
+                .with_messenger(self.delegate_messenger()),
             None => navigator,
         }
+    }
+
+    /// Sends what the operator types into a delegate's input box through router-acp
+    /// (`_router/delegate_message`), which steers a working delegate or gives an idle one the
+    /// message.
+    fn delegate_messenger(&self) -> child_sessions::Messenger {
+        let agent = self.agent.clone();
+        let session_id = self.session_id.clone();
+        Arc::new(move |delegate, text| {
+            let agent = agent.clone();
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                let provider = agent
+                    .provider(&session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let reply = provider
+                    .extension_request(
+                        "_router/delegate_message",
+                        serde_json::json!({"delegateSessionId": delegate, "text": text}),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(reply
+                    .get("delivery")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("sent")
+                    .to_string())
+            })
+        })
     }
 
     /// The router-acp session backing this goose session: the one its latest turn ran in

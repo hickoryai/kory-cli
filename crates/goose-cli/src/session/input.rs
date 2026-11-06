@@ -37,6 +37,8 @@ pub enum InputResult {
     DockFocus,
     /// ↑ on an empty prompt: move into the session's tool calls.
     ToolFocus,
+    /// A click on a child row or a tool-call line (`child_sessions::take_activation`).
+    Activate,
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -615,6 +617,8 @@ async fn read_in_pane(
                 ));
             }
             Key::Eof if empty => return Ok(PaneRead::Result(InputResult::Exit)),
+            // A click opens a child or tool call; what was typed stays in the box.
+            Key::Activate => return Ok(PaneRead::Result(InputResult::Activate)),
             Key::Up if pane.move_vertical(-1) => {}
             Key::Down if pane.move_vertical(1) => {}
             Key::Up if empty && walk.back.is_none() && pane.select_goal() => {}

@@ -45,7 +45,7 @@ const GUTTER: usize = 2;
 /// Columns of rule always shown between the status and the context bar.
 const MIN_RULE: usize = 3;
 /// Enter in a child session's input box.
-const CHILD_TAKES_NO_MESSAGES: &str = "a child session takes no messages · Esc returns";
+const CHILD_TAKES_NO_MESSAGES: &str = "goose subagents take no messages · Esc returns";
 
 /// The live pane, so a full-screen view or child process can hand the screen back and forth.
 static ACTIVE: OnceLock<Mutex<Weak<Shared>>> = OnceLock::new();
@@ -454,6 +454,11 @@ impl Dock {
             .and_then(|index| state.rows.get(index).cloned())
     }
 
+    /// Child `index` of the pane's list (a clicked row).
+    pub fn row(&self, index: usize) -> Option<ChildRow> {
+        self.shared.state.lock().unwrap().rows.get(index).cloned()
+    }
+
     pub fn is_selecting(&self) -> bool {
         self.shared.state.lock().unwrap().selected.is_some()
     }
@@ -755,7 +760,18 @@ fn pane(state: &State, cols: usize, lines: usize) -> Vec<String> {
     for slot in 0..shown {
         let index = state.offset + slot;
         if let Some(child) = state.rows.get(index) {
-            out.push(view::child_row(child, state.selected == Some(index), width));
+            let selected = state.selected == Some(index);
+            let row = view::child_row(child, selected, width);
+            // Gray until selected or under the pointer (the relay draws that white); a click
+            // opens it.
+            let row = if selected {
+                row
+            } else {
+                style(console::strip_ansi_codes(&row).into_owned())
+                    .dim()
+                    .to_string()
+            };
+            out.push(format!("{}{row}", relay::child_row_mark(index)));
         }
     }
     if overflow && slots > 0 {
@@ -795,16 +811,26 @@ fn input_box(state: &State, cols: usize) -> Vec<String> {
 /// nothing under them, since a child has no children.
 pub struct ChildPane {
     state: Mutex<State>,
+    /// Whether Enter sends what is typed to the child (router-acp delegates take messages;
+    /// goose's own subagents do not).
+    sends: bool,
 }
 
 impl ChildPane {
-    pub fn new() -> Arc<Self> {
+    pub fn new(sends: bool) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
                 size: terminal_size(),
                 ..State::default()
             }),
+            sends,
         })
+    }
+
+    /// A state the status line leads with: how the last message was delivered, or why not.
+    pub fn set_status(&self, status: Option<String>) {
+        self.state.lock().unwrap().status = status;
+        relay::repaint();
     }
 
     /// The pane's painter for the relay.
@@ -833,17 +859,21 @@ impl ChildPane {
         self.state.lock().unwrap().input.text.is_empty()
     }
 
-    /// A key for the input box. What it would send stays in the box: a child takes no
-    /// messages from here, so Enter says so on the status line instead of queueing a message
-    /// nobody delivers.
+    /// A key for the input box. Enter (or Ctrl+Enter) hands back the message to send, whether
+    /// or not the child is working: it never waits in a queue here. A child that takes no
+    /// messages keeps the text and says so on the status line.
     pub fn type_key(&self, key: Key) -> Typed {
         let mut state = self.state.lock().unwrap();
         state.status = None;
         if matches!(key, Key::Enter | Key::SendNow) && state.input.paste.is_none() {
-            if !state.input.text.iter().all(|c| c.is_whitespace()) {
-                state.status = Some(CHILD_TAKES_NO_MESSAGES.to_string());
+            if state.input.text.iter().all(|c| c.is_whitespace()) {
+                return Typed::Ignored;
             }
-            return Typed::Ignored;
+            if !self.sends {
+                state.status = Some(CHILD_TAKES_NO_MESSAGES.to_string());
+                return Typed::Ignored;
+            }
+            return Typed::Submitted(state.input.take().trim().to_string());
         }
         type_into(&mut state, key)
     }
@@ -1246,7 +1276,7 @@ mod tests {
 
     #[test]
     fn a_child_pane_is_the_sessions_input_box_with_nothing_under_it() {
-        let child = ChildPane::new();
+        let child = ChildPane::new(true);
         child.set_turn(Some(Instant::now() - Duration::from_secs(72)));
         child.set_context(Some((102_000, 258_000)));
         for c in "hi".chars() {
@@ -1267,19 +1297,36 @@ mod tests {
     }
 
     #[test]
-    fn enter_in_a_child_queues_nothing_and_keeps_the_text() {
-        let child = ChildPane::new();
+    fn enter_in_a_child_sends_at_once_even_while_it_works() {
+        let child = ChildPane::new(true);
+        child.set_turn(Some(Instant::now()));
+        for c in "go on".chars() {
+            child.type_key(Key::Char(c));
+        }
+        assert_eq!(
+            child.type_key(Key::Enter),
+            Typed::Submitted("go on".to_string())
+        );
+        assert!(child.input_is_empty());
+        assert_eq!(child.type_key(Key::Enter), Typed::Ignored);
+        let lines = plain(&(child.painter())(80, 40));
+        assert!(!lines[0].contains("queued"), "{lines:?}");
+    }
+
+    #[test]
+    fn enter_in_a_subagent_queues_nothing_and_keeps_the_text() {
+        let child = ChildPane::new(false);
         child.set_turn(Some(Instant::now()));
         child.type_key(Key::Char('x'));
         assert_eq!(child.type_key(Key::Enter), Typed::Ignored);
         let lines = plain(&(child.painter())(80, 40));
-        assert!(lines[0].contains("takes no messages"), "{lines:?}");
+        assert!(lines[0].contains("take no messages"), "{lines:?}");
         assert!(!lines[0].contains("queued"), "{lines:?}");
         assert_eq!(lines[1], "› x");
         child.type_key(Key::Escape);
         assert!(child.input_is_empty());
         let lines = plain(&(child.painter())(80, 40));
-        assert!(!lines[0].contains("takes no messages"), "{lines:?}");
+        assert!(!lines[0].contains("take no messages"), "{lines:?}");
     }
 
     #[test]
