@@ -493,7 +493,7 @@ pub fn render_message_streaming(
         thinking.close();
         thinking.in_reply = false;
         flush_markdown_buffer(buffer, get_theme());
-        outln!("\n{} {}", accent(">"), message.as_concat_text());
+        print_submitted(&message.as_concat_text());
         let _ = std::io::stdout().flush();
         return;
     }
@@ -693,7 +693,11 @@ fn transcript_message(message: &Message) -> Message {
 }
 
 /// A submitted prompt as the transcript keeps it: `›` and its first line, the rest indented.
-fn print_submitted(text: &str) {
+/// It always starts a line of its own, even after output that did not end its line.
+pub(super) fn print_submitted(text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
     if !at_line_start() {
         outln!();
     }
@@ -2169,6 +2173,31 @@ mod tests {
     use serde_json::json;
     use std::env;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn a_typed_message_starts_a_line_of_its_own() {
+        // After a reply whose last line never ended, the message goes on the next line...
+        let after_open_line =
+            capture_output_after(false, || print_submitted("To be specific:\nmore"));
+        assert_eq!(
+            strip_str(&after_open_line).to_string(),
+            "\n› To be specific:\n  more\n"
+        );
+        // ...and after one that did, with no blank line between.
+        let after_line_end = capture_output_after(true, || print_submitted("hi"));
+        assert_eq!(strip_str(&after_line_end).to_string(), "› hi\n");
+        assert!(capture_output(|| print_submitted("  \n")).is_empty());
+
+        // A message steered into the running turn reads the same way.
+        let mut buffer = MarkdownBuffer::new();
+        let mut thinking = ThinkingBlock::default();
+        let steered = capture_output_after(false, || {
+            let mut message = Message::user().with_text("keep going");
+            message.metadata.steer = true;
+            render_message_streaming(&message, &mut buffer, &mut thinking, false);
+        });
+        assert_eq!(strip_str(&steered).to_string(), "\n› keep going\n");
+    }
 
     #[test]
     fn a_child_transcript_renders_as_the_session_renders_its_own() {

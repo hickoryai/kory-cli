@@ -729,7 +729,7 @@ impl CliSession {
 
             // Messages typed during the last turn go out as soon as it ends.
             if let Some(queued) = queued {
-                println!("{} {}", console::style(">").cyan(), queued);
+                output::print_submitted(&queued);
                 self.handle_input(
                     InputResult::Message(queued),
                     &history_manager,

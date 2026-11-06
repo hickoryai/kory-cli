@@ -428,22 +428,11 @@ enum PaneRead {
     Result(InputResult),
 }
 
-/// The submitted message stays in the transcript, as the line editor's prompt line did.
+/// The submitted message stays in the transcript, as the line editor's prompt line did, on a
+/// line of its own.
 fn echo_submitted(text: &str) {
-    if text.trim().is_empty() {
-        return;
-    }
-    let mut lines = text.lines();
-    if let Some(first) = lines.next() {
-        println!(
-            "{} {}",
-            console::style(super::output::sapling_green("›")).bold(),
-            first
-        );
-    }
-    for line in lines {
-        println!("  {line}");
-    }
+    super::output::print_submitted(text);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 /// ↑/↓ through the prompt history from the pane's input box, keeping what was being written.
