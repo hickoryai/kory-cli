@@ -19,6 +19,10 @@ impl KeyListener {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
+    pub fn start_for_prompt() -> std::io::Result<Self> {
+        Self::start()
+    }
+
     pub async fn next(&mut self) -> Option<Key> {
         None
     }

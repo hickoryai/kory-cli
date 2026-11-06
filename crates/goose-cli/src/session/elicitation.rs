@@ -108,8 +108,9 @@ fn collect_elicitation_input_inner(
         .unwrap_or_default();
 
     let mut data: HashMap<String, Value> = HashMap::new();
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
 
-    for (name, field_schema) in properties {
+    for (name, field_schema) in ordered_fields(properties) {
         if cancel_token.is_cancelled() {
             return Ok(ElicitationInput {
                 action: ElicitationAction::Cancel,
@@ -117,6 +118,31 @@ fn collect_elicitation_input_inner(
             });
         }
         let is_required = required.contains(&name.as_str());
+        if interactive {
+            // A "custom answer" companion (`<field>_custom`, as Claude's AskUserQuestion
+            // sends) is offered as the "Other…" choice of the field it belongs to.
+            if companion_of(properties, name).is_some() {
+                continue;
+            }
+            let custom = format!("{name}_custom");
+            let custom = properties.contains_key(&custom).then_some(custom);
+            match prompt_field(
+                name,
+                field_schema,
+                is_required,
+                custom.as_deref(),
+                &mut data,
+            ) {
+                Ok(()) => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    return Ok(ElicitationInput {
+                        action: ElicitationAction::Cancel,
+                        user_data: HashMap::new(),
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
         let field_type = field_schema
             .get("type")
             .and_then(|t| t.as_str())
@@ -209,6 +235,203 @@ fn collect_elicitation_input_inner(
     })
 }
 
+/// The form's fields in the order a person reads them: `question_2` before `question_10`.
+fn ordered_fields(properties: &serde_json::Map<String, Value>) -> Vec<(&String, &Value)> {
+    let mut fields: Vec<_> = properties.iter().collect();
+    fields.sort_by_key(|(name, _)| natural_key(name));
+    fields
+}
+
+fn natural_key(name: &str) -> Vec<(String, u64)> {
+    let mut key = Vec::new();
+    let mut text = String::new();
+    let mut digits = String::new();
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else {
+            if !digits.is_empty() {
+                key.push((std::mem::take(&mut text), digits.parse().unwrap_or(0)));
+                digits.clear();
+            }
+            text.push(c);
+        }
+    }
+    key.push((text, digits.parse().unwrap_or(0)));
+    key
+}
+
+/// The choice field a `<field>_custom` free-text field belongs to.
+fn companion_of<'a>(
+    properties: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Option<&'a Value> {
+    let base = name.strip_suffix("_custom")?;
+    properties
+        .get(base)
+        .filter(|field| choices(field).is_some() || array_choices(field).is_some())
+}
+
+/// A field's question as a person reads it: its title, else its description, else its name.
+fn field_label(name: &str, field: &Value) -> String {
+    let title = field.get("title").and_then(Value::as_str);
+    let description = field.get("description").and_then(Value::as_str);
+    match (title, description) {
+        (Some(title), Some(description)) => format!("{title}: {description}"),
+        (Some(text), None) | (None, Some(text)) => text.to_string(),
+        (None, None) => name.replace('_', " "),
+    }
+}
+
+/// A single choice's options as (value, label, hint), from a titled `oneOf` or an `enum`.
+fn choices(field: &Value) -> Option<Vec<(String, String, String)>> {
+    if let Some(one_of) = field.get("oneOf").and_then(Value::as_array) {
+        return one_of.iter().map(enum_option).collect();
+    }
+    let values = field.get("enum")?.as_array()?;
+    values
+        .iter()
+        .map(|value| {
+            let value = value.as_str()?;
+            Some((value.to_string(), value.to_string(), String::new()))
+        })
+        .collect()
+}
+
+/// A multi-choice (`type: array`) field's options, from `items.anyOf`, `items.oneOf` or
+/// `items.enum`.
+fn array_choices(field: &Value) -> Option<Vec<(String, String, String)>> {
+    if field.get("type").and_then(Value::as_str) != Some("array") {
+        return None;
+    }
+    let items = field.get("items")?;
+    match items.get("anyOf").or_else(|| items.get("oneOf")) {
+        Some(options) => options.as_array()?.iter().map(enum_option).collect(),
+        None => choices(items),
+    }
+}
+
+fn enum_option(option: &Value) -> Option<(String, String, String)> {
+    let value = option.get("const")?.as_str()?;
+    let label = option.get("title").and_then(Value::as_str).unwrap_or(value);
+    let hint = option
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some((value.to_string(), label.to_string(), hint.to_string()))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum Pick {
+    Value(String),
+    Other,
+    Skip,
+}
+
+/// One field asked with the terminal's own menus and inputs: ↑/↓ and Enter for a choice
+/// (with "Other…" for a typed answer and "Skip" when the field is optional), Space to tick
+/// a multi-choice, a text box otherwise. Esc or Ctrl-C cancels the whole form.
+fn prompt_field(
+    name: &str,
+    field: &Value,
+    required: bool,
+    custom: Option<&str>,
+    data: &mut HashMap<String, Value>,
+) -> io::Result<()> {
+    let label = field_label(name, field);
+    let field_type = field
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string");
+    if let Some(options) = choices(field) {
+        let mut select = cliclack::select(format!("{label} (↑↓ to move, Enter to choose)"));
+        for (value, title, hint) in &options {
+            select = select.item(Pick::Value(value.clone()), title, hint);
+        }
+        if custom.is_some() {
+            select = select.item(Pick::Other, "Other…", "type your own answer");
+        }
+        if !required {
+            select = select.item(Pick::Skip, "Skip", "");
+        }
+        if let Some(default) = field.get("default").and_then(Value::as_str) {
+            select = select.initial_value(Pick::Value(default.to_string()));
+        }
+        match select.interact()? {
+            Pick::Value(value) => {
+                data.insert(name.to_string(), Value::String(value));
+            }
+            Pick::Other => {
+                let answer: String = cliclack::input("Your answer").interact()?;
+                if let Some(custom) = custom {
+                    data.insert(custom.to_string(), Value::String(answer));
+                }
+            }
+            Pick::Skip => {}
+        }
+        return Ok(());
+    }
+    if let Some(options) = array_choices(field) {
+        let mut select =
+            cliclack::multiselect(format!("{label} (Space to select, Enter to confirm)"))
+                .required(required);
+        for (value, title, hint) in &options {
+            select = select.item(value.clone(), title, hint);
+        }
+        let picked = select.interact()?;
+        data.insert(
+            name.to_string(),
+            Value::Array(picked.into_iter().map(Value::String).collect()),
+        );
+        if let Some(custom) = custom {
+            let answer: String = cliclack::input("Anything else? (optional)")
+                .required(false)
+                .interact()?;
+            if !answer.trim().is_empty() {
+                data.insert(custom.to_string(), Value::String(answer));
+            }
+        }
+        return Ok(());
+    }
+    if field_type == "boolean" {
+        let default = field
+            .get("default")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let answer = cliclack::confirm(&label)
+            .initial_value(default)
+            .interact()?;
+        data.insert(name.to_string(), Value::Bool(answer));
+        return Ok(());
+    }
+    let mut input = cliclack::input(&label).required(required);
+    let default = field.get("default").map(format_default);
+    if let Some(default) = &default {
+        input = input.default_input(default);
+    }
+    if matches!(field_type, "number" | "integer") {
+        let integer = field_type == "integer";
+        input = input.validate(move |text: &String| {
+            let ok = text.is_empty()
+                || if integer {
+                    text.trim().parse::<i64>().is_ok()
+                } else {
+                    text.trim().parse::<f64>().is_ok()
+                };
+            if ok {
+                Ok(())
+            } else {
+                Err("Enter a number")
+            }
+        });
+    }
+    let answer: String = input.interact()?;
+    if !answer.is_empty() {
+        data.insert(name.to_string(), parse_value(&answer, field_type, None));
+    }
+    Ok(())
+}
+
 fn single_select(schema: &Value) -> Option<SingleSelect<'_>> {
     let properties = schema.get("properties")?.as_object()?;
     if properties.len() != 1 {
@@ -278,9 +501,10 @@ fn prompt_single_select(select: SingleSelect<'_>) -> io::Result<ElicitationInput
         .iter()
         .map(|(value, label)| (value.clone(), label, ""))
         .collect();
+    // The message above already asks the question; a field id like `choice` says nothing.
     let label = match select.description {
-        Some(desc) => format!("{} ({})", select.field_name, desc),
-        None => select.field_name.to_string(),
+        Some(desc) => format!("{desc} (↑↓ to move, Enter to choose)"),
+        None => "Choose one (↑↓ to move, Enter to choose)".to_string(),
     };
     let mut prompt = cliclack::select(label).items(&items);
     if let Some(initial_value) = select.initial_value {
@@ -694,6 +918,71 @@ mod tests {
         assert_eq!(select.options[0].1, "Small");
         assert_eq!(select.options[1].0, SelectChoice::Value("l".to_string()));
         assert_eq!(select.options[1].1, "Large");
+    }
+
+    /// The operator's report: Claude's AskUserQuestion arrived as a bare `question_0:` line
+    /// with no options, because the form has a companion "Other" field and only one-field
+    /// forms got a menu. Each choice field now gets its options, the companion becomes its
+    /// "Other…" choice, and the fields come in reading order.
+    #[test]
+    fn ask_user_question_forms_read_as_menus() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "question_10": {"type": "string", "oneOf": [{"const": "x", "title": "X"}]},
+                "question_10_custom": {"type": "string", "title": "Other"},
+                "question_2": {
+                    "type": "string",
+                    "title": "Router fix",
+                    "description": "Apply the patches?",
+                    "oneOf": [
+                        {"const": "Apply", "title": "Apply and install", "description": "Recommended"},
+                        {"const": "Decline", "title": "Decline"}
+                    ]
+                },
+                "question_2_custom": {"type": "string", "title": "Other"},
+                "question_3": {
+                    "type": "array",
+                    "items": {"anyOf": [{"const": "a", "title": "A"}, {"const": "b", "title": "B"}]}
+                }
+            }
+        });
+        let properties = schema["properties"].as_object().unwrap();
+        let order: Vec<&str> = ordered_fields(properties)
+            .into_iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "question_2",
+                "question_2_custom",
+                "question_3",
+                "question_10",
+                "question_10_custom"
+            ]
+        );
+        assert!(companion_of(properties, "question_2_custom").is_some());
+        assert!(companion_of(properties, "question_2").is_none());
+        let question = &properties["question_2"];
+        assert_eq!(
+            field_label("question_2", question),
+            "Router fix: Apply the patches?"
+        );
+        assert_eq!(field_label("question_9", &json!({})), "question 9");
+        assert_eq!(
+            choices(question).unwrap(),
+            [
+                (
+                    "Apply".into(),
+                    "Apply and install".into(),
+                    "Recommended".into()
+                ),
+                ("Decline".into(), "Decline".into(), String::new())
+            ]
+        );
+        assert_eq!(array_choices(&properties["question_3"]).unwrap().len(), 2);
+        assert!(choices(&properties["question_3"]).is_none());
     }
 
     #[test_case(json!({}); "missing properties")]

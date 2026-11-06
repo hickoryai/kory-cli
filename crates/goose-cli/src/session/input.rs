@@ -1,3 +1,4 @@
+use super::child_sessions::dock::Dock;
 use super::completion::GooseCompleter;
 use super::paste::{
     read_paste_aware_input, PasteAwareEnterHandler, PasteCaptureHandler, PasteState,
@@ -36,6 +37,8 @@ pub enum InputResult {
     DockFocus,
     /// ↑ on an empty prompt: move into the session's tool calls.
     ToolFocus,
+    /// A click on a child row or a tool-call line (`child_sessions::take_activation`).
+    Activate,
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -286,10 +289,11 @@ fn should_use_editor_always(
     editor_always_override.unwrap_or(has_editor)
 }
 
-pub fn get_input(
+pub async fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
     background_output: Option<&UnsolicitedRelay>,
+    pane: Option<&Dock>,
 ) -> Result<InputResult> {
     let config = Config::global();
     let prompt_editor = config.get_goose_prompt_editor().ok().flatten();
@@ -311,6 +315,25 @@ pub fn get_input(
                 // Empty editor content — fall through to inline prompt
             }
         }
+    }
+
+    // The pane's input box is the prompt wherever it runs; the line editor only serves a
+    // terminal that cannot host the pane.
+    if let Some(pane) = pane {
+        if let Some(relay) = background_output {
+            relay.resume();
+        }
+        let read = read_in_pane(editor, pane).await;
+        if let Some(relay) = background_output {
+            relay.pause();
+        }
+        return match read? {
+            PaneRead::Text(text) => {
+                echo_submitted(&text);
+                interpret(editor, text)
+            }
+            PaneRead::Result(result) => Ok(result),
+        };
     }
 
     let completion_cache = editor
@@ -396,7 +419,230 @@ pub fn get_input(
             _ => return Err(e.into()),
         },
     };
+    interpret(editor, input)
+}
 
+/// What the prompt read: text to interpret, or a key that already decided the result.
+enum PaneRead {
+    Text(String),
+    Result(InputResult),
+}
+
+/// The submitted message stays in the transcript, as the line editor's prompt line did, on a
+/// line of its own.
+fn echo_submitted(text: &str) {
+    super::output::print_submitted(text);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+/// ↑/↓ through the prompt history from the pane's input box, keeping what was being written.
+#[derive(Default)]
+struct HistoryWalk {
+    /// How many entries back from the newest; `None` on the line being written.
+    back: Option<usize>,
+    stash: String,
+}
+
+impl HistoryWalk {
+    fn step(&mut self, entries: &[String], pane: &Dock, older: bool) {
+        let next = match (self.back, older) {
+            (None, true) if !entries.is_empty() => {
+                self.stash = pane.input_text();
+                Some(0)
+            }
+            (None, _) => return,
+            (Some(back), true) => Some((back + 1).min(entries.len() - 1)),
+            (Some(0), false) => None,
+            (Some(back), false) => Some(back - 1),
+        };
+        self.back = next;
+        let text = match next {
+            Some(back) => entries[entries.len() - 1 - back].clone(),
+            None => std::mem::take(&mut self.stash),
+        };
+        pane.set_input(&text, usize::MAX);
+    }
+}
+
+/// Tab through completions: the first candidate goes in, each further Tab the next one.
+struct CompletionCycle {
+    /// The text before the completed word and after the caret.
+    prefix: String,
+    suffix: String,
+    candidates: Vec<String>,
+    index: usize,
+}
+
+impl CompletionCycle {
+    fn apply(&self, pane: &Dock) {
+        let text = format!("{}{}", self.prefix, self.candidates[self.index]);
+        let cursor = text.chars().count();
+        pane.set_input(&format!("{text}{}", self.suffix), cursor);
+    }
+}
+
+fn complete_in_pane(
+    editor: &Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    pane: &Dock,
+    cycle: &mut Option<CompletionCycle>,
+) {
+    use rustyline::completion::Completer;
+    if let Some(current) = cycle.as_mut() {
+        current.index = (current.index + 1) % current.candidates.len();
+        current.apply(pane);
+        return;
+    }
+    let Some(helper) = editor.helper() else {
+        return;
+    };
+    let (text, cursor) = pane.input();
+    let pos = text
+        .char_indices()
+        .nth(cursor)
+        .map_or(text.len(), |(index, _)| index);
+    let ctx = rustyline::Context::new(editor.history());
+    let Ok((start, pairs)) = helper.complete(&text, pos, &ctx) else {
+        return;
+    };
+    if pairs.is_empty() || start > pos {
+        return;
+    }
+    let candidates: Vec<String> = pairs.iter().map(|pair| pair.replacement.clone()).collect();
+    if candidates.len() > 1 {
+        let shown: Vec<&str> = pairs
+            .iter()
+            .take(8)
+            .map(|pair| pair.display.as_str())
+            .collect();
+        let more = candidates.len().saturating_sub(shown.len());
+        let mut notice = shown.join("  ");
+        if more > 0 {
+            notice.push_str(&format!("  +{more}"));
+        }
+        pane.set_notice(Some(notice));
+    }
+    let next = CompletionCycle {
+        prefix: text.get(..start).unwrap_or_default().to_string(),
+        suffix: text.get(pos..).unwrap_or_default().to_string(),
+        candidates,
+        index: 0,
+    };
+    next.apply(pane);
+    if next.candidates.len() > 1 {
+        *cycle = Some(next);
+    }
+}
+
+/// The prompt read in the pane: keys from the terminal, edited in the pane's input box, with
+/// the history, completion, Ctrl-C and ↑/↓ meanings the line editor gave them.
+async fn read_in_pane(
+    editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    pane: &Dock,
+) -> Result<PaneRead> {
+    use super::child_sessions::dock::Typed;
+    use super::child_sessions::Key;
+    let completion_cache = editor
+        .helper()
+        .map(|h| h.completion_cache.clone())
+        .ok_or_else(|| anyhow::anyhow!("Editor helper not set"))?;
+    // The status the line editor showed as its hint (an interruption, a pending exit).
+    if pane.input_text().is_empty() {
+        let status = completion_cache.read().unwrap().hint_status;
+        if status != HintStatus::Default {
+            use rustyline::hint::Hinter;
+            let ctx = rustyline::Context::new(editor.history());
+            let hint = editor.helper().and_then(|helper| helper.hint("", 0, &ctx));
+            pane.set_notice(hint);
+        }
+    }
+    let entries: Vec<String> = editor.history().iter().cloned().collect();
+    let mut walk = HistoryWalk::default();
+    let mut cycle: Option<CompletionCycle> = None;
+    let mut keys = super::child_sessions::KeyReader::start_for_prompt()?;
+    while let Some(key) = keys.next().await {
+        if key != Key::Open {
+            cycle = None;
+        }
+        if !matches!(
+            key,
+            Key::Up | Key::Down | Key::HistoryPrev | Key::HistoryNext
+        ) {
+            walk.back = None;
+        }
+        let empty = pane.input_text().is_empty();
+        // The selected goal takes the keys until it is edited, removed or left.
+        if key != Key::Interrupt && pane.is_goal_selected() {
+            use super::child_sessions::dock::GoalKey;
+            match pane.goal_key(key) {
+                GoalKey::Edit(objective) => {
+                    pane.set_input(&format!("/goal {objective}"), usize::MAX)
+                }
+                GoalKey::Remove => return Ok(PaneRead::Text("/goal clear".to_string())),
+                GoalKey::ToolCalls => {
+                    if super::tool_calls::request_focus() {
+                        super::tool_calls::take_focus_request();
+                        return Ok(PaneRead::Result(InputResult::ToolFocus));
+                    }
+                }
+                GoalKey::Back | GoalKey::Stay => {}
+            }
+            continue;
+        }
+        match key {
+            Key::Interrupt => {
+                let mut cache = completion_cache.write().unwrap();
+                if !empty {
+                    cache.hint_status = HintStatus::Default;
+                    if let Some(guard) = cache.planner_quit.as_mut() {
+                        *guard = Default::default();
+                    }
+                    drop(cache);
+                    pane.clear_input();
+                    continue;
+                }
+                if cache.planner_quit.is_some() || cache.hint_status == HintStatus::MaybeExit {
+                    return Ok(PaneRead::Result(InputResult::Interrupt));
+                }
+                cache.hint_status = HintStatus::MaybeExit;
+                drop(cache);
+                pane.set_notice(Some(
+                    "Press Ctrl+C again to exit, or type new instructions to continue".into(),
+                ));
+            }
+            Key::Eof if empty => return Ok(PaneRead::Result(InputResult::Exit)),
+            // A click opens a child or tool call; what was typed stays in the box.
+            Key::Activate => return Ok(PaneRead::Result(InputResult::Activate)),
+            Key::Up if pane.move_vertical(-1) => {}
+            Key::Down if pane.move_vertical(1) => {}
+            Key::Up if empty && walk.back.is_none() && pane.select_goal() => {}
+            Key::Up if empty && walk.back.is_none() && super::tool_calls::request_focus() => {
+                super::tool_calls::take_focus_request();
+                return Ok(PaneRead::Result(InputResult::ToolFocus));
+            }
+            Key::Down if empty && walk.back.is_none() && pane.has_rows() => {
+                return Ok(PaneRead::Result(InputResult::DockFocus));
+            }
+            Key::Up | Key::HistoryPrev => walk.step(&entries, pane, true),
+            Key::Down | Key::HistoryNext => walk.step(&entries, pane, false),
+            Key::Open => complete_in_pane(editor, pane, &mut cycle),
+            key => {
+                if key != Key::Interrupt {
+                    completion_cache.write().unwrap().hint_status = HintStatus::Default;
+                }
+                if let Typed::Submitted(text) = pane.type_key(key) {
+                    return Ok(PaneRead::Text(text));
+                }
+            }
+        }
+    }
+    Ok(PaneRead::Result(InputResult::Exit))
+}
+
+/// What a line read at the prompt asks for.
+fn interpret(
+    editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    input: String,
+) -> Result<InputResult> {
     // Add valid input to history (history saving to file is handled in the Session::interactive method)
     if !input.trim().is_empty() {
         editor.add_history_entry(input.as_str())?;
@@ -666,6 +912,10 @@ Ctrl+C - Clear current line if text is entered, otherwise exit the session
 Up on an empty prompt - Select the session's tool calls (Up/Down move, Enter shows one, Esc returns)
 Ctrl+P/Ctrl+N - Navigate through command history (also Up/Down while the prompt has text)
 Down on an empty prompt - Select a running child session in the dock
+/goal <objective> - Keep working until the objective is met; /goal shows it, /goal clear drops it
+Up on an empty prompt, with a goal - Select the goal (Enter edits, Delete removes, Up moves on)
+Wheel or PageUp/PageDown - Scroll the transcript; typing or the Jump to bottom pill returns
+Shift+drag - Select text while the wheel scrolls the transcript
 Tab (while subagents run) - Open the read-only child session navigator; Tab, q or Esc closes it
 GOOSE_CLI_BELL=true - Ring the terminal bell when goose finishes a turn or needs approval"
     )

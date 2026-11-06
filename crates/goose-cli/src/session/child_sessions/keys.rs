@@ -23,24 +23,54 @@ pub enum Key {
     /// raising SIGINT.
     Interrupt,
     Char(char),
+    /// Ctrl+J or Shift+Enter: a line break in the message being written.
+    Newline,
+    /// Ctrl-D.
+    Eof,
+    Delete,
+    /// Ctrl-K.
+    KillToEnd,
+    /// Ctrl-W or Alt+Backspace.
+    KillWord,
+    /// Alt+B, Ctrl+← or Alt+←.
+    WordLeft,
+    /// Alt+F, Ctrl+→ or Alt+→.
+    WordRight,
+    /// Ctrl-P: the previous history entry even where ↑ means something else.
+    HistoryPrev,
+    /// Ctrl-N.
+    HistoryNext,
+    /// A bracketed paste starts; its text arrives as `Char` and `Newline` keys until `PasteEnd`.
+    PasteStart,
+    PasteEnd,
     Click {
         row: u16,
         col: u16,
     },
     WheelUp,
     WheelDown,
+    /// The pane's relay saw a click on a tool call or a child; `relay::take_activation`
+    /// says which.
+    Activate,
 }
+
+/// The sequence the relay types for `Key::Activate`.
+pub const ACTIVATE_SEQUENCE: &[u8] = b"\x1b[7799~";
 
 const ESC: u8 = 0x1b;
 const CTRL: u16 = 4;
 const ALT: u16 = 2;
+const SHIFT: u16 = 1;
 
 /// Turns raw terminal bytes into keys. Escape sequences may arrive split across reads, so
 /// incomplete input is kept until more bytes arrive or the input goes idle.
 #[derive(Default)]
 pub struct KeyParser {
     pending: Vec<u8>,
+    in_paste: bool,
 }
+
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 impl KeyParser {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Key> {
@@ -48,7 +78,50 @@ impl KeyParser {
         let mut keys = Vec::new();
         let mut i = 0;
         while i < self.pending.len() {
+            if self.in_paste {
+                // Pasted text is text: line breaks and tabs are typed, not keys.
+                let rest = &self.pending[i..];
+                if rest.starts_with(PASTE_END) {
+                    keys.push(Key::PasteEnd);
+                    self.in_paste = false;
+                    i += PASTE_END.len();
+                    continue;
+                }
+                if PASTE_END.starts_with(rest) {
+                    break;
+                }
+                match rest[0] {
+                    b'\r' => {
+                        keys.push(Key::Newline);
+                        // CRLF is one break.
+                        i += if rest.get(1) == Some(&b'\n') { 2 } else { 1 };
+                    }
+                    b'\n' => {
+                        keys.push(Key::Newline);
+                        i += 1;
+                    }
+                    b'\t' => {
+                        keys.push(Key::Char('\t'));
+                        i += 1;
+                    }
+                    0x00..=0x1f | 0x7f => i += 1,
+                    _ => match parse_char(rest) {
+                        Parsed::Key(key, used) => {
+                            keys.push(key);
+                            i += used;
+                        }
+                        Parsed::Skip(used) => i += used,
+                        Parsed::Incomplete => break,
+                    },
+                }
+                continue;
+            }
             match parse_one(&self.pending[i..]) {
+                Parsed::Key(Key::PasteStart, used) => {
+                    keys.push(Key::PasteStart);
+                    self.in_paste = true;
+                    i += used;
+                }
                 Parsed::Key(key, used) => {
                     keys.push(key);
                     i += used;
@@ -79,11 +152,21 @@ fn parse_one(bytes: &[u8]) -> Parsed {
     let key = match bytes[0] {
         ESC => return parse_escape(bytes),
         b'\t' => Key::Open,
-        b'\r' | b'\n' => Key::Enter,
+        // The listener turns off CR-to-LF translation, so LF is Ctrl+J.
+        b'\r' => Key::Enter,
+        b'\n' => Key::Newline,
         0x7f | 0x08 => Key::Backspace,
         0x01 => Key::Home,
+        0x02 => Key::Left,
+        0x03 => Key::Interrupt,
+        0x04 => Key::Eof,
         0x05 => Key::End,
+        0x06 => Key::Right,
+        0x0b => Key::KillToEnd,
+        0x0e => Key::HistoryNext,
+        0x10 => Key::HistoryPrev,
         0x15 => Key::KillLine,
+        0x17 => Key::KillWord,
         0x00..=0x1f => return Parsed::Skip(1),
         _ => return parse_char(bytes),
     };
@@ -124,6 +207,9 @@ fn parse_escape(bytes: &[u8]) -> Parsed {
         },
         // Alt+Enter; the terminal's input translation may turn its CR into LF.
         Some(b'\r' | b'\n') => Parsed::Key(Key::SendNow, 2),
+        Some(b'b') => Parsed::Key(Key::WordLeft, 2),
+        Some(b'f') => Parsed::Key(Key::WordRight, 2),
+        Some(0x7f | 0x08) => Parsed::Key(Key::KillWord, 2),
         Some(_) => Parsed::Key(Key::Escape, 1),
     }
 }
@@ -140,6 +226,12 @@ fn parse_csi(bytes: &[u8]) -> Parsed {
     let used = end + 1;
     let key = match (params, bytes[end]) {
         ([b'<', mouse @ ..], final_byte @ (b'M' | b'm')) => sgr_mouse(mouse, final_byte == b'M'),
+        (b"7799", b'~') => Some(Key::Activate),
+        (b"200", b'~') => Some(Key::PasteStart),
+        (b"201", b'~') => Some(Key::PasteEnd),
+        (b"3", b'~') => Some(Key::Delete),
+        (b"1;3" | b"1;5", b'D') => Some(Key::WordLeft),
+        (b"1;3" | b"1;5", b'C') => Some(Key::WordRight),
         (b"5", b'~') => Some(Key::PageUp),
         (b"6", b'~') => Some(Key::PageDown),
         (b"1" | b"7", b'~') => Some(Key::Home),
@@ -181,14 +273,26 @@ fn modified(code: u32, mods: u16) -> Option<Key> {
     let ctrl = mods & CTRL != 0;
     match code {
         13 if ctrl || mods & ALT != 0 => Some(Key::SendNow),
+        13 if mods & SHIFT != 0 => Some(Key::Newline),
         13 => Some(Key::Enter),
         27 => Some(Key::Escape),
         9 => Some(Key::Open),
+        127 | 8 if ctrl || mods & ALT != 0 => Some(Key::KillWord),
         127 | 8 => Some(Key::Backspace),
         99 if ctrl => Some(Key::Interrupt),
+        100 if ctrl => Some(Key::Eof),
+        106 if ctrl => Some(Key::Newline),
+        107 if ctrl => Some(Key::KillToEnd),
+        110 if ctrl => Some(Key::HistoryNext),
+        112 if ctrl => Some(Key::HistoryPrev),
         117 if ctrl => Some(Key::KillLine),
+        119 if ctrl => Some(Key::KillWord),
         97 if ctrl => Some(Key::Home),
+        98 if ctrl => Some(Key::Left),
         101 if ctrl => Some(Key::End),
+        102 if ctrl => Some(Key::Right),
+        98 if mods & ALT != 0 => Some(Key::WordLeft),
+        102 if mods & ALT != 0 => Some(Key::WordRight),
         _ if ctrl => None,
         code => char::from_u32(code)
             .filter(|c| !c.is_control())
@@ -297,6 +401,12 @@ mod tests {
     }
 
     #[test]
+    fn the_relays_click_sequence_is_one_activate_key_and_motion_is_nothing() {
+        assert_eq!(parse(ACTIVATE_SEQUENCE), [Key::Activate]);
+        assert_eq!(parse(b"\x1b[<35;4;2M"), []);
+    }
+
+    #[test]
     fn maps_sgr_mouse_events() {
         assert_eq!(
             parse(b"\x1b[<0;5;3M\x1b[<0;5;3m\x1b[<64;1;1M\x1b[<65;1;1M\x1b[<2;1;1M"),
@@ -319,6 +429,51 @@ mod tests {
         assert!(parser.feed(b"\x1b").is_empty());
         assert_eq!(parser.flush_idle(), Some(Key::Escape));
         assert_eq!(parser.flush_idle(), None);
+    }
+
+    #[test]
+    fn line_editing_keys() {
+        assert_eq!(
+            parse(b"\n\x03\x04\x0b\x17\x10\x0e\x1bb\x1bf\x1b\x7f\x1b[3~\x1b[1;5D\x1b[1;3C"),
+            [
+                Key::Newline,
+                Key::Interrupt,
+                Key::Eof,
+                Key::KillToEnd,
+                Key::KillWord,
+                Key::HistoryPrev,
+                Key::HistoryNext,
+                Key::WordLeft,
+                Key::WordRight,
+                Key::KillWord,
+                Key::Delete,
+                Key::WordLeft,
+                Key::WordRight,
+            ]
+        );
+        assert_eq!(
+            parse(b"\x1b[13;2u\x1b[106;5u\x1b[100;5u"),
+            [Key::Newline, Key::Newline, Key::Eof]
+        );
+    }
+
+    #[test]
+    fn a_bracketed_paste_is_text_even_split_across_reads() {
+        let mut parser = KeyParser::default();
+        assert_eq!(
+            parser.feed(b"\x1b[200~a\r\nb\x1b["),
+            [
+                Key::PasteStart,
+                Key::Char('a'),
+                Key::Newline,
+                Key::Char('b')
+            ]
+        );
+        assert_eq!(
+            parser.feed(b"201~\r"),
+            [Key::PasteEnd, Key::Enter],
+            "after the paste, CR is Enter again"
+        );
     }
 
     #[test]

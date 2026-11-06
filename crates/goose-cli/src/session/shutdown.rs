@@ -48,6 +48,8 @@ pub async fn census(provider: &dyn Provider) -> Census {
 pub const REFUSED: &str = "  /shutdown only works in an /implement (router-acp planner) session.";
 pub const BLOCKED: &str =
     "◼ shutdown in progress · new prompts are blocked until the workers drain (Ctrl-C quits)";
+pub const UNANSWERED: &str =
+    "◼ shutdown · router-acp has not answered yet, and may already be draining; its progress appears here";
 pub const SHUT_DOWN: &str =
     "◼ shutdown · this session has shut down; /exit, then /implement in a new session resumes";
 pub const CLOSE_HINT: &str = "  The session can be closed now (/exit).";
@@ -237,25 +239,45 @@ pub fn accepted(answer: &Value) -> Result<(), String> {
         .to_string())
 }
 
-/// How long router-acp has to accept or refuse; it answers at once and reports the rest as
-/// progress.
+/// How long this prompt waits for router-acp to accept or refuse. The request stays delivered
+/// after that: a busy router can start draining before its answer gets here, so silence is
+/// not a refusal.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Asks the provider's router to shut the planner run down. On acceptance, the receiver of
-/// its progress notifications (subscribed before asking, so none is missed).
-pub async fn request(
+/// A shutdown request router-acp accepted, or has not refused in time.
+#[derive(Debug)]
+pub struct Requested {
+    /// Subscribed before asking, so no progress notification is missed.
+    pub notifications: Option<broadcast::Receiver<ExtensionNotification>>,
+    pub answered: bool,
+}
+
+/// Asks the provider's router to shut the planner run down. Only an answer refuses it.
+pub async fn request(provider: &dyn Provider) -> Result<Requested, String> {
+    request_within(provider, REQUEST_TIMEOUT).await
+}
+
+async fn request_within(
     provider: &dyn Provider,
-) -> Result<Option<broadcast::Receiver<ExtensionNotification>>, String> {
+    wait: std::time::Duration,
+) -> Result<Requested, String> {
     let notifications = provider.subscribe_extension_notifications();
-    let answer = tokio::time::timeout(
-        REQUEST_TIMEOUT,
+    let answered = match tokio::time::timeout(
+        wait,
         provider.extension_request(REQUEST, serde_json::json!({})),
     )
     .await
-    .map_err(|_| "router-acp did not answer the shutdown request".to_string())?
-    .map_err(|error| error.to_string())?;
-    accepted(&answer)?;
-    Ok(notifications)
+    {
+        Ok(answer) => {
+            accepted(&answer.map_err(|error| error.to_string())?)?;
+            true
+        }
+        Err(_) => false,
+    };
+    Ok(Requested {
+        notifications,
+        answered,
+    })
 }
 
 /// A shutdown router-acp accepted for this session.
@@ -564,6 +586,7 @@ mod tests {
         answer: Result<Value, String>,
         asked: std::sync::Mutex<Vec<(String, Value)>>,
         progress: broadcast::Sender<ExtensionNotification>,
+        silent: bool,
     }
 
     #[async_trait::async_trait]
@@ -598,6 +621,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((method.to_string(), params));
+            if self.silent {
+                std::future::pending::<()>().await;
+            }
             self.answer
                 .clone()
                 .map_err(goose_providers::errors::ProviderError::RequestFailed)
@@ -609,13 +635,16 @@ mod tests {
             answer,
             asked: std::sync::Mutex::new(Vec::new()),
             progress: broadcast::channel(4).0,
+            silent: false,
         }
     }
 
     #[tokio::test]
     async fn shutdown_sends_the_planner_request_and_listens_first() {
         let router = router(Ok(json!({"accepted": true})));
-        let mut receiver = request(&router).await.unwrap();
+        let requested = request(&router).await.unwrap();
+        assert!(requested.answered);
+        let mut receiver = requested.notifications;
         assert_eq!(
             router.asked.lock().unwrap().clone(),
             [(REQUEST.to_string(), json!({}))]
@@ -644,6 +673,30 @@ mod tests {
             request(&declined).await.unwrap_err(),
             "already shutting down"
         );
+    }
+
+    /// 2026-11-03: a busy router started the drain, its answer came after the wait, and this
+    /// printed "refused" and dropped the progress of the drain that was running.
+    #[tokio::test]
+    async fn a_router_that_stays_silent_has_not_refused() {
+        let router = Router {
+            silent: true,
+            ..router(Ok(json!({"accepted": true})))
+        };
+        let requested = request_within(&router, std::time::Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(!requested.answered);
+        let mut receiver = requested.notifications;
+        router
+            .progress
+            .send(ExtensionNotification {
+                method: PROGRESS.to_string(),
+                params: json!({"sessionId": "r1", "phase": "saving"}),
+            })
+            .unwrap();
+        let first = next_notification(&mut receiver).await;
+        assert_eq!(parse(&first, "r1").unwrap().phase, Phase::Saving);
     }
 
     #[tokio::test]

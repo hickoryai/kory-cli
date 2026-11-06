@@ -173,7 +173,7 @@ impl Navigator {
         self.scroll_back = 0;
     }
 
-    fn ascend(&mut self) {
+    pub fn ascend(&mut self) {
         if let Some(crumb) = self.path.pop() {
             self.selected = crumb.selected;
             self.list_offset = 0;
@@ -295,7 +295,9 @@ pub(super) fn child_row(child: &ChildRow, selected: bool, width: usize) -> Strin
         sanitize(&child.activity)
     );
     if selected {
-        fit(&row, width, |s| style(s).cyan().bold())
+        fit(&row, width, |s| {
+            style(super::super::output::sapling_green(s)).bold()
+        })
     } else {
         fit(&row, width, style)
     }

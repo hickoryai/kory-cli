@@ -365,9 +365,7 @@ pub(super) fn read_paste_aware_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     paste_state: Arc<std::sync::RwLock<PasteState>>,
 ) -> rustyline::Result<String> {
-    // Text typed during the last turn and never sent starts the prompt.
-    let draft = super::child_sessions::dock::take_draft();
-    let input = editor.readline_with_initial("> ", (&draft, ""))?;
+    let input = editor.readline("> ")?;
     let expanded = paste_state
         .read()
         .ok()

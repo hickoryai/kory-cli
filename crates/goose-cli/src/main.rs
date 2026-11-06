@@ -46,7 +46,12 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()
                 .expect("Failed to build Tokio runtime");
-            runtime.block_on(run())
+            let result = runtime.block_on(run());
+            // Dropping a runtime waits for every blocking task without limit, so one stuck
+            // task (a read that never returns, a provider that never closes) kept the
+            // process alive after "session closed". Leftover work gets a moment, not forever.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            result
         })
         .map_err(|e| anyhow::anyhow!("Failed to spawn goose-cli main thread: {}", e))?;
 

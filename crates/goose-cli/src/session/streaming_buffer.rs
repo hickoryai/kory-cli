@@ -310,6 +310,12 @@ impl MarkdownBuffer {
         }
     }
 
+    /// Puts text back in front of the buffer, to go out with whatever comes next.
+    pub fn hold(&mut self, text: &str) {
+        self.buffer.insert_str(0, text);
+        self.checkpoint = ScanCheckpoint::default();
+    }
+
     /// Flush any remaining content from the buffer.
     ///
     /// Call this at the end of a stream to get any buffered content,

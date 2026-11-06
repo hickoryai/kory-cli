@@ -28,18 +28,33 @@ pub struct KeyListener {
 
 impl KeyListener {
     pub fn start() -> std::io::Result<Self> {
+        Self::start_with(false)
+    }
+
+    /// For the prompt, where Ctrl-C and Ctrl-D are keys rather than signals and end of input.
+    pub fn start_for_prompt() -> std::io::Result<Self> {
+        Self::start_with(true)
+    }
+
+    fn start_with(ctrl_keys: bool) -> std::io::Result<Self> {
         let fd = std::io::stdin().as_raw_fd();
         let original = get_termios(fd)?;
         let mut cbreak = original;
         cbreak.c_lflag &= !(libc::ICANON | libc::ECHO);
+        if ctrl_keys {
+            cbreak.c_lflag &= !libc::ISIG;
+        }
+        // Enter arrives as CR and Ctrl+J as LF, so they stay two keys.
+        cbreak.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IXON);
         cbreak.c_cc[libc::VMIN] = 1;
         cbreak.c_cc[libc::VTIME] = 0;
         set_termios(fd, &cbreak)?;
+        let typed_ahead = enters_restored(read_pending(fd));
 
         let (tx, keys) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = stop.clone();
-        let reader = std::thread::spawn(move || read_keys(fd, &reader_stop, &tx));
+        let reader = std::thread::spawn(move || read_keys(fd, &typed_ahead, &reader_stop, &tx));
         Ok(Self {
             keys,
             stop,
@@ -86,8 +101,36 @@ impl Drop for EchoOff {
     }
 }
 
-fn read_keys(fd: i32, stop: &AtomicBool, tx: &mpsc::UnboundedSender<Key>) {
+/// Input already typed when this listener took over.
+fn read_pending(fd: i32) -> Vec<u8> {
+    let mut count: libc::c_int = 0;
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut count) } != 0 || count <= 0 {
+        return Vec::new();
+    }
+    let mut pending = vec![0u8; count as usize];
+    let read = unsafe { libc::read(fd, pending.as_mut_ptr().cast(), pending.len()) };
+    pending.truncate(read.max(0) as usize);
+    pending
+}
+
+/// The terminal's line settings turned Enter into a line feed while the input waited, which a
+/// listener would read as Ctrl+J and add a line instead of sending the message.
+fn enters_restored(mut typed: Vec<u8>) -> Vec<u8> {
+    for byte in &mut typed {
+        if *byte == b'\n' {
+            *byte = b'\r';
+        }
+    }
+    typed
+}
+
+fn read_keys(fd: i32, typed_ahead: &[u8], stop: &AtomicBool, tx: &mpsc::UnboundedSender<Key>) {
     let mut parser = KeyParser::default();
+    for key in parser.feed(typed_ahead) {
+        if tx.send(key).is_err() {
+            return;
+        }
+    }
     let mut buf = [0u8; 256];
     while !stop.load(Ordering::Relaxed) {
         let mut pollfd = libc::pollfd {
@@ -171,4 +214,16 @@ fn write_raw(text: &str) {
     let mut stdout = std::io::stdout().lock();
     let _ = stdout.write_all(text.as_bytes());
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_typed_before_the_listener_started_still_sends() {
+        assert_eq!(enters_restored(b"/login\n".to_vec()), b"/login\r");
+        let keys = KeyParser::default().feed(&enters_restored(b"a\n".to_vec()));
+        assert_eq!(keys.last(), Some(&Key::Enter));
+    }
 }

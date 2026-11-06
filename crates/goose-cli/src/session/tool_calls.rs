@@ -336,6 +336,15 @@ fn follow(offset: usize, selected: usize, slots: usize, len: usize) -> usize {
     offset.min(len.saturating_sub(slots))
 }
 
+/// The call on screen row `row` of the list `list_frame` draws for `len` calls from `offset`
+/// on a screen `rows` tall.
+fn clicked_call(len: usize, offset: usize, rows: usize, row: usize) -> Option<usize> {
+    let slots = rows.saturating_sub(1);
+    let shown = len.saturating_sub(offset).min(slots);
+    let first = 1 + slots - shown;
+    (row >= first && row < first + shown).then(|| offset + row - first)
+}
+
 /// The list, bottom-anchored like the transcript it stands for: header, then the calls with
 /// the newest on the last row.
 fn list_frame(
@@ -408,16 +417,27 @@ pub struct ToolCallsView {
 impl ToolCallsView {
     /// Opens on the newest call; `None` when there are no calls.
     pub fn open(calls: Vec<ToolCall>) -> Option<Self> {
+        Self::open_on(calls, None)
+    }
+
+    /// Opens on call `id`'s details, as a click on its transcript line does (Esc goes to the
+    /// list); on the newest call when `id` is not among them.
+    pub fn open_at(calls: Vec<ToolCall>, id: &str) -> Option<Self> {
+        Self::open_on(calls, Some(id))
+    }
+
+    fn open_on(calls: Vec<ToolCall>, id: Option<&str>) -> Option<Self> {
         if calls.is_empty() {
             return None;
         }
-        let selected = calls.len() - 1;
+        let found = id.and_then(|id| calls.iter().position(|call| call.id == id));
+        let selected = found.unwrap_or(calls.len() - 1);
         let mut view = Self {
             screen: Screen::enter(),
             calls,
             selected,
             offset: usize::MAX,
-            detail: None,
+            detail: found.map(|_| 0),
         };
         view.draw();
         Some(view)
@@ -440,6 +460,15 @@ impl ToolCallsView {
     /// Handles one key; false once the view has closed back to the input.
     pub fn key(&mut self, key: Key) -> bool {
         let (_, rows) = self.screen.size();
+        // A click on a call in the list opens its details, as selecting it and Enter would.
+        if let (Key::Click { row, .. }, None) = (key, self.detail) {
+            if let Some(index) = clicked_call(self.calls.len(), self.offset, rows, row as usize) {
+                self.selected = index;
+                self.detail = Some(0);
+                self.draw();
+            }
+            return true;
+        }
         if let Some(scroll) = self.detail {
             let (_, max_scroll) =
                 detail_frame(&self.calls[self.selected], scroll, self.screen.size());
@@ -525,6 +554,19 @@ mod tests {
     }
 
     const DELEGATE: &str = r#"router-acp · delegate_task → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · task Feature · planner → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · phase=implementation (pool: implementation_candidates + boost +3.00) · utility 3.63 = 0.84×quality 2.97→0.55 (Feature) + 0.16×quota (headroom 60%, cost rank 4) + pref 3.07 · tradeoff 3→1.6 (complexity-scaled) · "[router-acp planner role: implement-work] Policy identity...""#;
+
+    #[test]
+    fn a_click_lands_on_the_call_drawn_on_that_row() {
+        // 3 calls on a 6-row screen: the header, two blank rows, then calls 0, 1 and 2.
+        assert_eq!(clicked_call(3, 0, 6, 0), None);
+        assert_eq!(clicked_call(3, 0, 6, 2), None);
+        assert_eq!(clicked_call(3, 0, 6, 3), Some(0));
+        assert_eq!(clicked_call(3, 0, 6, 5), Some(2));
+        assert_eq!(clicked_call(3, 0, 6, 6), None);
+        // A long list scrolled to its end: every row under the header is a call.
+        assert_eq!(clicked_call(20, 15, 6, 1), Some(15));
+        assert_eq!(clicked_call(20, 15, 6, 5), Some(19));
+    }
 
     #[test]
     fn router_notices_are_listed_with_their_full_text() {

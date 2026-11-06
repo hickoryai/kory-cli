@@ -183,7 +183,7 @@ struct Display {
     held: String,
     partial: String,
     markdown: MarkdownBuffer,
-    thinking_header_shown: bool,
+    thinking_block: output::ThinkingBlock,
     in_burst: bool,
     debug: bool,
 }
@@ -209,7 +209,7 @@ impl Display {
             held: String::new(),
             partial: String::new(),
             markdown: MarkdownBuffer::new(),
-            thinking_header_shown: false,
+            thinking_block: output::ThinkingBlock::default(),
             in_burst: false,
             debug,
         }
@@ -232,15 +232,12 @@ impl Display {
     /// child sessions it opens already say which agent is working.
     fn render(&mut self, message: &Message) {
         self.in_burst = true;
-        let (markdown, thinking_header_shown, debug) = (
-            &mut self.markdown,
-            &mut self.thinking_header_shown,
-            self.debug,
-        );
+        let (markdown, thinking_block, debug) =
+            (&mut self.markdown, &mut self.thinking_block, self.debug);
         // Text after the last line end has not gone out yet: a tool-call line must end it.
         let line_start = self.partial.is_empty();
         let text = output::capture_output_after(line_start, || {
-            output::render_message_streaming(message, markdown, thinking_header_shown, debug)
+            output::render_message_streaming(message, markdown, thinking_block, debug)
         });
         self.emit(text, false);
     }
@@ -249,11 +246,14 @@ impl Display {
         if !self.in_burst {
             return;
         }
-        let markdown = &mut self.markdown;
-        let tail = output::capture_output(|| output::flush_markdown_buffer_current_theme(markdown));
+        let (markdown, thinking_block) = (&mut self.markdown, &mut self.thinking_block);
+        let tail = output::capture_output(|| {
+            thinking_block.close();
+            output::flush_markdown_buffer_current_theme(markdown);
+        });
         self.emit(tail, true);
         self.in_burst = false;
-        self.thinking_header_shown = false;
+        self.thinking_block = output::ThinkingBlock::default();
     }
 
     /// The external printer ends every print with a newline, so only whole lines go out

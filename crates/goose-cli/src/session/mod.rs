@@ -1,3 +1,4 @@
+mod background_view;
 mod builder;
 mod child_sessions;
 mod completion;
@@ -75,6 +76,7 @@ use tracing::warn;
 const SHELL_STATUS_FALLBACK_WIDTH: usize = 120;
 /// How often a message the running turn declined is offered to it again.
 const STEER_RETRY: Duration = Duration::from_secs(2);
+const CONTEXT_REFRESH: Duration = Duration::from_secs(3);
 /// How long a turn that ended waits for a message on its way to it.
 const STEER_SETTLE: Duration = Duration::from_secs(5);
 /// How long a message may be on its way to the running turn before it counts as declined.
@@ -246,6 +248,43 @@ impl HistoryManager {
     }
 }
 
+/// How long background extension loading may run before the session says so. It usually ends
+/// well inside this.
+const EXTENSION_BANNER_GRACE: Duration = Duration::from_secs(2);
+
+/// Says "extensions ready" as soon as loading ends, without waiting for the next prompt, and
+/// only when the session said it was loading.
+#[derive(Default)]
+struct ExtensionProgress {
+    announced: std::sync::atomic::AtomicBool,
+    finished: std::sync::atomic::AtomicBool,
+    ready_shown: std::sync::atomic::AtomicBool,
+}
+
+impl ExtensionProgress {
+    fn announced(&self) {
+        self.announced
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.show_ready();
+    }
+
+    fn finished(&self) {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.show_ready();
+    }
+
+    fn show_ready(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.announced.load(SeqCst)
+            && self.finished.load(SeqCst)
+            && !self.ready_shown.swap(true, SeqCst)
+        {
+            output::show_extensions_ready();
+        }
+    }
+}
+
 pub struct CliSession {
     agent: Arc<Agent>,
     messages: Conversation,
@@ -261,7 +300,7 @@ pub struct CliSession {
     /// [`CliSession::ensure_extensions_loaded`], the session's single loading
     /// gate.
     extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
-    loading_announced: bool,
+    extension_progress: Arc<ExtensionProgress>,
     /// Records (and at the prompt, shows) what the agent says while no turn of ours runs.
     unsolicited: Option<unsolicited::UnsolicitedRelay>,
     /// The persistent child list under the prompt, and the router session it follows.
@@ -328,18 +367,26 @@ impl CliSession {
             .map(|session| session.conversation.unwrap_or_default())
             .unwrap();
         let completion_cache = Arc::new(std::sync::RwLock::new(CompletionCache::new()));
+        let extension_progress = Arc::new(ExtensionProgress::default());
         let extension_loading = extension_loading.map(|handle| {
             let agent = agent.clone();
             let session_id = session_id.clone();
             let completion_cache = completion_cache.clone();
+            let progress = extension_progress.clone();
             AbortOnDropHandle::new(tokio::spawn(async move {
-                let failures = handle.await.map_err(|error| {
-                    anyhow::anyhow!("Extension loading task failed: {}", error)
-                })??;
-                if refresh_completions {
-                    Self::refresh_completion_cache(&agent, &session_id, &completion_cache).await?;
+                let loaded = async {
+                    let failures = handle.await.map_err(|error| {
+                        anyhow::anyhow!("Extension loading task failed: {}", error)
+                    })??;
+                    if refresh_completions {
+                        Self::refresh_completion_cache(&agent, &session_id, &completion_cache)
+                            .await?;
+                    }
+                    Ok(failures)
                 }
-                Ok(failures)
+                .await;
+                progress.finished();
+                loaded
             }))
         });
 
@@ -355,7 +402,7 @@ impl CliSession {
             output_format,
             stats,
             extension_loading,
-            loading_announced: false,
+            extension_progress,
             unsolicited: None,
             dock: None,
             shutdown: std::sync::Mutex::new(None),
@@ -622,13 +669,9 @@ impl CliSession {
             let msg = Message::user().with_text(&prompt);
             self.process_message(msg, CancellationToken::default(), true)
                 .await?;
-        } else if self
-            .extension_loading
-            .as_ref()
-            .is_some_and(|h| !h.is_finished())
-        {
-            self.loading_announced = true;
+        } else if !self.extensions_loaded_within(EXTENSION_BANNER_GRACE).await {
             output::show_loading_extensions_background();
+            self.extension_progress.announced();
         }
 
         // The completion cache starts empty: populating it here would issue
@@ -651,11 +694,11 @@ impl CliSession {
                 self.ensure_extensions_loaded(true).await?;
             }
 
+            self.sync_unsolicited(Some(&mut editor)).await;
             if show_status {
                 self.display_context_usage().await?;
             }
             show_status = true;
-            self.sync_unsolicited(Some(&mut editor)).await;
             // A `/shutdown` still draining holds the prompt back until it ends.
             if self.shutdown_gate() == shutdown::Gate::Draining {
                 if let Some(dock) = self.dock() {
@@ -686,7 +729,7 @@ impl CliSession {
 
             // Messages typed during the last turn go out as soon as it ends.
             if let Some(queued) = queued {
-                println!("{} {}", console::style(">").cyan(), queued);
+                output::print_submitted(&queued);
                 self.handle_input(
                     InputResult::Message(queued),
                     &history_manager,
@@ -713,7 +756,9 @@ impl CliSession {
                 &mut editor,
                 Some(&conversation_strings),
                 self.unsolicited.as_ref(),
-            )?;
+                self.dock.as_ref().map(|(_, dock)| dock),
+            )
+            .await?;
             if matches!(input, InputResult::Interrupt) {
                 let step = self
                     .completion_cache
@@ -740,10 +785,15 @@ impl CliSession {
                     *guard = Default::default();
                 }
             }
-            if matches!(input, InputResult::DockFocus | InputResult::ToolFocus) {
+            if matches!(
+                input,
+                InputResult::DockFocus | InputResult::ToolFocus | InputResult::Activate
+            ) {
                 // The line editor accepted the empty line to hand over the keys; take that
-                // line back so the prompt returns where it was.
-                erase_accepted_prompt_line();
+                // line back so the prompt returns where it was. The pane's input box left none.
+                if self.dock().is_none() {
+                    erase_accepted_prompt_line();
+                }
                 show_status = false;
             }
             self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
@@ -859,6 +909,7 @@ impl CliSession {
             }
             InputResult::DockFocus => self.focus_dock().await,
             InputResult::ToolFocus => self.browse_tool_calls().await,
+            InputResult::Activate => self.open_clicked().await,
             InputResult::Edit(prefill) => {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
@@ -1507,7 +1558,7 @@ impl CliSession {
         let cancel_token_clone = cancel_token.clone();
         let mut markdown_buffer = streaming_buffer::MarkdownBuffer::new();
         let mut prompted_credits_urls: HashSet<String> = HashSet::new();
-        let mut thinking_header_shown = false;
+        let mut thinking_block = output::ThinkingBlock::default();
         let run_started = Instant::now();
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
@@ -1526,12 +1577,17 @@ impl CliSession {
         }
         let mut deferred_messages: Vec<Message> = Vec::new();
         let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
+        // An ACP agent reports its context in `usage_update`s, not turn usage, so the pane's
+        // context bar reads it on a clock while the turn runs.
+        let mut refresh_context = tokio::time::interval(CONTEXT_REFRESH);
         // Messages queued in the footer reach the running turn one at a time.
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut steer_retry = tokio::time::interval(STEER_RETRY);
         let mut handed_to_goose: Vec<String> = Vec::new();
         // ↑ from the input line with nothing queued: the session's tool calls, full screen.
         let mut tool_view: Option<tool_calls::ToolCallsView> = None;
+        // A background task chosen from the children list, full screen.
+        let mut background: Option<background_view::BackgroundView> = None;
         // A `/shutdown`'s progress, and its lines held while a full-screen view is open.
         let mut shutdown_rx = self.take_shutdown_notifications();
         let mut held_status: Vec<String> = Vec::new();
@@ -1540,6 +1596,17 @@ impl CliSession {
         loop {
             tokio::select! {
                 key = children.next_key() => {
+                    // A background task's output, while open, takes every key but Ctrl-C.
+                    if let Some(view) = background.as_mut() {
+                        if key == child_sessions::Key::Interrupt {
+                            cancel_token_clone.cancel();
+                        } else if !view.key(key) {
+                            background = None;
+                            print_held_status(&mut held_status);
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
+                        }
+                        continue;
+                    }
                     // The tool-call list, while open, takes every key but Ctrl-C.
                     if let Some(view) = tool_view.as_mut() {
                         if key == child_sessions::Key::Interrupt {
@@ -1547,7 +1614,7 @@ impl CliSession {
                         } else if !view.key(key) {
                             tool_view = None;
                             print_held_status(&mut held_status);
-                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                         }
                         continue;
                     }
@@ -1558,7 +1625,44 @@ impl CliSession {
                     .then(|| self.dock().filter(|dock| !dock.is_selecting()).map(|dock| dock.input_text()))
                     .flatten()
                     .filter(|text| !text.trim().is_empty());
+                    // The selected goal takes the keys until it is edited, removed or left.
+                    if key != child_sessions::Key::Interrupt
+                        && !children.is_open()
+                        && self.dock().is_some_and(|dock| dock.is_goal_selected())
+                    {
+                        use child_sessions::dock::GoalKey;
+                        let action = self.dock().map(|dock| dock.goal_key(key));
+                        match action {
+                            Some(GoalKey::Edit(objective)) => {
+                                if let Some(dock) = self.dock() {
+                                    dock.set_input(&format!("/goal {objective}"), usize::MAX);
+                                }
+                            }
+                            Some(GoalKey::Remove) => self.change_goal(None).await,
+                            Some(GoalKey::ToolCalls) => {
+                                let calls = tool_calls::collect(self.messages.messages());
+                                if !calls.is_empty() {
+                                    output::hide_thinking();
+                                    let _ = progress_bars.hide();
+                                    tool_view = tool_calls::ToolCallsView::open(calls);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if let Some(text) = typed {
+                        // `/goal …` during a turn changes the goal at router-acp; steered at
+                        // the agent it would be only text.
+                        if let Some(change) = goal_edit(&text)
+                            .filter(|_| self.dock().is_some_and(|dock| dock.is_routed()))
+                        {
+                            if let Some(dock) = self.dock() {
+                                dock.clear_input();
+                            }
+                            self.change_goal(change).await;
+                            continue;
+                        }
                         let gate = self.shutdown_gate();
                         if text.trim() == "/shutdown" || gate != shutdown::Gate::Open {
                             output::hide_thinking();
@@ -1593,8 +1697,32 @@ impl CliSession {
                                     children.handle_key(key, true).await;
                                     None
                                 }
+                                // A click on a child row or a tool-call line.
+                                Key::Activate => match child_sessions::take_activation() {
+                                    Some(child_sessions::Target::Child(index)) => dock.row(index),
+                                    Some(child_sessions::Target::ToolCall(id)) => {
+                                        let calls = tool_calls::collect(self.messages.messages());
+                                        if !calls.is_empty() {
+                                            output::hide_thinking();
+                                            let _ = progress_bars.hide();
+                                            tool_view = tool_calls::ToolCallsView::open_at(calls, &id);
+                                        }
+                                        None
+                                    }
+                                    None => None,
+                                },
                                 Key::Up if dock.is_selecting() => {
                                     dock.step(-1);
+                                    None
+                                }
+                                Key::Up if dock.move_vertical(-1) => None,
+                                Key::Down if !dock.is_selecting() && dock.move_vertical(1) => None,
+                                // ↑ reaches the goal first, then the tool calls.
+                                Key::Up
+                                    if !dock.has_queued()
+                                        && dock.input_text().is_empty()
+                                        && dock.select_goal() =>
+                                {
                                     None
                                 }
                                 // Nothing queued to take back: ↑ moves into the tool calls.
@@ -1616,7 +1744,6 @@ impl CliSession {
                                     dock.clear_selection();
                                     None
                                 }
-                                Key::Click { row, .. } => dock.select_row(row),
                                 key => {
                                     match dock.type_key(key) {
                                         child_sessions::dock::Typed::SendNow => {
@@ -1633,7 +1760,13 @@ impl CliSession {
                             if let Some(child) = chosen {
                                 output::hide_thinking();
                                 let _ = progress_bars.hide();
-                                children.open_at(&child, true).await;
+                                if background_view::task_id(&child).is_some() {
+                                    if let Ok(provider) = self.agent.provider(&self.session_id).await {
+                                        background = background_view::BackgroundView::open(provider, &child);
+                                    }
+                                } else {
+                                    children.open_at(&child, true).await;
+                                }
                             }
                             continue;
                         }
@@ -1646,12 +1779,12 @@ impl CliSession {
                     children.handle_key(key, true).await;
                     if was_open && !children.is_open() {
                         print_held_status(&mut held_status);
-                        render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                        render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                     }
                 }
                 notification = shutdown::next_notification(&mut shutdown_rx) => {
                     let lines = self.take_shutdown_progress(&notification);
-                    if children.is_open() || tool_view.is_some() {
+                    if children.is_open() || tool_view.is_some() || background.is_some() {
                         held_status.extend(lines);
                     } else if !lines.is_empty() {
                         output::hide_thinking();
@@ -1664,12 +1797,12 @@ impl CliSession {
                     let Some(dock) = self.dock() else { continue };
                     let (delivered, echo) = settle_steer(dock, text, outcome, &mut handed_to_goose);
                     if let Some(echo) = &echo {
-                        if children.is_open() || tool_view.is_some() {
+                        if children.is_open() || tool_view.is_some() || background.is_some() {
                             deferred_messages.push(echo.clone());
                         } else {
                             output::hide_thinking();
                             let _ = progress_bars.hide();
-                            output::render_message_streaming(echo, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                            output::render_message_streaming(echo, &mut markdown_buffer, &mut thinking_block, self.debug);
                         }
                     }
                     if delivered {
@@ -1678,6 +1811,12 @@ impl CliSession {
                 }
                 _ = steer_retry.tick(), if self.dock().is_some_and(|dock| dock.has_queued()) => {
                     self.start_steer(&steer_tx);
+                }
+                _ = refresh_context.tick(), if self.dock().is_some() => {
+                    let _ = self.display_context_usage().await;
+                    if let Some(view) = background.as_mut() {
+                        view.refresh();
+                    }
                 }
                 _ = refresh_children.tick(), if children.is_open() || children.watches_router() => {
                     if children.is_open() {
@@ -1695,11 +1834,16 @@ impl CliSession {
                             let needs_terminal = find_tool_confirmation(&message).is_some()
                                 || find_elicitation_request(&message).is_some()
                                 || output::get_credits_top_up_url(&message).is_some();
+                            // The question draws into the transcript and takes the cursor.
+                            let _question = needs_terminal
+                                .then(|| self.dock().map(|_| child_sessions::dock::Hidden::new()))
+                                .flatten();
                             if needs_terminal {
                                 drop(extended_keys.take());
                                 tool_view = None;
+                                background = None;
                                 children.suspend();
-                                render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                                render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                             }
                             if let Some(confirmation_request) = find_tool_confirmation(&message) {
                                 let selected_permission = if interactive {
@@ -1841,10 +1985,10 @@ impl CliSession {
                                 } else if let Some(view) = tool_view.as_mut() {
                                     view.refresh(tool_calls::collect(self.messages.messages()));
                                     deferred_messages.push(message);
-                                } else if children.is_open() {
+                                } else if children.is_open() || background.is_some() {
                                     deferred_messages.push(message);
                                 } else if !is_json_mode {
-                                    output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                                    output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_block, self.debug);
                                     maybe_open_credits_top_up_url(
                                         &message,
                                         interactive,
@@ -1855,10 +1999,14 @@ impl CliSession {
                         }
                         Some(Ok(AgentEvent::Usage(usage))) => {
                             last_usage = Some(usage);
+                            // The pane's context bar follows the turn as it goes.
+                            if self.dock().is_some() {
+                                let _ = self.display_context_usage().await;
+                            }
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
                         Some(Ok(AgentEvent::McpNotification(_)))
-                            if children.is_open() || tool_view.is_some() => {}
+                            if children.is_open() || tool_view.is_some() || background.is_some() => {}
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
                             handle_mcp_notification(
                                 &extension_id,
@@ -1875,8 +2023,9 @@ impl CliSession {
                         }
                         Some(Err(e)) => {
                             tool_view = None;
+                            background = None;
                             children.suspend();
-                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                             if interactive || !is_stream_json_mode {
                                 handle_agent_error(&e, is_stream_json_mode);
                             }
@@ -1900,8 +2049,9 @@ impl CliSession {
                 }
                 _ = cancel_token_clone.cancelled() => {
                     tool_view = None;
+                    background = None;
                     children.suspend();
-                    render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                    render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                     drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
                     drop(stream);
                     if let Err(e) = self.handle_interrupted_messages(true).await {
@@ -1912,6 +2062,7 @@ impl CliSession {
             }
         }
         drop(tool_view);
+        drop(background);
         drop(children);
         print_held_status(&mut held_status);
         self.return_shutdown_notifications(shutdown_rx);
@@ -1940,9 +2091,10 @@ impl CliSession {
         render_deferred(
             &mut deferred_messages,
             &mut markdown_buffer,
-            &mut thinking_header_shown,
+            &mut thinking_block,
             self.debug,
         );
+        thinking_block.close();
 
         let failed = input_failed
             || stream_error.is_some()
@@ -2182,12 +2334,28 @@ impl CliSession {
                 .map_err(|e| anyhow::anyhow!("Extension loading task failed: {}", e))??;
             output::show_extension_failures(&failures);
 
-            if interactive && (was_in_progress || self.loading_announced) {
-                output::show_extensions_ready();
+            if interactive && was_in_progress {
+                self.extension_progress.announced();
             }
-            self.loading_announced = false;
         }
         Ok(())
+    }
+
+    /// Whether background loading ended within `grace`; nothing needs saying if it did.
+    async fn extensions_loaded_within(&self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            let Some(handle) = self.extension_loading.as_ref() else {
+                return true;
+            };
+            if handle.is_finished() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     pub async fn update_completion_cache(&mut self) -> Result<()> {
@@ -2349,6 +2517,11 @@ impl CliSession {
             .get_goose_provider()
             .unwrap_or_else(|_| "unknown".to_string());
 
+        // The pane keeps the context on its status line; only a plain terminal prints it.
+        let show = |used: usize| match self.dock() {
+            Some(dock) => dock.set_context(Some((used, context_limit))),
+            None => output::display_context_usage(used, context_limit),
+        };
         match self.get_session().await {
             Ok(metadata) => {
                 if let Some(used) = context_in_use(
@@ -2356,7 +2529,7 @@ impl CliSession {
                     provider.manages_own_context(),
                     metadata.usage.total_tokens,
                 ) {
-                    output::display_context_usage(used, context_limit);
+                    show(used);
                 }
 
                 if show_cost {
@@ -2373,7 +2546,7 @@ impl CliSession {
                     provider.manages_own_context(),
                     Some(0),
                 ) {
-                    output::display_context_usage(used, context_limit);
+                    show(used);
                 }
             }
         }
@@ -2524,8 +2697,9 @@ impl CliSession {
             session_manager: self.agent.config.session_manager.clone(),
             session_id: self.session_id.clone(),
             router,
+            agent: Some(self.agent.clone()),
         });
-        self.dock = Some((root, dock));
+        self.dock = dock.map(|dock| (root, dock));
     }
 
     fn dock(&self) -> Option<&child_sessions::dock::Dock> {
@@ -2562,11 +2736,40 @@ impl CliSession {
     /// ↑ on an empty prompt: the session's tool calls, full screen, until ↓ past the newest,
     /// Esc or q returns to the prompt.
     async fn browse_tool_calls(&mut self) {
+        self.browse_tool_calls_at(None).await;
+    }
+
+    /// A click at the prompt: the child row or tool-call line it landed on opens, as the
+    /// arrow keys and Enter would open it.
+    async fn open_clicked(&mut self) {
+        match child_sessions::take_activation() {
+            Some(child_sessions::Target::Child(index)) => {
+                let Some(row) = self.dock().and_then(|dock| dock.row(index)) else {
+                    return;
+                };
+                if background_view::task_id(&row).is_some() {
+                    self.view_background(&row).await;
+                } else {
+                    self.child_navigator(true).await.browse_at(&row).await;
+                }
+            }
+            Some(child_sessions::Target::ToolCall(id)) => {
+                self.browse_tool_calls_at(Some(&id)).await
+            }
+            None => {}
+        }
+    }
+
+    async fn browse_tool_calls_at(&mut self, id: Option<&str>) {
         let calls = tool_calls::collect(self.messages.messages());
         let Ok(mut keys) = child_sessions::KeyReader::start() else {
             return;
         };
-        let Some(mut view) = tool_calls::ToolCallsView::open(calls) else {
+        let view = match id {
+            Some(id) => tool_calls::ToolCallsView::open_at(calls, id),
+            None => tool_calls::ToolCallsView::open(calls),
+        };
+        let Some(mut view) = view else {
             return;
         };
         while let Some(key) = keys.next().await {
@@ -2648,10 +2851,13 @@ impl CliSession {
             return;
         };
         match shutdown::request(provider.as_ref()).await {
-            Ok(notifications) => {
+            Ok(requested) => {
+                if !requested.answered {
+                    output::print_status_line(shutdown::UNANSWERED);
+                }
                 *self.shutdown.lock().unwrap() = Some(shutdown::Run {
                     session_id,
-                    notifications,
+                    notifications: requested.notifications,
                     drained: false,
                 });
                 if let Some(dock) = self.dock() {
@@ -2728,6 +2934,45 @@ impl CliSession {
         quitting
     }
 
+    /// Sets (`Some`) or removes (`None`) the goal router-acp holds this session to, without a
+    /// prompt, as while a turn runs.
+    async fn change_goal(&self, objective: Option<String>) {
+        let Ok(provider) = self.agent.provider(&self.session_id).await else {
+            return;
+        };
+        let params = match &objective {
+            Some(objective) => serde_json::json!({"action": "set", "objective": objective}),
+            None => serde_json::json!({"action": "clear"}),
+        };
+        if let Err(error) = provider.extension_request("_router/goal", params).await {
+            output::print_status_line(&format!("the goal did not change: {error}"));
+        }
+    }
+
+    /// A background task chosen from the children list, full screen until q or Esc; its
+    /// output keeps arriving while it shows.
+    async fn view_background(&self, row: &child_sessions::ChildRow) {
+        let Ok(provider) = self.agent.provider(&self.session_id).await else {
+            return;
+        };
+        let Some(mut view) = background_view::BackgroundView::open(provider, row) else {
+            return;
+        };
+        let Ok(mut keys) = child_sessions::KeyReader::start() else {
+            return;
+        };
+        let mut refresh = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            tokio::select! {
+                key = keys.next() => match key {
+                    Some(key) if view.key(key) => {}
+                    _ => break,
+                },
+                _ = refresh.tick() => view.refresh(),
+            }
+        }
+    }
+
     /// ↓ on an empty prompt: ↑/↓ choose a child, Enter (or a click) opens it in the
     /// navigator, Esc or ↑ past the first row returns to the prompt.
     async fn focus_dock(&mut self) {
@@ -2752,13 +2997,16 @@ impl CliSession {
                     None
                 }
                 child_sessions::Key::Enter => dock.selected(),
-                child_sessions::Key::Click { row, .. } => dock.select_row(row),
                 child_sessions::Key::Escape | child_sessions::Key::Char('q') => break,
                 _ => None,
             };
             if let Some(child) = chosen {
                 drop(keys);
-                navigator.browse_at(&child).await;
+                if background_view::task_id(&child).is_some() {
+                    self.view_background(&child).await;
+                } else {
+                    navigator.browse_at(&child).await;
+                }
                 keys = match child_sessions::KeyReader::start() {
                     Ok(keys) => keys,
                     Err(_) => break,
@@ -2779,11 +3027,41 @@ impl CliSession {
             enabled,
         );
         match self.router_session_id().await {
-            Some(router_session_id) => {
-                navigator.with_router(RouterStateSource::configured(), router_session_id)
-            }
+            Some(router_session_id) => navigator
+                .with_router(RouterStateSource::configured(), router_session_id)
+                .with_messenger(self.delegate_messenger()),
             None => navigator,
         }
+    }
+
+    /// Sends what the operator types into a delegate's input box through router-acp
+    /// (`_router/delegate_message`), which steers a working delegate or gives an idle one the
+    /// message.
+    fn delegate_messenger(&self) -> child_sessions::Messenger {
+        let agent = self.agent.clone();
+        let session_id = self.session_id.clone();
+        Arc::new(move |delegate, text| {
+            let agent = agent.clone();
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                let provider = agent
+                    .provider(&session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let reply = provider
+                    .extension_request(
+                        "_router/delegate_message",
+                        serde_json::json!({"delegateSessionId": delegate, "text": text}),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(reply
+                    .get("delivery")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("sent")
+                    .to_string())
+            })
+        })
     }
 
     /// The router-acp session backing this goose session: the one its latest turn ran in
@@ -2980,6 +3258,18 @@ async fn next_key(keys: &mut Option<child_sessions::KeyReader>) -> child_session
     }
 }
 
+/// The change a `/goal …` line asks for: `Some(Some(objective))` to set, `Some(None)` to
+/// remove, `None` when the line is something else (a bare `/goal` only asks what the goal is,
+/// which the status line shows).
+fn goal_edit(text: &str) -> Option<Option<String>> {
+    let rest = text.trim().strip_prefix("/goal ")?.trim();
+    match rest {
+        "" => None,
+        "clear" | "off" | "none" | "stop" | "cancel" => Some(None),
+        objective => Some(Some(objective.to_string())),
+    }
+}
+
 /// Clears the empty `> ` line the line editor left when it handed keys to the dock or the
 /// tool-call list, so returning to the prompt does not stack another one under it.
 fn erase_accepted_prompt_line() {
@@ -2992,11 +3282,11 @@ fn erase_accepted_prompt_line() {
 fn render_deferred(
     messages: &mut Vec<Message>,
     markdown_buffer: &mut streaming_buffer::MarkdownBuffer,
-    thinking_header_shown: &mut bool,
+    thinking_block: &mut output::ThinkingBlock,
     debug: bool,
 ) {
     for message in messages.drain(..) {
-        output::render_message_streaming(&message, markdown_buffer, thinking_header_shown, debug);
+        output::render_message_streaming(&message, markdown_buffer, thinking_block, debug);
     }
 }
 

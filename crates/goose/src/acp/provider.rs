@@ -1,14 +1,17 @@
 use agent_client_protocol::schema::v1::{
     Annotations as AcpAnnotations, ClientCapabilities, CloseSessionRequest, ContentBlock,
-    ContentChunk, EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
-    ElicitationCapabilities, ElicitationFormCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
+    ContentChunk, CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
+    CreateTerminalResponse, ElicitationCapabilities, ElicitationFormCapabilities, EnvVariable,
+    HttpHeader, ImageContent, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    KillTerminalResponse, LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallContent, ToolCallStatus, ToolKind,
+    TerminalOutputRequest, TextContent, ToolCallContent, ToolCallStatus, ToolKind,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo};
@@ -34,6 +37,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as TokioMutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
 use crate::acp::handoff::{build_handoff_context_memo, memo_token_budget, prompt_token_cost};
+use crate::acp::terminal::TerminalManager;
 use crate::acp::{map_permission_response, PermissionDecision};
 use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
@@ -76,6 +80,7 @@ pub struct AcpProviderConfig {
     /// whenever the active session model changes.
     pub model_config_option_id: Option<String>,
     pub mode_mapping: HashMap<GooseMode, Vec<String>>,
+    pub terminal: bool,
     pub notification_callback: Option<Arc<dyn Fn(SessionNotification) + Send + Sync>>,
 }
 
@@ -166,6 +171,13 @@ enum AcpUpdate {
     PermissionRequest {
         request: Box<RequestPermissionRequest>,
         response_tx: oneshot::Sender<RequestPermissionResponse>,
+    },
+    /// The agent asks the user something (`elicitation/create`, form mode); the answer is the
+    /// ACP result as JSON (`{"action":"accept","content":{…}}`, `decline` or `cancel`).
+    Elicitation {
+        message: String,
+        schema: serde_json::Value,
+        response_tx: oneshot::Sender<serde_json::Value>,
     },
     Complete(StopReason, Option<AcpUsage>),
     Error(agent_client_protocol::Error),
@@ -293,7 +305,9 @@ async fn relay_unsolicited(
                     runs.end();
                     tool_response_message(id, raw_output, content, is_error)
                 }
+                // No turn to ask in: dropping the answer channel cancels the question.
                 AcpUpdate::PermissionRequest { .. }
+                | AcpUpdate::Elicitation { .. }
                 | AcpUpdate::Complete(..)
                 | AcpUpdate::Error(_) => continue,
             },
@@ -404,13 +418,15 @@ impl AcpEffortState {
 struct AcpSessionState {
     active_id: Arc<Mutex<Option<SessionId>>>,
     effort: AcpEffortState,
+    terminal: TerminalManager,
 }
 
 impl AcpSessionState {
-    fn new(effort: AcpEffortState) -> Self {
+    fn new(effort: AcpEffortState, terminal: TerminalManager) -> Self {
         Self {
             active_id: Arc::new(Mutex::new(None)),
             effort,
+            terminal,
         }
     }
 }
@@ -424,7 +440,16 @@ pub struct AcpProvider {
 
     pending_confirmations:
         Arc<TokioMutex<HashMap<String, oneshot::Sender<PermissionConfirmation>>>>,
+    /// Questions the agent asked, by the action-required id the session answers.
+    pending_elicitations: Arc<TokioMutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
+    /// The terminals this client hosts for the agent (and router-acp's `background_start`).
+    terminals: TerminalManager,
+    /// Work the agent started with its own tools (a Monitor, a backgrounded Bash command),
+    /// as router-acp reports it in `_router/background` notifications.
+    native_backgrounds: Arc<Mutex<Vec<NativeBackground>>>,
+    /// The goal router-acp holds the session to, from its `_router/goal` notifications.
+    session_goal: Arc<Mutex<Option<crate::providers::base::SessionGoal>>>,
     /// True after the first ACP prompt completes with the handoff context committed.
     /// Failed or abandoned first prompts reset this so the next prompt can retry it.
     handoff_context_sent: Arc<AtomicBool>,
@@ -563,6 +588,14 @@ impl AcpProvider {
         let (unsolicited, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         tokio::spawn(relay_unsolicited(unsolicited_rx, unsolicited.clone()));
         let (extension_notifications, _) = broadcast::channel(UNSOLICITED_CAPACITY);
+        let native_backgrounds = Arc::new(Mutex::new(Vec::new()));
+        let session_goal = Arc::new(Mutex::new(None));
+        tokio::spawn(follow_router_state(
+            extension_notifications.subscribe(),
+            native_backgrounds.clone(),
+            session_goal.clone(),
+        ));
+        let terminals = TerminalManager::new(config.work_dir.clone());
         let client_loop = AcpClientLoop::new(
             config,
             goose_mode_shared.clone(),
@@ -573,6 +606,7 @@ impl AcpProvider {
             unsolicited_tx.clone(),
             connection.clone(),
             extension_notifications.clone(),
+            terminals.clone(),
         );
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx, cancel_rx));
@@ -612,7 +646,11 @@ impl AcpProvider {
             mode_mapping,
             session: Mutex::new(session),
             pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
+            pending_elicitations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_tool_updates,
+            terminals,
+            native_backgrounds,
+            session_goal,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
             context_used,
@@ -808,6 +846,14 @@ impl AcpProvider {
     }
 
     fn claim_handoff_context(&self, messages: &[Message]) -> HandoffContextClaim {
+        // A slash command has to reach the agent or router as typed, and it is no conversation
+        // to hand off: the next real prompt carries the context instead.
+        if latest_prompt_is_slash_command(messages) {
+            return HandoffContextClaim {
+                first_prompt: false,
+                include_context: false,
+            };
+        }
         let first_prompt = !self.handoff_context_sent.swap(true, Ordering::AcqRel);
         HandoffContextClaim {
             first_prompt,
@@ -1074,6 +1120,57 @@ impl Provider for AcpProvider {
         false
     }
 
+    fn session_goal(&self) -> Option<crate::providers::base::SessionGoal> {
+        self.session_goal.lock().ok()?.clone()
+    }
+
+    fn background_tasks(&self) -> Vec<crate::providers::base::BackgroundTask> {
+        let mut tasks = self.terminals.running();
+        if let Ok(native) = self.native_backgrounds.lock() {
+            tasks.extend(native.iter().map(|native| native.task.clone()));
+        }
+        tasks.sort_by_key(|task| task.started_at);
+        tasks
+    }
+
+    fn background_output(&self, id: &str) -> Option<String> {
+        if let Some(output) = self.terminals.output_of(id) {
+            return Some(output);
+        }
+        // A backgrounded Bash command writes to a file; a Monitor's output goes only to the
+        // agent, so its view says so.
+        let native = self
+            .native_backgrounds
+            .lock()
+            .ok()?
+            .iter()
+            .find(|native| native.task.id == id)
+            .cloned()?;
+        Some(match native.output_file {
+            Some(file) => tail_of_file(&file, 256 * 1024)
+                .unwrap_or_else(|error| format!("(cannot read {file}: {error})")),
+            None => "(this task's output goes to the agent only)".to_string(),
+        })
+    }
+
+    fn stop_background(&self, id: &str) -> bool {
+        self.terminals.kill_id(id)
+    }
+
+    async fn handle_elicitation_response(
+        &self,
+        request_id: &str,
+        response: &serde_json::Value,
+    ) -> bool {
+        match self.pending_elicitations.lock().await.remove(request_id) {
+            Some(tx) => {
+                let _ = tx.send(response.clone());
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn stream(
         &self,
         model_config: &ModelConfig,
@@ -1159,6 +1256,7 @@ impl Provider for AcpProvider {
             bare_retry_blocks.map(|blocks| (self.tx.as_ref().unwrap().clone(), session_id, blocks));
 
         let pending_confirmations = self.pending_confirmations.clone();
+        let pending_elicitations = self.pending_elicitations.clone();
         let goose_mode = *self
             .goose_mode
             .lock()
@@ -1224,6 +1322,17 @@ impl Provider for AcpProvider {
                                 tool_response_message(id, raw_output, content, is_error);
                             yield (Some(message), None);
                         }
+                    }
+                    AcpUpdate::Elicitation { message, schema, response_tx } => {
+                        runs.end();
+                        // The session shows the question and answers it through
+                        // `handle_elicitation_response`; the stream goes on meanwhile.
+                        let id = uuid::Uuid::new_v4().to_string();
+                        pending_elicitations.lock().await.insert(id.clone(), response_tx);
+                        let question = Message::assistant().with_content(
+                            MessageContent::action_required_elicitation(id, message, schema),
+                        );
+                        yield (Some(question), None);
                     }
                     AcpUpdate::PermissionRequest { request, response_tx } => {
                         runs.end();
@@ -1348,6 +1457,7 @@ struct AcpClientLoop {
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
     connection: SharedConnection,
     extension_notifications: broadcast::Sender<ExtensionNotification>,
+    terminals: TerminalManager,
 }
 
 impl AcpClientLoop {
@@ -1362,6 +1472,7 @@ impl AcpClientLoop {
         unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
         connection: SharedConnection,
         extension_notifications: broadcast::Sender<ExtensionNotification>,
+        terminals: TerminalManager,
     ) -> Self {
         Self {
             config,
@@ -1374,6 +1485,7 @@ impl AcpClientLoop {
             unsolicited_tx,
             connection,
             extension_notifications,
+            terminals,
         }
     }
 
@@ -1433,10 +1545,12 @@ impl AcpClientLoop {
             unsolicited_tx,
             connection,
             extension_notifications,
+            terminals: terminal_manager,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
-        let session_state = AcpSessionState::new(effort);
+        let terminal_enabled = config.terminal;
+        let session_state = AcpSessionState::new(effort, terminal_manager.clone());
 
         Client
             .builder()
@@ -1450,6 +1564,7 @@ impl AcpClientLoop {
                     let context_used = context_used.clone();
                     let session_state = session_state.clone();
                     let unsolicited_tx = unsolicited_tx.clone();
+                    let terminal_manager = terminal_manager.clone();
                     async move |notification: SessionNotification, _cx| {
                         let is_active_session =
                             session_state.active_id.lock().is_ok_and(|active| {
@@ -1576,7 +1691,10 @@ impl AcpClientLoop {
                                         let content = if accumulated.content.is_empty() {
                                             None
                                         } else {
-                                            Some(accumulated.content)
+                                            Some(
+                                                terminal_manager
+                                                    .resolve_content(accumulated.content),
+                                            )
                                         };
                                         deliver(AcpUpdate::ToolCallComplete {
                                             id,
@@ -1622,7 +1740,10 @@ impl AcpClientLoop {
                                         let content = if accumulated.content.is_empty() {
                                             None
                                         } else {
-                                            Some(accumulated.content)
+                                            Some(
+                                                terminal_manager
+                                                    .resolve_content(accumulated.content),
+                                            )
                                         };
                                         deliver(AcpUpdate::ToolCallComplete {
                                             id,
@@ -1683,6 +1804,148 @@ impl AcpClientLoop {
                             RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
                         });
                         responder.respond(response)
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            // A question from the agent (Claude's AskUserQuestion, Grok's ask_user_question,
+            // both as `elicitation/create` through router-acp) goes to the running turn, which
+            // shows it and sends the answer back. Without a turn, or for a mode the CLI cannot
+            // show, the question is cancelled rather than left waiting.
+            .on_receive_request(
+                {
+                    let prompt_response_tx = prompt_response_tx.clone();
+                    async move |request: CreateElicitationRequest, responder, _connection_cx| {
+                        let cancelled = serde_json::json!({"action": "cancel"});
+                        let (message, schema) = elicitation_form(&request);
+                        let handler = prompt_response_tx
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.as_ref().cloned())
+                            .filter(|tx| !tx.is_closed());
+                        let answer = match (schema, handler) {
+                            (Some(schema), Some(tx)) => {
+                                let (response_tx, response_rx) = oneshot::channel();
+                                match tx.try_send(AcpUpdate::Elicitation {
+                                    message,
+                                    schema,
+                                    response_tx,
+                                }) {
+                                    Ok(()) => response_rx.await.unwrap_or(cancelled),
+                                    Err(_) => cancelled,
+                                }
+                            }
+                            _ => cancelled,
+                        };
+                        let response = serde_json::from_value::<CreateElicitationResponse>(answer)
+                            .unwrap_or_else(|_| {
+                                serde_json::from_value(serde_json::json!({"action": "cancel"}))
+                                    .expect("a cancel elicitation response parses")
+                            });
+                        responder.respond(response)
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: CreateTerminalRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        match terminal_manager.create(request).await {
+                            Ok(id) => responder.respond(CreateTerminalResponse::new(id)),
+                            Err(error) => Err(agent_client_protocol::Error::internal_error()
+                                .data(error.to_string())),
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: TerminalOutputRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        match terminal_manager.output(
+                            request.session_id.0.as_ref(),
+                            request.terminal_id.0.as_ref(),
+                        ) {
+                            Some(response) => responder.respond(response),
+                            None => Err(agent_client_protocol::Error::internal_error()
+                                .data(format!("unknown terminal {}", request.terminal_id.0))),
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: WaitForTerminalExitRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        match terminal_manager
+                            .wait_for_exit(
+                                request.session_id.0.as_ref(),
+                                request.terminal_id.0.as_ref(),
+                            )
+                            .await
+                        {
+                            Some(status) => {
+                                responder.respond(WaitForTerminalExitResponse::new(status))
+                            }
+                            None => Err(agent_client_protocol::Error::internal_error()
+                                .data(format!("unknown terminal {}", request.terminal_id.0))),
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: KillTerminalRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        terminal_manager.kill(
+                            request.session_id.0.as_ref(),
+                            request.terminal_id.0.as_ref(),
+                        );
+                        responder.respond(KillTerminalResponse::new())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: ReleaseTerminalRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        terminal_manager
+                            .release(
+                                request.session_id.0.as_ref(),
+                                request.terminal_id.0.as_ref(),
+                            )
+                            .await;
+                        responder.respond(ReleaseTerminalResponse::new())
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -1809,8 +2072,10 @@ async fn handle_requests(
     // router-acp translates provider-native question requests into ACP form
     // elicitation only when the connected client advertises this capability.
     // Without it, questions such as Grok's `_x.ai/ask_user_question` remain
-    // vendor-specific requests and cannot reach Kory's question UI.
-    let client_capabilities = client_capabilities();
+    // vendor-specific requests and cannot reach Kory's question UI. Hosting
+    // terminals lets the agent (and router-acp's `background_start`) run
+    // background commands whose whole lifecycle the session can see.
+    let client_capabilities = client_capabilities().terminal(config.terminal);
     let init_response: InitializeResponse = cx
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1).client_capabilities(client_capabilities),
@@ -1921,6 +2186,7 @@ async fn handle_requests(
                 log_undelivered(response_tx.send(result), AGENT_METHOD_NAMES.session_load);
             }
             ClientRequest::CloseSession { session_id } => {
+                session_state.terminal.close_session(session_id.0.as_ref());
                 if supports_close {
                     if let Err(error) = cx
                         .send_request(CloseSessionRequest::new(session_id.clone()))
@@ -2005,6 +2271,7 @@ async fn handle_requests(
 
     if supports_close && !supports_load {
         for session_id in session_ids {
+            session_state.terminal.close_session(session_id.0.as_ref());
             if let Err(e) = cx
                 .send_request(CloseSessionRequest::new(session_id.clone()))
                 .block_task()
@@ -2246,6 +2513,20 @@ fn last_user_message_index(messages: &[Message]) -> Option<usize> {
         .rposition(|m| m.role == Role::User && m.is_agent_visible() && !m.is_turn_context())
 }
 
+/// `/login`, `/usage extra`; not a path such as `/Users/me/file`.
+fn latest_prompt_is_slash_command(messages: &[Message]) -> bool {
+    last_user_message_index(messages).is_some_and(|index| {
+        let text = messages[index].as_concat_text();
+        text.trim_start()
+            .strip_prefix('/')
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|name| {
+                name.chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ':')
+            })
+    })
+}
+
 fn has_handoff_context(messages: &[Message]) -> bool {
     last_user_message_index(messages).is_some_and(|last_user_index| {
         messages[..last_user_index]
@@ -2377,6 +2658,101 @@ fn acp_tool_call_content_to_rmcp(
         }
     }
     out
+}
+
+/// A task the agent started with its own tools, as `_router/background` reports it.
+#[derive(Clone, Debug)]
+struct NativeBackground {
+    task: crate::providers::base::BackgroundTask,
+    output_file: Option<String>,
+}
+
+const ROUTER_BACKGROUND_METHOD: &str = "_router/background";
+const ROUTER_GOAL_METHOD: &str = "_router/goal";
+
+/// Keeps the provider in step with router-acp's notifications: a native task is listed from
+/// its `running` notice until `ended`, and the session's goal is the last one reported.
+async fn follow_router_state(
+    mut notifications: broadcast::Receiver<ExtensionNotification>,
+    native: Arc<Mutex<Vec<NativeBackground>>>,
+    goal: Arc<Mutex<Option<crate::providers::base::SessionGoal>>>,
+) {
+    loop {
+        match notifications.recv().await {
+            Ok(notification) if notification.method == ROUTER_BACKGROUND_METHOD => {
+                if let Ok(mut native) = native.lock() {
+                    apply_native_background(&mut native, &notification.params);
+                }
+            }
+            Ok(notification) if notification.method == ROUTER_GOAL_METHOD => {
+                if let Ok(mut goal) = goal.lock() {
+                    *goal = reported_goal(&notification.params);
+                }
+            }
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// The goal in a `_router/goal` notification; `null` when the session has none.
+fn reported_goal(params: &serde_json::Value) -> Option<crate::providers::base::SessionGoal> {
+    let goal = params.get("goal")?;
+    Some(crate::providers::base::SessionGoal {
+        objective: goal.get("objective")?.as_str()?.to_string(),
+        status: goal.get("status")?.as_str()?.to_string(),
+    })
+}
+
+fn apply_native_background(native: &mut Vec<NativeBackground>, params: &serde_json::Value) {
+    let task = &params["task"];
+    let Some(id) = task["id"].as_str() else {
+        return;
+    };
+    native.retain(|existing| existing.task.id != id);
+    if params["state"].as_str() != Some("running") {
+        return;
+    }
+    let started_at = task["startedAt"]
+        .as_i64()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    native.push(NativeBackground {
+        task: crate::providers::base::BackgroundTask {
+            id: id.to_string(),
+            kind: task["kind"].as_str().unwrap_or("background").to_string(),
+            command: task["command"].as_str().unwrap_or_default().to_string(),
+            started_at,
+            last_line: String::new(),
+        },
+        output_file: task["outputFile"].as_str().map(str::to_string),
+    });
+}
+
+/// The last `limit` bytes of a file, from a line start.
+fn tail_of_file(path: &str, limit: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(limit);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(match (start > 0, text.split_once('\n')) {
+        (true, Some((_, rest))) => rest.to_string(),
+        _ => text,
+    })
+}
+
+/// An `elicitation/create` request's question and its form's JSON schema; no schema for a
+/// mode other than a form (a URL to open), which the CLI cannot show.
+fn elicitation_form(request: &CreateElicitationRequest) -> (String, Option<serde_json::Value>) {
+    let value = serde_json::to_value(request).unwrap_or_default();
+    let schema = (value.get("mode").and_then(serde_json::Value::as_str) == Some("form"))
+        .then(|| value.get("requestedSchema").cloned())
+        .flatten();
+    (request.message.clone(), schema)
 }
 
 fn build_action_required_message(request: &RequestPermissionRequest) -> Option<Message> {
@@ -2814,7 +3190,11 @@ mod tests {
                     response: NewSessionResponse::new("test-session"),
                 }),
                 pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
+                pending_elicitations: Arc::new(TokioMutex::new(HashMap::new())),
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
+                terminals: TerminalManager::new(std::env::temp_dir()),
+                native_backgrounds: Arc::new(Mutex::new(Vec::new())),
+                session_goal: Arc::new(Mutex::new(None)),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),
                 context_used: Arc::new(AtomicU64::new(0)),
@@ -3126,6 +3506,24 @@ mod tests {
         let second_claim = provider.claim_handoff_context(&messages);
         assert!(!second_claim.first_prompt);
         assert!(!second_claim.include_context);
+    }
+
+    #[test]
+    fn a_slash_command_carries_no_handoff_and_leaves_it_for_the_next_prompt() {
+        let (provider, _) = test_provider();
+        let history = vec![
+            Message::user().with_text("/login"),
+            Message::assistant().with_text("Manage logins"),
+        ];
+        let mut command = history.clone();
+        command.push(Message::user().with_text("/login"));
+        assert!(!provider.claim_handoff_context(&command).include_context);
+        let mut path = history.clone();
+        path.push(Message::user().with_text("/Users/me/file.rs explain this"));
+        assert!(!latest_prompt_is_slash_command(&path));
+        let mut prompt = history;
+        prompt.push(Message::user().with_text("what next?"));
+        assert!(provider.claim_handoff_context(&prompt).include_context);
     }
 
     #[test]
@@ -4301,6 +4699,7 @@ mod tests {
             session_config_options: vec![],
             model_config_option_id: None,
             mode_mapping,
+            terminal: false,
             notification_callback: None,
         }
     }
@@ -5276,6 +5675,158 @@ mod tests {
             SteerOutcome::Unsupported
         );
         assert!(provider.steering_unsupported.load(Ordering::Acquire));
+    }
+
+    /// Work the agent starts with its own tools is listed from router-acp's
+    /// `_router/background` running notice until its ended one.
+    #[test]
+    fn native_background_work_follows_router_notifications() {
+        let mut native = Vec::new();
+        let running = serde_json::json!({"sessionId": "s", "state": "running", "task": {
+            "id": "bash_7", "kind": "shell", "command": "cargo build",
+            "startedAt": 1_793_736_940_000_i64, "outputFile": "/tmp/bash_7.out"}});
+        apply_native_background(&mut native, &running);
+        apply_native_background(&mut native, &running);
+        assert_eq!(native.len(), 1, "a repeated notice is one task");
+        assert_eq!(native[0].task.kind, "shell");
+        assert_eq!(native[0].task.command, "cargo build");
+        assert_eq!(
+            native[0].task.started_at.timestamp_millis(),
+            1_793_736_940_000
+        );
+        assert_eq!(native[0].output_file.as_deref(), Some("/tmp/bash_7.out"));
+        apply_native_background(
+            &mut native,
+            &serde_json::json!({"state": "ended", "reason": "finished", "task": {"id": "bash_7"}}),
+        );
+        assert!(native.is_empty());
+    }
+
+    /// The operator's report: an `/implement` parent asked a question (Claude's
+    /// AskUserQuestion, an `elicitation/create` through router-acp) and waited 45 minutes,
+    /// because the client advertised form elicitation and never handled the request. The
+    /// question now reaches the session as an action-required elicitation and its answer
+    /// goes back to the agent.
+    #[tokio::test]
+    async fn an_agent_question_reaches_the_session_and_its_answer_returns() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+            PromptRequest, PromptResponse,
+        };
+        use agent_client_protocol::{on_receive_request, Agent as ScriptedAgent, ByteStreams};
+        use futures::StreamExt;
+
+        let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, client_write) = tokio::io::duplex(64 * 1024);
+        let answers = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let agent_answers = answers.clone();
+        tokio::spawn(async move {
+            ScriptedAgent
+                .builder()
+                .on_receive_request(
+                    async |_req: InitializeRequest, responder, _cx| {
+                        responder.respond(
+                            InitializeResponse::new(ProtocolVersion::LATEST)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |_req: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new(SessionId::new("asks")))
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: PromptRequest, responder, cx| {
+                        let answers = agent_answers.clone();
+                        let asker = cx.clone();
+                        cx.spawn(async move {
+                            let question: CreateElicitationRequest =
+                                serde_json::from_value(serde_json::json!({
+                                    "mode": "form",
+                                    "sessionId": "asks",
+                                    "message": "Apply the router fix?",
+                                    "requestedSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "choice": {"type": "string", "enum": ["Apply", "Decline"]}
+                                        },
+                                        "required": ["choice"]
+                                    }
+                                }))
+                                .unwrap();
+                            let answer = asker.send_request(question).block_task().await;
+                            answers
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::to_value(answer.unwrap()).unwrap());
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })
+                    },
+                    on_receive_request!(),
+                )
+                .connect_to(ByteStreams::new(agent_write.compat_write(), agent_read.compat()))
+                .await
+        });
+        let provider = AcpProvider::connect_with_transport(
+            "router-acp".to_string(),
+            GooseMode::Auto,
+            test_acp_config(HashMap::new(), None),
+            ByteStreams::new(client_write.compat_write(), client_read.compat()),
+        )
+        .await
+        .unwrap();
+
+        let model = ModelConfig::new("test-model");
+        let mut stream = provider
+            .stream(&model, "", &[Message::user().with_text("work")], &[])
+            .await
+            .unwrap();
+        let mut asked = None;
+        while let Some(item) = stream.next().await {
+            let (message, _) = item.unwrap();
+            let Some(message) = message else { continue };
+            for content in &message.content {
+                if let MessageContent::ActionRequired(required) = content {
+                    if let crate::conversation::message::ActionRequiredData::Elicitation {
+                        id,
+                        message,
+                        requested_schema,
+                    } = &required.data
+                    {
+                        assert_eq!(message, "Apply the router fix?");
+                        assert_eq!(requested_schema["required"][0], "choice");
+                        asked = Some(id.clone());
+                    }
+                }
+            }
+            if let Some(id) = asked.take() {
+                assert!(
+                    provider
+                        .handle_elicitation_response(
+                            &id,
+                            &serde_json::json!({"action": "accept", "content": {"choice": "Apply"}}),
+                        )
+                        .await
+                );
+                assert!(
+                    !provider
+                        .handle_elicitation_response(&id, &serde_json::json!({"action": "cancel"}))
+                        .await,
+                    "an answered question is not answered twice"
+                );
+            }
+        }
+        let answers = answers.lock().unwrap().clone();
+        assert_eq!(
+            answers.len(),
+            1,
+            "the agent got its answer and finished the turn"
+        );
+        assert_eq!(answers[0]["action"], "accept");
+        assert_eq!(answers[0]["content"]["choice"], "Apply");
     }
 
     /// An extension request carries the session id and returns the agent's answer; the

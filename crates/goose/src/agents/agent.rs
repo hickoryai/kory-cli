@@ -1024,6 +1024,23 @@ impl Agent {
                     // success while the blocked tool call stays unblocked.
                     // The success path returns an empty stream after the MCP
                     // server receives the user's accept/decline/cancel action.
+                    // A question the provider itself asked (an ACP agent's elicitation)
+                    // is answered there; only the rest belong to a waiting MCP tool call.
+                    let provider_answer = match action {
+                        ElicitationAction::Accept => {
+                            serde_json::json!({"action": "accept", "content": user_data})
+                        }
+                        ElicitationAction::Decline => serde_json::json!({"action": "decline"}),
+                        _ => serde_json::json!({"action": "cancel"}),
+                    };
+                    if let Ok(provider) = self.provider(&session_config.id).await {
+                        if provider
+                            .handle_elicitation_response(id, &provider_answer)
+                            .await
+                        {
+                            return Ok(Box::pin(futures::stream::empty()));
+                        }
+                    }
                     let response = match action {
                         ElicitationAction::Accept => ElicitationOutcome::Accept(user_data.clone()),
                         ElicitationAction::Decline => ElicitationOutcome::Decline,

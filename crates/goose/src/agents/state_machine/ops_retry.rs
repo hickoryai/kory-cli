@@ -26,6 +26,14 @@ fn retry_error(error: &str) -> Message {
     )
 }
 
+fn router_owns_goals(session: &Session) -> bool {
+    let provider = session
+        .provider_name
+        .clone()
+        .or_else(|| crate::config::Config::global().get_goose_provider().ok());
+    provider.as_deref() == Some(crate::providers::router_acp::ROUTER_ACP_PROVIDER_NAME)
+}
+
 pub struct RetryOperation {
     retry_timeout: Duration,
     on_failure_timeout: Duration,
@@ -85,6 +93,11 @@ impl Operation<Session, GooseEffect> for RetryOperation {
         conversation: &Conversation,
         emit: &Emitter,
     ) -> Result<OperationResult<GooseEffect>> {
+        // router-acp owns `/goal` for its sessions: it uses the agent's native goal mode and
+        // holds the turn open until the goal is affirmed, which one nudge here cannot do.
+        if command.command == "goal" && router_owns_goals(session) {
+            return not_applicable();
+        }
         let mut state = GoalState::of(session);
         let target = match command.command {
             "goal" => &mut state.goal,
