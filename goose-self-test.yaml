@@ -23,6 +23,7 @@ activities:
   - Validate GDK observability hook lifecycle events and payload opt-in
   - Validate capped and uncapped auto-compaction thresholds and Desktop editing
   - Test error boundaries including nested delegation prevention
+  - Validate private nightly parity cursor recovery and daily budget caps
   - Generate comprehensive test report
 
 parameters:
@@ -30,7 +31,7 @@ parameters:
     input_type: string
     requirement: optional
     default: "all"
-    description: "Which test phases to run: all, basic, extensions, delegation, code-mode, children-ui, declared-vision, reasoning, zai-coding-plan, acp-effort, compaction, headless-check, advanced"
+    description: "Which test phases to run: all, basic, extensions, delegation, code-mode, children-ui, declared-vision, reasoning, zai-coding-plan, acp-effort, compaction, headless-check, nightly-parity, advanced"
 
   - key: test_depth
     input_type: string
@@ -72,6 +73,12 @@ instructions: |
   - Test both success and failure paths
   - Document everything meticulously
   - Handle errors gracefully - a test failure shouldn't stop the suite
+
+  When test_phases is nightly-parity, run only
+  `python3 -m unittest discover -s workflow_recipes/kory_source_nightly/tests -v`
+  from the checkout. Report the actual exit status and test count. These tests use
+  synthetic snapshots and a fake harness. Do not run the live nightly driver,
+  access GitHub, use reviewer/judge seats, or read private comparison artifacts.
 
   When test_phases is headless-check, run only the goose-cli skill_check regression tests
   using the checkout's existing resource/build launcher. Verify successful validator exit,
@@ -165,6 +172,12 @@ extensions:
 prompt: |
   Execute the Goose Self-Testing Integration Suite in {{ workspace_dir }}.
   Test phases: {{ test_phases }}, Depth: {{ test_depth }}, Parallel: {{ parallel_tests }}
+
+  {% if test_phases == "nightly-parity" %}
+  Run only `python3 -m unittest discover -s workflow_recipes/kory_source_nightly/tests -v`.
+  Report the actual exit status and test count, then finish. Do not execute initialization
+  or any other phase, delegate, edit source, call GitHub, or run live comparisons.
+  {% endif %}
 
   {% if test_phases == "children-ui" %}
   Run only `source bin/activate-hermit && GOOSE_DISABLE_KEYRING=1 cargo test --release -p goose-cli --lib session::child_sessions`.

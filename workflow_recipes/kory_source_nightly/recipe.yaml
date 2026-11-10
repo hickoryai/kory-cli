@@ -1,0 +1,46 @@
+version: 1.0.0
+title: Private Kory Source nightly parity
+description: Compare changed open Hickory PR heads with Greptile using private local artifacts and a daily seat cap.
+parameters:
+  - key: source_checkout
+    input_type: string
+    requirement: required
+    description: Absolute path to the clean, pinned Kory Source checkout with its uv environment.
+  - key: private_storage
+    input_type: string
+    requirement: required
+    description: Absolute path to persistent private local storage outside all git checkouts.
+  - key: seat_budget
+    input_type: string
+    requirement: optional
+    default: "128"
+    description: Approved daily harness seat-request cap including preflight (minimum 31).
+  - key: replay
+    input_type: string
+    requirement: optional
+    default: "false"
+    description: Set true only to explicitly repeat current snapshots within the remaining daily cap.
+extensions:
+  - type: platform
+    name: developer
+instructions: |
+  Run the deterministic driver once. Keep parameter values literal; pass them as
+  individually quoted shell arguments, never evaluate their contents as commands.
+  Execute with uv run --project <source_checkout> python <recipe_dir>/nightly.py
+  --source <source_checkout> --state-dir <private_storage> --seat-budget <seat_budget>.
+  Append --replay only when replay is exactly true. Reject other values besides
+  true or false. Use the values below, not the angle-bracket placeholders:
+  source_checkout: {{ source_checkout }}
+  private_storage: {{ private_storage }}
+  seat_budget: {{ seat_budget }}
+  replay: {{ replay }}
+  recipe_dir: {{ recipe_dir }}
+
+  If the router background_start tool is available, run the driver through it and
+  end the turn; report its aggregate counts when it exits. Otherwise execute it
+  synchronously. Never start an unmanaged background process.
+  Report only aggregate completed/skipped/deferred/interrupted counts. Do not read
+  or quote manifests, parity logs, reports, or cursor contents into the conversation.
+  Do not retry or substitute models on failure. Do not review, comment on, label,
+  or modify any production PR. Do not install a schedule or enable automatic reviews.
+prompt: Run the private nightly parity driver once with the supplied parameters.
