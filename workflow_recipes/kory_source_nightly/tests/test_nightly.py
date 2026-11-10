@@ -42,6 +42,7 @@ class NightlyTests(unittest.TestCase):
             kwargs.pop("budget", 128),
             kwargs.pop("replay", False),
             discover=lambda: self.prs,
+            recheck=kwargs.pop("recheck", lambda _: True),
             export=self.export,
             run=kwargs.pop("run", self.run_harness),
             day=kwargs.pop("day", "2026-11-10"),
@@ -125,6 +126,12 @@ class NightlyTests(unittest.TestCase):
         self.assertEqual(self.compare(run=partial)["interrupted"], 1)
         self.assertEqual(self.compare()["skipped"], 1)
 
+    def test_head_change_at_launch_does_not_reserve_or_consume_cursor(self):
+        self.assertEqual(self.compare(recheck=lambda _: False)["deferred"], 1)
+        self.assertEqual(self.state()["attempts"], [])
+        self.assertEqual(self.state()["days"]["2026-11-10"]["reserved"], 0)
+        self.assertEqual(self.calls, [])
+
     def test_model_pins_and_single_current_unit(self):
         self.compare()
         argv = self.calls[0]
@@ -143,7 +150,8 @@ class NightlyTests(unittest.TestCase):
                     [
                         "python3",
                         "-c",
-                        f"import os; os.fstat({handle.fileno()}); print('private finding')",
+                        f"import os; os.fstat({handle.fileno()}); print('private finding'); "
+                        "print(os.environ['KORY_PARITY_RELAY_LOG'])",
                     ],
                     self.storage,
                     output,
@@ -151,6 +159,10 @@ class NightlyTests(unittest.TestCase):
                 )
             self.assertEqual(output.with_suffix(".log").stat().st_mode & 0o777, 0o600)
             self.assertIn("private finding", output.with_suffix(".log").read_text())
+            self.assertIn(
+                str(output.with_suffix(".relay.log")),
+                output.with_suffix(".log").read_text(),
+            )
         finally:
             os.umask(old_mask)
 

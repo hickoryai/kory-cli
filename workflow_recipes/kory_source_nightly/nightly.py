@@ -15,7 +15,7 @@ import subprocess
 import sys
 import uuid
 
-HARNESS_SHA = "e55d305ae38b7beb6dee20971c76835f16340cc7"
+HARNESS_SHA = "f29d30d4ea0fb635ae59c85a299b96572635d62a"
 REVIEWER = "grok@59aa6fc18f3f4b929dd9d59a6f3bfc11/grok-4.7"
 JUDGE = "claude@22e7810507d5403e83727a419617c51a/opus"
 REPO = "hickoryai/hickory-ai"
@@ -63,6 +63,17 @@ def open_prs() -> list[dict]:
         [pr for page in json.loads(result.stdout) for pr in page],
         key=lambda pr: (pr["updated_at"], pr["number"]),
     )
+
+
+def still_current(pr: dict) -> bool:
+    result = subprocess.run(
+        ["gh", "api", f"repos/{REPO}/pulls/{pr['number']}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    current = json.loads(result.stdout)
+    return current["state"] == "open" and current["head"]["sha"] == pr["head"]["sha"]
 
 
 async def export_snapshot(pr: dict) -> dict | None:
@@ -133,8 +144,16 @@ def launch(argv: list[str], source: Path, output: Path, *, lock_fd: int) -> int:
     # Harness stdout includes private findings; never relay it into a Goose
     # transcript or scheduler log.
     with output.with_suffix(".log").open("w") as log:
+        environment = dict(
+            os.environ, KORY_PARITY_RELAY_LOG=str(output.with_suffix(".relay.log"))
+        )
         return subprocess.run(
-            argv, cwd=source, stdout=log, stderr=subprocess.STDOUT, pass_fds=(lock_fd,)
+            argv,
+            cwd=source,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            pass_fds=(lock_fd,),
+            env=environment,
         ).returncode
 
 
@@ -160,6 +179,7 @@ def compare(
     replay: bool,
     *,
     discover=open_prs,
+    recheck=still_current,
     export=export_snapshot,
     run=launch,
     day: str | None = None,
@@ -196,6 +216,9 @@ def compare(
         attempt_dir.mkdir(mode=0o700)
         manifest, output = attempt_dir / "manifest.json", attempt_dir / "parity"
         save(manifest, [fixture])
+        if not recheck(pr):
+            summary["deferred"] += 1
+            continue
         attempt = {
             "key": snapshot_key,
             "day": day,

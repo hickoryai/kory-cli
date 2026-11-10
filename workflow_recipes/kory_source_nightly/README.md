@@ -45,14 +45,19 @@ intermediate heads that disappeared between nights, or heads on now-closed PRs.
 
 Only the current `(repository, PR number, full head SHA)` is eligible. The existing
 exporter fetches Greptile output using read-only APIs. The driver checks that the
-PR is still open at the same head, sets the manifest's `snapshot_sha`, and passes
+PR is still open at the same head after export and immediately before reserving
+seats, sets the manifest's `snapshot_sha`, and passes
 `--only <number>@<head-prefix>` to the harness. Older findings remain prior context
 for the judge; they are never presented as current golden findings or shown to
 the reviewer. A current head without matching Greptile output is deferred without
 consuming a cursor or budget, so a later night can pick up a late Greptile review.
+Eligibility is checked at selection time; an in-flight review remains pinned to
+that immutable snapshot if the branch subsequently changes.
 
 Each attempt has a UUID directory containing its frozen manifest, harness log,
-and parity JSON/Markdown. Only counts go to stdout. A `0700` directory, `0600`
+and parity JSON/Markdown. `KORY_PARITY_RELAY_LOG` routes the harness-owned loopback
+relay log into that same attempt directory using exclusive `0600` creation.
+Only counts go to stdout. A `0700` directory, `0600`
 files, restrictive umask, and rejection of storage inside git checkouts keep
 results local. Use private storage with appropriate host access controls; no
 upload, comment, review, label, or production mutation is performed. The recipe
