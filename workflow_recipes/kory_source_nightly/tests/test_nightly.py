@@ -140,6 +140,14 @@ class NightlyTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--only") + 1], "1@aaaaaaaaaaaa")
         self.assertEqual(argv[argv.index("--arms") + 1], "registry_off")
 
+    def test_model_pins_can_match_the_local_router_accounts(self):
+        reviewer = "grok@local/grok-4.7"
+        judge = "claude@local/opus"
+        self.compare(reviewer=reviewer, judge=judge)
+        argv = self.calls[0]
+        self.assertEqual(argv[argv.index("--reviewer-model") + 1], reviewer)
+        self.assertEqual(argv[argv.index("--judge-model") + 1], judge)
+
     def test_private_outputs_and_lock_inherited_by_harness(self):
         lock = self.storage / "lock"
         old_mask = os.umask(0o077)

@@ -102,7 +102,13 @@ async def export_snapshot(pr: dict) -> dict | None:
 
 
 def command(
-    source: Path, manifest: Path, output: Path, pr: dict, allocation: int
+    source: Path,
+    manifest: Path,
+    output: Path,
+    pr: dict,
+    allocation: int,
+    reviewer: str = REVIEWER,
+    judge: str = JUDGE,
 ) -> list[str]:
     return [
         sys.executable,
@@ -119,11 +125,11 @@ def command(
         "--runs",
         "1",
         "--reviewer-model",
-        REVIEWER,
+        reviewer,
         "--judge-provider",
         "router-acp",
         "--judge-model",
-        JUDGE,
+        judge,
         "--seed",
         "11607",
         "--seat-budget",
@@ -183,6 +189,8 @@ def compare(
     export=export_snapshot,
     run=launch,
     day: str | None = None,
+    reviewer: str = REVIEWER,
+    judge: str = JUDGE,
 ) -> dict:
     day = day or dt.datetime.now(dt.timezone.utc).date().isoformat()
     cursor = state_dir / "cursor.json"
@@ -232,7 +240,11 @@ def compare(
         # reservation across restarts, so interrupted calls cannot overspend.
         save(cursor, state)
         seen.add(snapshot_key)
-        code = run(command(source, manifest, output, pr, allocation), source, output)
+        code = run(
+            command(source, manifest, output, pr, allocation, reviewer, judge),
+            source,
+            output,
+        )
         attempt["exit_code"] = code
         recover(state)
         save(cursor, state)
@@ -261,6 +273,16 @@ def main() -> None:
         "--replay",
         action="store_true",
         help="explicitly repeat current heads, within today's remaining cap",
+    )
+    parser.add_argument(
+        "--reviewer-model",
+        default=REVIEWER,
+        help="pinned routeable reviewer candidate and model",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=JUDGE,
+        help="pinned routeable judge candidate and model",
     )
     args = parser.parse_args()
     if args.seat_budget < PREFLIGHT_RESERVE + MIN_RUN_BUDGET:
@@ -311,6 +333,8 @@ def main() -> None:
                     source,
                     args.seat_budget,
                     args.replay,
+                    reviewer=args.reviewer_model,
+                    judge=args.judge_model,
                     run=functools.partial(launch, lock_fd=lock.fileno()),
                 )
             )

@@ -20,6 +20,16 @@ parameters:
     requirement: optional
     default: "false"
     description: Set true only to explicitly repeat current snapshots within the remaining daily cap.
+  - key: reviewer_model
+    input_type: string
+    requirement: optional
+    default: grok@59aa6fc18f3f4b929dd9d59a6f3bfc11/grok-4.7
+    description: Pinned routeable Grok reviewer candidate and model on the relay host.
+  - key: judge_model
+    input_type: string
+    requirement: optional
+    default: claude@22e7810507d5403e83727a419617c51a/opus
+    description: Pinned routeable Claude judge candidate and model on the relay host.
 extensions:
   - type: platform
     name: developer
@@ -27,13 +37,16 @@ instructions: |
   Run the deterministic driver once. Keep parameter values literal; pass them as
   individually quoted shell arguments, never evaluate their contents as commands.
   Execute with uv run --project <source_checkout> python <recipe_dir>/nightly.py
-  --source <source_checkout> --state-dir <private_storage> --seat-budget <seat_budget>.
+  --source <source_checkout> --state-dir <private_storage> --seat-budget <seat_budget>
+  --reviewer-model <reviewer_model> --judge-model <judge_model>.
   Append --replay only when replay is exactly true. Reject other values besides
   true or false. Use the values below, not the angle-bracket placeholders:
   source_checkout: {{ source_checkout }}
   private_storage: {{ private_storage }}
   seat_budget: {{ seat_budget }}
   replay: {{ replay }}
+  reviewer_model: {{ reviewer_model }}
+  judge_model: {{ judge_model }}
   recipe_dir: {{ recipe_dir }}
 
   If the router background_start tool is available, run the driver through it and

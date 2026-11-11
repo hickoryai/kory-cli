@@ -33,6 +33,18 @@ uv run --project /absolute/path/to/kory-source python \
   --seat-budget 128
 ```
 
+The default reviewer and judge values pin the accounts used by the original
+harness host. Account candidate ids are local to each router. On another relay
+host, pass its audited routeable candidates while keeping the same models:
+
+```bash
+  --reviewer-model grok@<local-account-id>/grok-4.7 \
+  --judge-model claude@<local-account-id>/opus
+```
+
+Use `router-acp account-status` to confirm both candidates are authenticated and
+routeable. Do not use `auto` or enable fallback substitution for parity runs.
+
 **No trigger is installed by this change.** After operator approval, run once
 nightly (for example, 02:00 UTC) using the relay owner's local scheduler, under
 that owner's account, with the same persistent private directory and environment.
