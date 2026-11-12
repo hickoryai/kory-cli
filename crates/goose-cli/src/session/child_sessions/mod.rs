@@ -345,15 +345,25 @@ async fn load_goose_snapshot(
     turn_active: bool,
 ) -> anyhow::Result<Snapshot> {
     let id = current.unwrap_or(root_id);
+    let child_sessions = session_manager.list_child_sessions(id).await?;
+    // The dock calls this every second with no transcript to show. Loading and parsing the whole
+    // conversation each time grows with the session: a router-driven run with no goose children
+    // reached 2,338 messages overnight, and the repaint loop's reads starved the prompt until the
+    // screen froze and keys were ignored. With nothing to label and no transcript, skip the load.
+    if child_sessions.is_empty() && current.is_none() {
+        return Ok(Snapshot {
+            children: Vec::new(),
+            transcript: None,
+            notice: None,
+        });
+    }
     let session = session_manager.get_session(id, true).await?;
     let messages = session
         .conversation
         .map(|conversation| conversation.messages().clone())
         .unwrap_or_default();
     let states = subagent_states(&messages);
-    let children = session_manager
-        .list_child_sessions(id)
-        .await?
+    let children = child_sessions
         .into_iter()
         .map(|child| ChildRow {
             status: child_status(states.get(&child.id).copied(), turn_active),
