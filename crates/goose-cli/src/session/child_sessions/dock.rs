@@ -117,6 +117,7 @@ struct State {
     /// How long the last turn took and when it ended (`1h 30m (12:34am)`), shown at the prompt
     /// where `working` was.
     finished: Option<String>,
+    background: Option<BackgroundProgress>,
     /// A session-wide state the status line leads with, e.g. `shutting down 1/3`.
     status: Option<String>,
     /// Tokens in the context and the model's limit.
@@ -130,6 +131,47 @@ struct State {
     goal: Option<goose::providers::base::SessionGoal>,
     /// ↑ selected the goal: the next key edits or removes it, or moves on.
     goal_selected: bool,
+}
+
+struct BackgroundProgress {
+    started: Instant,
+    last_output: Instant,
+    receiving: bool,
+}
+
+/// Output from a provider-owned turn has no goose turn-completion event. Silence
+/// ends a rendering burst, not the agent's work.
+pub struct BackgroundActivity(Weak<Shared>);
+
+impl BackgroundActivity {
+    pub fn received(&self) {
+        self.update(|state| {
+            let now = Instant::now();
+            let progress = state.background.get_or_insert(BackgroundProgress {
+                started: now,
+                last_output: now,
+                receiving: true,
+            });
+            progress.last_output = now;
+            progress.receiving = true;
+            state.finished = None;
+        });
+    }
+
+    pub fn settled(&self) {
+        self.update(|state| {
+            if let Some(progress) = &mut state.background {
+                progress.receiving = false;
+            }
+        });
+    }
+
+    fn update(&self, f: impl FnOnce(&mut State)) {
+        if let Some(shared) = self.0.upgrade() {
+            f(&mut shared.state.lock().unwrap());
+            relay::repaint();
+        }
+    }
 }
 
 /// What a key does to a selected goal.
@@ -195,14 +237,22 @@ impl Dock {
             // The spinner turns while the session, or a child on screen, works.
             let _ticker = AbortOnDropHandle::new(tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(SPINNER_FRAME).await;
                     let Some(shared) = ticking.upgrade() else {
                         return;
                     };
-                    let working = shared.state.lock().unwrap().turn_started.is_some();
-                    if working || CHILD_WORKING.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (working, waiting) = {
+                        let state = shared.state.lock().unwrap();
+                        (
+                            state.turn_started.is_some()
+                                || state.background.as_ref().is_some_and(|p| p.receiving)
+                                || CHILD_WORKING.load(std::sync::atomic::Ordering::Relaxed),
+                            state.background.is_some(),
+                        )
+                    };
+                    if working || waiting {
                         relay::repaint();
                     }
+                    tokio::time::sleep(if working { SPINNER_FRAME } else { REPAINT }).await;
                 }
             }));
             loop {
@@ -230,8 +280,13 @@ impl Dock {
         let mut state = self.shared.state.lock().unwrap();
         state.turn_started = Some(Instant::now());
         state.finished = None;
+        state.background = None;
         drop(state);
         relay::repaint();
+    }
+
+    pub fn background_activity(&self) -> BackgroundActivity {
+        BackgroundActivity(Arc::downgrade(&self.shared))
     }
 
     /// Back to the prompt. What was typed and never sent stays in the input box. A turn that
@@ -966,7 +1021,13 @@ fn top_rule(state: &State, width: usize) -> String {
     if let Some(status) = &state.status {
         left.push(style(status.clone()).yellow().to_string());
     }
-    if let Some(started) = state.turn_started {
+    let started = state.turn_started.or_else(|| {
+        state
+            .background
+            .as_ref()
+            .and_then(|progress| progress.receiving.then_some(progress.started))
+    });
+    if let Some(started) = started {
         left.push(format!(
             "{} {}",
             super::super::output::sapling_green(format!(
@@ -975,6 +1036,15 @@ fn top_rule(state: &State, width: usize) -> String {
             )),
             style(format_elapsed(started.elapsed())).dim()
         ));
+    } else if let Some(progress) = &state.background {
+        left.push(
+            style(format!(
+                "awaiting agent · last output {} ago",
+                format_elapsed(progress.last_output.elapsed())
+            ))
+            .dim()
+            .to_string(),
+        );
     } else if let Some(finished) = &state.finished {
         // The last turn's length and end, where `working` was.
         left.push(format!(
@@ -1290,6 +1360,52 @@ mod tests {
         let dock = typing();
         dock.begin_turn();
         dock
+    }
+
+    #[tokio::test]
+    async fn background_output_replaces_the_finished_stamp_without_claiming_silence_is_completion()
+    {
+        let dock = in_turn();
+        dock.end_turn();
+        let activity = dock.background_activity();
+        activity.received();
+        let started = dock
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .background
+            .as_ref()
+            .unwrap()
+            .started;
+        let lines = painted(&dock.shared.state.lock().unwrap(), 100, 20);
+        assert!(lines[0].contains("working"));
+        assert!(!lines[0].contains('⏹'));
+
+        activity.settled();
+        dock.end_turn(); // Revisiting the input prompt must not declare the agent finished.
+        let lines = painted(&dock.shared.state.lock().unwrap(), 100, 20);
+        assert!(lines[0].contains("awaiting agent"));
+        assert!(!lines[0].contains('⏹'));
+
+        activity.received();
+        assert_eq!(
+            dock.shared
+                .state
+                .lock()
+                .unwrap()
+                .background
+                .as_ref()
+                .unwrap()
+                .started,
+            started
+        );
+        dock.begin_turn();
+        assert!(dock.shared.state.lock().unwrap().background.is_none());
+        activity.settled(); // A late burst flush cannot finish the foreground turn.
+        assert!(painted(&dock.shared.state.lock().unwrap(), 100, 20)[0].contains("working"));
+        dock.end_turn();
+        assert!(painted(&dock.shared.state.lock().unwrap(), 100, 20)[0].contains('⏹'));
     }
 
     fn plain(lines: &[String]) -> Vec<String> {

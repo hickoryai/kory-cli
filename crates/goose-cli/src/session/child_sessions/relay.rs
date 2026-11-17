@@ -314,6 +314,7 @@ fn start() -> Option<Arc<Relay>> {
         // a program that wants echo turns it on. The relay reads the real terminal raw.
         let mut session_termios = real_termios;
         session_termios.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        session_termios.c_oflag |= libc::OPOST | libc::ONLCR;
         libc::tcsetattr(slave, libc::TCSANOW, &session_termios);
         let real_out = libc::dup(libc::STDOUT_FILENO);
         let real_in = libc::dup(libc::STDIN_FILENO);

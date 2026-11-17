@@ -46,6 +46,18 @@ curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_
 - [Governance](https://github.com/aaif-goose/goose/blob/main/GOVERNANCE.md)
 - [Custom Distributions](https://github.com/aaif-goose/goose/blob/main/CUSTOM_DISTROS.md) — build your own goose distro with preconfigured providers, extensions, and branding
 
+## CLI activity footer
+
+The footer shows a running timer during an interactive turn and while background agent
+output arrives (including router-initiated continuations). A pause in background output
+shows `awaiting agent` with the time since the last output. Background output has no
+turn-completion signal, so a quiet burst never produces a stopped timestamp. The stopped
+duration and local time describe a completed interactive turn only.
+
+The terminal relay and prompt key listener enable newline translation on the session's
+pseudo-terminal, including when the preceding input reader left it in raw mode. Transcript
+lines therefore return to the left margin while the footer keeps accepting input.
+
 ## Need help?
 - [Diagnostics & Reporting](https://goose-docs.ai/docs/troubleshooting/diagnostics-and-reporting)
 - [Known Issues](https://goose-docs.ai/docs/troubleshooting/known-issues)
