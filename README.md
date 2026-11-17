@@ -55,6 +55,9 @@ not mark the session stopped. The duration and local stop time are recorded when
 router notifications arrive. Child sessions read their lifecycle from the existing
 `state-query v1 delegates` result. Other providers use the local interactive turn.
 
+ACP terminal exit waits and releases run outside the incoming message handler, so a
+running background command cannot block the output and kill requests needed to interrupt it.
+
 The terminal relay and prompt key listener enable newline translation on the session's
 pseudo-terminal, including when the preceding input reader left it in raw mode. Transcript
 lines therefore return to the left margin while the footer keeps accepting input.
