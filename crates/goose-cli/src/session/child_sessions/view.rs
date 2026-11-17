@@ -9,6 +9,7 @@ const WHEEL_LINES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildStatus {
+    Unknown,
     Running,
     Stopped,
     Completed,
@@ -19,6 +20,7 @@ pub enum ChildStatus {
 impl ChildStatus {
     pub(super) fn label(self) -> &'static str {
         match self {
+            ChildStatus::Unknown => "unknown",
             ChildStatus::Running => "running",
             ChildStatus::Stopped => "stopped",
             ChildStatus::Completed => "done",

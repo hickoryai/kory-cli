@@ -48,11 +48,12 @@ curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_
 
 ## CLI activity footer
 
-The footer shows a running timer during an interactive turn and while background agent
-output arrives (including router-initiated continuations). A pause in background output
-shows `awaiting agent` with the time since the last output. Background output has no
-turn-completion signal, so a quiet burst never produces a stopped timestamp. The stopped
-duration and local time describe a completed interactive turn only.
+The router session's footer reads the same `session_info_update` activity state as the
+terminal title (`_meta.routerAcp.busy`). Router-reported starts and stops control the
+timer, including autonomous wakes. Output pauses and returning to the local prompt do
+not mark the session stopped. The duration and local stop time are recorded when those
+router notifications arrive. Child sessions read their lifecycle from the existing
+`state-query v1 delegates` result. Other providers use the local interactive turn.
 
 The terminal relay and prompt key listener enable newline translation on the session's
 pseudo-terminal, including when the preceding input reader left it in raw mode. Transcript

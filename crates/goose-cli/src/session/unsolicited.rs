@@ -3,7 +3,6 @@
 //! as each burst settles, and at an interactive prompt it is printed above the line being
 //! edited through the line editor's external printer.
 
-use super::child_sessions::dock::BackgroundActivity;
 use super::output;
 use super::streaming_buffer::MarkdownBuffer;
 use goose::conversation::message::Message;
@@ -94,12 +93,6 @@ impl UnsolicitedRelay {
 
     pub fn displays(&self) -> bool {
         self.shared.state.lock().unwrap().display.is_some()
-    }
-
-    pub fn set_activity(&self, activity: Option<BackgroundActivity>) {
-        if let Some(display) = self.shared.state.lock().unwrap().display.as_mut() {
-            display.activity = activity;
-        }
     }
 
     /// The prompt is about to show: print what arrived meanwhile and print live from now on.
@@ -193,7 +186,6 @@ struct Display {
     thinking_block: output::ThinkingBlock,
     in_burst: bool,
     debug: bool,
-    activity: Option<BackgroundActivity>,
 }
 
 impl Display {
@@ -220,7 +212,6 @@ impl Display {
             thinking_block: output::ThinkingBlock::default(),
             in_burst: false,
             debug,
-            activity: None,
         }
     }
 
@@ -240,9 +231,6 @@ impl Display {
     /// A burst prints as it would during a turn, with no banner of its own: the dock and the
     /// child sessions it opens already say which agent is working.
     fn render(&mut self, message: &Message) {
-        if let Some(activity) = &self.activity {
-            activity.received();
-        }
         self.in_burst = true;
         let (markdown, thinking_block, debug) =
             (&mut self.markdown, &mut self.thinking_block, self.debug);
@@ -265,9 +253,6 @@ impl Display {
         });
         self.emit(tail, true);
         self.in_burst = false;
-        if let Some(activity) = &self.activity {
-            activity.settled();
-        }
         self.thinking_block = output::ThinkingBlock::default();
     }
 

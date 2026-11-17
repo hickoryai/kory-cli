@@ -2654,9 +2654,6 @@ impl CliSession {
                 && (display.is_none() || relay.displays())
         });
         let interactive = display.is_some();
-        if at_prompt {
-            self.sync_dock(interactive).await;
-        }
         if let (false, Some(provider)) = (current, provider) {
             if let Some(previous) = self.unsolicited.take() {
                 previous.settle().await;
@@ -2678,8 +2675,8 @@ impl CliSession {
             );
         }
         self.take_unsolicited();
-        if let Some(relay) = &self.unsolicited {
-            relay.set_activity(self.dock().map(|dock| dock.background_activity()));
+        if at_prompt {
+            self.sync_dock(interactive).await;
         }
     }
 

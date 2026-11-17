@@ -2315,6 +2315,7 @@ mod tests {
         let routed = SessionActivity {
             title: Some("Chordzy [opus]\x1b".into()),
             busy: true,
+            ..SessionActivity::default()
         };
         assert_eq!(terminal_title(&routed, false, "x", 0), "⠋ Chordzy [opus]");
         assert_eq!(terminal_title(&routed, false, "x", 1), "⠙ Chordzy [opus]");

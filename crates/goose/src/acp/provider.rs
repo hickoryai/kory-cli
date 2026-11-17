@@ -1620,6 +1620,7 @@ impl AcpClientLoop {
                                     .and_then(|router| router.get("busy"))
                                     .and_then(|busy| busy.as_bool());
                                 super::session_activity::update(
+                                    notification.session_id.0.as_ref(),
                                     update.title.value().cloned(),
                                     busy,
                                 );
