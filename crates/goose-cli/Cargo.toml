@@ -167,6 +167,7 @@ env-lock.workspace = true
 tempfile = { workspace = true }
 test-case = { workspace = true }
 tokio = { workspace = true }
+vt100 = "0.16.2"
 
 [package.metadata.cargo-machete]
 ignored = [

@@ -507,7 +507,11 @@ impl Completer for GooseCompleter {
 }
 
 // Implement the Helper trait which is required by rustyline
-impl Helper for GooseCompleter {}
+impl Helper for GooseCompleter {
+    fn resize(&self, prompt_rows: usize) -> bool {
+        super::child_sessions::dock::resize_prompt(prompt_rows)
+    }
+}
 
 // Implement required traits with default implementations
 impl Hinter for GooseCompleter {

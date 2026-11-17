@@ -75,6 +75,7 @@ struct State {
     suspended: bool,
     focus_requested: bool,
     turn_active: bool,
+    prompt_active: bool,
     /// A session-wide state the header leads with, e.g. `shutting down 1/3`.
     status: Option<String>,
 }
@@ -399,10 +400,32 @@ pub fn take_focus_request() -> bool {
         .unwrap_or(false)
 }
 
+/// Rustyline owns resize/repaint while editing, so the background painter must not
+/// move its cursor or resize its scroll region independently.
+pub struct PromptGuard;
+
+impl PromptGuard {
+    pub fn start() -> Self {
+        with_active(|shared| shared.state.lock().unwrap().prompt_active = true);
+        Self
+    }
+}
+
+impl Drop for PromptGuard {
+    fn drop(&mut self) {
+        with_active(|shared| shared.state.lock().unwrap().prompt_active = false);
+    }
+}
+
+pub fn resize_prompt(prompt_rows: usize) -> bool {
+    with_active(|shared| shared.resize(Some(prompt_rows))).unwrap_or(false)
+}
+
 /// A full-screen view or an external program takes the whole screen; the footer stops
 /// painting and gives the scroll region back until `resume`.
 pub fn suspend() {
     with_active(|shared| {
+        let _terminal = std::io::stdout().lock();
         shared.state.lock().unwrap().suspended = true;
         write_raw("\x1b7\x1b[r\x1b8\x1b[?25h");
     });
@@ -410,11 +433,15 @@ pub fn suspend() {
 
 pub fn resume() {
     with_active(|shared| {
+        let _terminal = std::io::stdout().lock();
         let (reserved, lines) = {
             let mut state = shared.state.lock().unwrap();
             state.suspended = false;
             (state.reserved, state.size.1)
         };
+        if shared.resize(None) {
+            return;
+        }
         if reserved > 0 {
             write_raw(&region_sequence(reserved, lines));
         }
@@ -481,6 +508,7 @@ impl Shared {
 
     /// Reserves exactly the rows the current layout needs. Only called on a fresh line.
     fn fit(&self) {
+        let _terminal = std::io::stdout().lock();
         if !is_capable() {
             return;
         }
@@ -515,28 +543,47 @@ impl Shared {
 
     /// Terminals reset the scroll region on resize; reapply it for the new size.
     fn follow_resize(&self) {
+        self.resize(None);
+    }
+
+    fn resize(&self, prompt_rows: Option<usize>) -> bool {
+        // Match the editor's lock order: terminal first, then footer state.
+        let _terminal = std::io::stdout().lock();
         let (cols, lines) = terminal_size();
         let mut state = self.state.lock().unwrap();
-        if state.reserved == 0 || state.suspended || state.size == (cols, lines) {
-            return;
+        if state.size == (0, 0)
+            || state.suspended
+            || state.size == (cols, lines)
+            || (state.prompt_active && prompt_rows.is_none())
+        {
+            return false;
         }
-        write_raw(&release_sequence(state.reserved, state.size.1));
-        state.reserved = Layout::of(&state, (cols, lines))
-            .height()
-            .min(state.reserved);
+        let height = Layout::of(&state, (cols, lines)).height();
+        write_raw(&resize_sequence(
+            state.reserved,
+            state.size,
+            height,
+            (cols, lines),
+            prompt_rows.unwrap_or(0),
+        ));
+        state.reserved = height;
         state.size = (cols, lines);
-        write_raw(&region_sequence(state.reserved, lines));
+        follow_selection(&mut state);
+        write_raw(&frame(&state, cols, lines));
+        true
     }
 
     fn paint(&self) {
+        let _terminal = std::io::stdout().lock();
         let state = self.state.lock().unwrap();
-        if state.reserved == 0 || state.suspended {
+        if state.reserved == 0 || state.suspended || state.size != terminal_size() {
             return;
         }
         write_raw(&frame(&state, state.size.0, state.size.1));
     }
 
     fn release(&self) {
+        let _terminal = std::io::stdout().lock();
         let mut state = self.state.lock().unwrap();
         if state.reserved > 0 {
             write_raw(&release_sequence(state.reserved, state.size.1));
@@ -568,6 +615,32 @@ fn release_sequence(height: usize, lines: usize) -> String {
         out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
     }
     out.push_str("\x1b8");
+    out
+}
+
+fn resize_sequence(
+    old_height: usize,
+    (old_cols, old_lines): (usize, usize),
+    height: usize,
+    (cols, lines): (usize, usize),
+    prompt_rows: usize,
+) -> String {
+    // Terminals either clip the bottom or shift rows up when shrinking. Clear both
+    // possible footer footprints; old absolute row numbers can now be off-screen.
+    let old_top = old_lines.saturating_sub(old_height);
+    let shifted_top = old_top.saturating_sub(old_lines.saturating_sub(lines));
+    // A narrower terminal can also reflow each former footer row onto several rows.
+    let reflow_top = lines.saturating_sub(old_height * old_cols.div_ceil(cols.max(1)));
+    let top = old_top
+        .min(shifted_top)
+        .min(reflow_top)
+        .min(lines.saturating_sub(height));
+    let mut out = String::from("\x1b[0m\x1b[r");
+    for row in top.saturating_sub(prompt_rows) + 1..=lines {
+        out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+    }
+    let bottom = lines.saturating_sub(height).max(1);
+    out.push_str(&format!("\x1b[1;{bottom}r\x1b[{bottom};1H"));
     out
 }
 
@@ -817,6 +890,10 @@ fn write_raw(text: &str) {
     let _ = stdout.write_all(text.as_bytes());
     let _ = stdout.flush();
 }
+
+#[cfg(all(test, unix))]
+#[path = "../../../tests/support/dock_terminal.rs"]
+mod terminal_tests;
 
 #[cfg(test)]
 mod tests {

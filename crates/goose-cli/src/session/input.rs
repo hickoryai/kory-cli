@@ -122,7 +122,9 @@ impl rustyline::ConditionalEventHandler for DockFocusHandler {
 
 /// ↑ on an empty line moves into the session's tool calls when it has any; otherwise ↑ keeps
 /// its history meaning (as does Ctrl+P, always).
-struct ToolFocusHandler;
+struct ToolFocusHandler {
+    background_tools: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
 
 impl rustyline::ConditionalEventHandler for ToolFocusHandler {
     fn handle(
@@ -132,9 +134,27 @@ impl rustyline::ConditionalEventHandler for ToolFocusHandler {
         _positive: bool,
         ctx: &rustyline::EventContext,
     ) -> Option<rustyline::Cmd> {
-        (ctx.line().is_empty() && super::tool_calls::request_focus())
+        let background = self
+            .background_tools
+            .as_ref()
+            .is_some_and(|tools| tools.load(std::sync::atomic::Ordering::Relaxed));
+        (ctx.line().is_empty() && super::tool_calls::request_focus(background))
             .then_some(rustyline::Cmd::AcceptLine)
     }
+}
+
+pub(super) fn bind_navigation(
+    editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    background_tools: Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Up, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(ToolFocusHandler { background_tools })),
+    );
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Down, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(DockFocusHandler)),
+    );
 }
 
 /// How long after an unparsed escape sequence its leftover bytes may still arrive. The
@@ -337,9 +357,9 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(UnknownEscapeHandler { tail: escape_tail })),
     );
 
-    editor.bind_sequence(
-        rustyline::KeyEvent(rustyline::KeyCode::Up, rustyline::Modifiers::NONE),
-        rustyline::EventHandler::Conditional(Box::new(ToolFocusHandler)),
+    bind_navigation(
+        editor,
+        background_output.map(UnsolicitedRelay::tools_available),
     );
 
     editor.bind_sequence(
@@ -369,15 +389,11 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
-    editor.bind_sequence(
-        rustyline::KeyEvent(rustyline::KeyCode::Down, rustyline::Modifiers::NONE),
-        rustyline::EventHandler::Conditional(Box::new(DockFocusHandler)),
-    );
-
     // Background agent output prints above the line being edited only while it is edited.
     if let Some(relay) = background_output {
         relay.resume();
     }
+    let _prompt = super::child_sessions::dock::PromptGuard::start();
     let read = read_paste_aware_input(editor, paste_state);
     if let Some(relay) = background_output {
         relay.pause();

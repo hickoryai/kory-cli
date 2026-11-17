@@ -2562,6 +2562,7 @@ impl CliSession {
     /// ↑ on an empty prompt: the session's tool calls, full screen, until ↓ past the newest,
     /// Esc or q returns to the prompt.
     async fn browse_tool_calls(&mut self) {
+        self.settle_unsolicited().await;
         let calls = tool_calls::collect(self.messages.messages());
         let Ok(mut keys) = child_sessions::KeyReader::start() else {
             return;

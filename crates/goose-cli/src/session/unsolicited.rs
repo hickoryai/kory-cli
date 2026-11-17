@@ -10,6 +10,7 @@ use goose::conversation::Conversation;
 use goose::providers::base::{Provider, UnsolicitedUpdate};
 use goose::session::SessionManager;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -32,6 +33,7 @@ struct Shared {
     session_id: String,
     state: Mutex<State>,
     persisting: tokio::sync::Mutex<HashSet<String>>,
+    tools_available: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -60,6 +62,7 @@ impl UnsolicitedRelay {
                 ..State::default()
             }),
             persisting: tokio::sync::Mutex::new(HashSet::new()),
+            tools_available: Arc::default(),
         });
         let relayed = shared.clone();
         let task = tokio::spawn(async move {
@@ -93,6 +96,10 @@ impl UnsolicitedRelay {
 
     pub fn displays(&self) -> bool {
         self.shared.state.lock().unwrap().display.is_some()
+    }
+
+    pub fn tools_available(&self) -> Arc<AtomicBool> {
+        self.shared.tools_available.clone()
     }
 
     /// The prompt is about to show: print what arrived meanwhile and print live from now on.
@@ -133,11 +140,15 @@ impl UnsolicitedRelay {
 
 impl Shared {
     fn stream(&self, message: Message) {
+        let has_tools = super::tool_calls::has_tool_calls(std::slice::from_ref(&message));
         let mut state = self.state.lock().unwrap();
         if let Some(display) = state.display.as_mut() {
             display.render(&message);
         }
         state.pending.push(message);
+        if has_tools {
+            self.tools_available.store(true, Ordering::Relaxed);
+        }
     }
 
     async fn settle(&self) {
@@ -350,6 +361,7 @@ mod tests {
             session_id: session_id.clone(),
             state: Mutex::new(State::default()),
             persisting: tokio::sync::Mutex::new(HashSet::new()),
+            tools_available: Arc::default(),
         };
         for chunk in ["Worker handed ", "off."] {
             shared.stream(Message::assistant().with_text(chunk).with_id("wake-1"));
@@ -380,5 +392,17 @@ mod tests {
             ]
         );
         assert_eq!(shared.state.lock().unwrap().recorded.len(), 2);
+
+        assert!(!shared.tools_available.load(Ordering::Relaxed));
+        shared.stream(Message::assistant().with_tool_request(
+            "background-tool",
+            Ok(rmcp::model::CallToolRequestParams::new("Terminal")),
+        ));
+        assert!(shared.tools_available.load(Ordering::Relaxed));
+        shared.settle().await;
+        let recorded = &shared.state.lock().unwrap().recorded;
+        let calls = super::super::tool_calls::collect(recorded);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "background-tool");
     }
 }

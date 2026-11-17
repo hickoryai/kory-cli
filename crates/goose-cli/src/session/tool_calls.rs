@@ -26,8 +26,8 @@ pub fn set_available(available: bool) {
 }
 
 /// From the line editor's ↑ handler: true when there are tool calls to move into.
-pub fn request_focus() -> bool {
-    let available = AVAILABLE.load(Ordering::Relaxed);
+pub fn request_focus(background_available: bool) -> bool {
+    let available = AVAILABLE.load(Ordering::Relaxed) || background_available;
     REQUESTED.store(available, Ordering::Relaxed);
     available
 }
