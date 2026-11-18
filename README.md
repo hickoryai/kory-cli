@@ -66,6 +66,10 @@ The terminal relay and prompt key listener enable newline translation on the ses
 pseudo-terminal, including when the preceding input reader left it in raw mode. Transcript
 lines therefore return to the left margin while the footer keeps accepting input.
 
+Drag to select transcript text; right-click copies the selection and clears its highlight
+without moving the view. Copying uses the local system clipboard as well as OSC 52 for
+terminals that support clipboard forwarding, including remote sessions.
+
 ## Need help?
 - [Diagnostics & Reporting](https://goose-docs.ai/docs/troubleshooting/diagnostics-and-reporting)
 - [Known Issues](https://goose-docs.ai/docs/troubleshooting/known-issues)

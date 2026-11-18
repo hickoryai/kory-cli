@@ -4455,6 +4455,7 @@ dependencies = [
  "agent-client-protocol",
  "anstream",
  "anyhow",
+ "arboard",
  "async-trait",
  "axum",
  "axum-server",

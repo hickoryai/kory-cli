@@ -481,6 +481,8 @@ impl Relay {
         let mut last_frame = Instant::now() - FRAME;
         let mut dirty = true;
         let mut interrupts: Vec<Instant> = Vec::new();
+        // X11 keeps clipboard ownership only while this handle stays alive.
+        let mut clipboard: Option<arboard::Clipboard> = None;
         loop {
             let stopping = self.stop.load(Ordering::SeqCst);
             let timeout = if stopping {
@@ -544,6 +546,21 @@ impl Relay {
             if input.scrolled {
                 dirty = true;
             }
+            let active_view = match child.as_mut() {
+                Some(shown) => &mut shown.view,
+                None => &mut view,
+            };
+            let copied = active_view.take_clipboard(|text| {
+                if clipboard.is_none() {
+                    clipboard = arboard::Clipboard::new().ok();
+                }
+                if let Some(clipboard) = clipboard.as_mut() {
+                    let _ = clipboard.set_text(text);
+                }
+            });
+            if !copied.is_empty() {
+                write_fd(self.real_out, &copied);
+            }
             if input.interrupt > 0 {
                 let now = Instant::now();
                 interrupts.retain(|at| now.duration_since(*at) < FORCE_QUIT_WINDOW);
@@ -598,7 +615,6 @@ impl Relay {
                 let mut out = view.forwarded();
                 match child.as_mut() {
                     Some(shown) => {
-                        out.append(&mut shown.view.clipboard);
                         out.extend_from_slice(&shown.view.frame(&pane));
                     }
                     None => out.extend_from_slice(&view.frame(&pane)),
@@ -773,8 +789,8 @@ struct View {
     /// The transcript row at the top of the screen at the last frame, for mouse positions.
     view_start: usize,
     selection: Option<Selection>,
-    /// A copied selection waiting to reach the real terminal.
-    clipboard: Vec<u8>,
+    /// A copied selection waiting to reach the local and terminal clipboards.
+    clipboard: Option<String>,
     /// Whether the real terminal has bracketed paste on.
     paste_mode: bool,
     /// The session's output, replayed into a new emulator when the size changes.
@@ -806,7 +822,7 @@ impl View {
             transcript_rows: 0,
             view_start: 0,
             selection: None,
-            clipboard: Vec::new(),
+            clipboard: None,
             paste_mode: false,
             log: Vec::new(),
             tool_rows: Default::default(),
@@ -876,7 +892,6 @@ impl View {
     /// Sequences meant for the real terminal, and the bracketed-paste mode the session wants.
     fn forwarded(&mut self) -> Vec<u8> {
         let mut out = std::mem::take(&mut self.parser.callbacks_mut().forward);
-        out.append(&mut self.clipboard);
         let paste = self.parser.screen().bracketed_paste();
         if paste != self.paste_mode {
             out.extend_from_slice(if paste {
@@ -887,6 +902,15 @@ impl View {
             self.paste_mode = paste;
         }
         out
+    }
+
+    fn take_clipboard(&mut self, copy_local: impl FnOnce(&str)) -> Vec<u8> {
+        let Some(text) = self.clipboard.take() else {
+            return Vec::new();
+        };
+        copy_local(&text);
+        // OSC 52 also reaches the user's clipboard when Kory runs over SSH.
+        format!("\x1b]52;c;{}\x07", BASE64_STANDARD.encode(text)).into_bytes()
     }
 
     /// A new terminal size. The emulator cannot reflow, so a fresh one at the new size replays
@@ -1037,6 +1061,13 @@ impl View {
             // Motion with the left button held.
             32 => self.drag_selection(col, row),
             0 => self.end_selection(col, row),
+            2 if pressed => {
+                let Some(selection) = self.selection.take() else {
+                    return false;
+                };
+                self.clipboard = Some(self.selected_text(selection));
+                true
+            }
             _ => false,
         }
     }
@@ -1093,9 +1124,7 @@ impl View {
         if selection.anchor == selection.head {
             self.selection = None;
         } else {
-            let text = self.selected_text(selection);
-            self.clipboard
-                .extend(format!("\x1b]52;c;{}\x07", BASE64_STANDARD.encode(text)).into_bytes());
+            self.clipboard = Some(self.selected_text(selection));
         }
         true
     }
@@ -1592,8 +1621,6 @@ mod tests {
         assert_eq!(view.scroll_up, 0);
     }
 
-    /// The operator's report: after a turn left the kitty keyboard protocol on, Ctrl-C reached
-    /// the session as `ESC[99;5u` and only echoed, so nothing could end the app.
     #[test]
     fn dragging_highlights_and_copies_the_text_through_the_terminal() {
         let mut view = View::new(40, 8);
@@ -1610,8 +1637,11 @@ mod tests {
         assert!(view.input(b"\x1b[<0;4;2m", Instant::now()).scrolled);
         let copied = BASE64_STANDARD.encode("rst line\nseco");
         assert!(
-            String::from_utf8_lossy(&view.forwarded()).contains(&format!("]52;c;{copied}\x07")),
-            "the text reaches the clipboard"
+            String::from_utf8_lossy(&view.take_clipboard(|text| {
+                assert_eq!(text, "rst line\nseco");
+            }))
+            .contains(&format!("]52;c;{copied}\x07")),
+            "the text reaches both clipboard paths"
         );
         assert!(view.selection.is_some(), "it stays highlighted");
         assert!(view.input(b"x", Instant::now()).scrolled);
@@ -1625,10 +1655,53 @@ mod tests {
         view.frame(&pane());
         view.input(b"\x1b[<0;1;1M\x1b[<0;1;1m", Instant::now());
         assert!(view.selection.is_none());
-        assert!(!String::from_utf8_lossy(&view.forwarded()).contains("]52;"));
+        assert!(view
+            .take_clipboard(|_| panic!("a click must not copy"))
+            .is_empty());
         view.input(b"\x1b[<0;1;1M\x1b[<32;2;3M\x1b[<0;2;3m", Instant::now());
         let copied = BASE64_STANDARD.encode("abcdefghijklmn\nne");
-        assert!(String::from_utf8_lossy(&view.forwarded()).contains(&copied));
+        assert!(String::from_utf8_lossy(&view.take_clipboard(|text| {
+            assert_eq!(text, "abcdefghijklmn\nne");
+        }))
+        .contains(&copied));
+    }
+
+    #[test]
+    fn right_click_copies_the_selection_once_and_clears_its_highlight() {
+        let mut view = View::new(40, 6);
+        for i in 0..12 {
+            view.output(format!("line {i}\r\n").as_bytes());
+        }
+        view.frame(&pane());
+        view.input(b"\x1b[5~", Instant::now());
+        view.frame(&pane());
+        let before = screen(&view.frame(&pane()), 40, 6);
+        // Select backwards, then right-click elsewhere (over the pane).
+        view.input(b"\x1b[<0;4;3M\x1b[<32;1;2M\x1b[<0;1;2m", Instant::now());
+        view.take_clipboard(|_| {});
+        assert!(String::from_utf8_lossy(&view.frame(&pane())).contains("\x1b[7m"));
+        let input = view.input(b"\x1b[<2;30;6M", Instant::now());
+        assert!(input.scrolled && input.forward.is_empty() && input.activate.is_none());
+        let mut local_copy = String::new();
+        let copied = view.take_clipboard(|text| local_copy = text.to_owned());
+        assert_eq!(local_copy, "line 7\nline");
+        assert_eq!(
+            copied,
+            format!("\x1b]52;c;{}\x07", BASE64_STANDARD.encode(&local_copy)).as_bytes()
+        );
+        let frame = view.frame(&pane());
+        assert!(!String::from_utf8_lossy(&frame).contains("\x1b[7m"));
+        assert_eq!(
+            screen(&frame, 40, 6),
+            before,
+            "copying does not jump to the bottom"
+        );
+
+        let input = view.input(b"\x1b[<2;30;6m\x1b[<2;1;1M", Instant::now());
+        assert!(!input.scrolled && input.forward.is_empty() && input.activate.is_none());
+        assert!(view
+            .take_clipboard(|_| panic!("release or an empty selection must not copy"))
+            .is_empty());
     }
 
     #[test]
