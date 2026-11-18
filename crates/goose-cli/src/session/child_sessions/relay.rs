@@ -1679,7 +1679,9 @@ mod tests {
         // Select backwards, then right-click elsewhere (over the pane).
         view.input(b"\x1b[<0;4;3M\x1b[<32;1;2M\x1b[<0;1;2m", Instant::now());
         view.take_clipboard(|_| {});
-        assert!(String::from_utf8_lossy(&view.frame(&pane())).contains("\x1b[7m"));
+        let mut terminal = vt100::Parser::new(6, 40, 0);
+        terminal.process(&view.frame(&pane()));
+        assert!(terminal.screen().cell(1, 0).unwrap().inverse());
         let input = view.input(b"\x1b[<2;30;6M", Instant::now());
         assert!(input.scrolled && input.forward.is_empty() && input.activate.is_none());
         let mut local_copy = String::new();
@@ -1690,7 +1692,8 @@ mod tests {
             format!("\x1b]52;c;{}\x07", BASE64_STANDARD.encode(&local_copy)).as_bytes()
         );
         let frame = view.frame(&pane());
-        assert!(!String::from_utf8_lossy(&frame).contains("\x1b[7m"));
+        terminal.process(&frame);
+        assert!(!terminal.screen().cell(1, 0).unwrap().inverse());
         assert_eq!(
             screen(&frame, 40, 6),
             before,
