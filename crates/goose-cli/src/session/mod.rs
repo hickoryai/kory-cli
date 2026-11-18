@@ -2907,7 +2907,7 @@ impl CliSession {
         let mut quit = shutdown::QuitGuard::default();
         output::print_status_line(shutdown::BLOCKED);
         let quitting = loop {
-            tokio::select! {
+            let key = tokio::select! {
                 notification = shutdown::next_notification(&mut notifications) => {
                     for line in self.take_shutdown_progress(&notification) {
                         output::print_status_line(&line);
@@ -2915,19 +2915,21 @@ impl CliSession {
                     if self.shutdown_gate() != shutdown::Gate::Draining {
                         break false;
                     }
+                    continue;
                 }
-                key = next_key(&mut keys) => {
-                    if matches!(key, child_sessions::Key::Enter | child_sessions::Key::SendNow) {
-                        output::print_status_line(shutdown::BLOCKED);
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => match quit.press() {
+                key = next_key(&mut keys) => key,
+                _ = tokio::signal::ctrl_c() => child_sessions::Key::Interrupt,
+            };
+            if let Some(step) = quit.key(key) {
+                match step {
                     shutdown::QuitStep::Confirm => output::print_status_line(shutdown::QUIT_CONFIRM),
                     shutdown::QuitStep::Quit => {
                         output::print_status_line(shutdown::EXIT_WARNING);
                         break true;
                     }
-                },
+                }
+            } else if matches!(key, child_sessions::Key::Enter | child_sessions::Key::SendNow) {
+                output::print_status_line(shutdown::BLOCKED);
             }
         };
         self.return_shutdown_notifications(notifications);

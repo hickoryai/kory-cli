@@ -58,6 +58,10 @@ router notifications arrive. Child sessions read their lifecycle from the existi
 ACP terminal exit waits and releases run outside the incoming message handler, so a
 running background command cannot block the output and kill requests needed to interrupt it.
 
+The shutdown screen handles Ctrl-C from both operating-system signals and extended
+keyboard input through the same two-press confirmation. Terminal key events must not
+leave a saved, drained session unable to exit while a protocol response is delayed.
+
 The terminal relay and prompt key listener enable newline translation on the session's
 pseudo-terminal, including when the preceding input reader left it in raw mode. Transcript
 lines therefore return to the left margin while the footer keeps accepting input.

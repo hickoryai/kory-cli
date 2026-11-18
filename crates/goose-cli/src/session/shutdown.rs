@@ -328,6 +328,12 @@ pub enum QuitStep {
 }
 
 impl QuitGuard {
+    /// Extended terminal input reports Ctrl-C as a key, not SIGINT. Both routes must
+    /// reach the same confirmation guard while the shutdown screen owns input.
+    pub fn key(&mut self, key: super::child_sessions::Key) -> Option<QuitStep> {
+        matches!(key, super::child_sessions::Key::Interrupt).then(|| self.press())
+    }
+
     pub fn press(&mut self) -> QuitStep {
         self.press_at(std::time::Instant::now())
     }
@@ -363,6 +369,20 @@ pub async fn next_notification(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shutdown_keyboard_interrupt_uses_the_same_quit_confirmation() {
+        use super::super::child_sessions::Key;
+        let mut guard = QuitGuard::default();
+        assert_eq!(guard.key(Key::Enter), None);
+        assert_eq!(guard.key(Key::Interrupt), Some(QuitStep::Confirm));
+        assert_eq!(guard.key(Key::Char('c')), None);
+        assert_eq!(guard.key(Key::SendNow), None);
+        assert_eq!(guard.key(Key::Interrupt), Some(QuitStep::Quit));
+        let mut mixed = QuitGuard::default();
+        assert_eq!(mixed.press(), QuitStep::Confirm);
+        assert_eq!(mixed.key(Key::Interrupt), Some(QuitStep::Quit));
+    }
 
     fn progress(params: Value) -> Progress {
         let mut params = params;
