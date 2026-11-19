@@ -3,7 +3,7 @@
 //! them.
 //!
 //! ```text
-//!   ● 3 claude ■ claude: a@example.com ● 2 codex ● 1 grok            ▶ claude: b@example.com
+//!   ● claude x3 ■ claude: a@example.com ● codex x2 ● grok            ▶ claude: b@example.com
 //!   ─────────────────────────────────────────────────────────────────────────────────────────
 //! ```
 //!
@@ -99,8 +99,8 @@ pub fn header_lines(accounts: &[RouterAccount], active: Option<&str>, cols: usiz
     ]
 }
 
-/// `● 3 claude ■ claude: a@example.com ● 2 codex`: per provider in the order first listed, the
-/// routable count, then each account that is not routable.
+/// `● claude x3 ■ claude: a@example.com ● grok`: per provider in the order first listed, its
+/// routable accounts (the name alone for one, ` x<n>` for several), then each one that is not.
 fn status_text(accounts: &[RouterAccount]) -> String {
     let mut providers: Vec<&str> = Vec::new();
     for account in accounts {
@@ -112,8 +112,10 @@ fn status_text(accounts: &[RouterAccount]) -> String {
     for provider in providers {
         let of: Vec<&RouterAccount> = accounts.iter().filter(|a| a.provider == provider).collect();
         let up = of.iter().filter(|a| a.available).count();
-        if up > 0 {
-            parts.push(format!("{GREEN}{UP}{DEFAULT_FG} {up} {provider}"));
+        match up {
+            0 => {}
+            1 => parts.push(format!("{GREEN}{UP}{DEFAULT_FG} {provider}")),
+            _ => parts.push(format!("{GREEN}{UP}{DEFAULT_FG} {provider} x{up}")),
         }
         for down in of.iter().filter(|a| !a.available) {
             parts.push(format!("{RED}{DOWN}{DEFAULT_FG} {provider}: {}", down.label));
@@ -150,7 +152,7 @@ mod tests {
     #[test]
     fn routable_accounts_count_per_provider_and_the_rest_are_named() {
         let text = console::strip_ansi_codes(&status_text(&fleet())).into_owned();
-        assert_eq!(text, "● 3 claude ■ claude: b@x.com ● 2 codex ● 1 grok");
+        assert_eq!(text, "● claude x3 ■ claude: b@x.com ● codex x2 ● grok");
         let colored = status_text(&fleet());
         assert!(colored.contains(&format!("{GREEN}{UP}")) && colored.contains(&format!("{RED}{DOWN}")));
     }
@@ -166,7 +168,7 @@ mod tests {
         let lines = header_lines(&fleet(), Some("claude@3"), 80);
         assert_eq!(lines.len(), 2);
         let top = console::strip_ansi_codes(&lines[0]).into_owned();
-        assert!(top.starts_with(" ● 3 claude"), "{top}");
+        assert!(top.starts_with(" ● claude x3"), "{top}");
         assert!(top.ends_with("▶ claude: d@x.com"), "{top}");
         assert_eq!(console::measure_text_width(&lines[0]), 80);
         assert!(lines[1].starts_with(WHITE));
