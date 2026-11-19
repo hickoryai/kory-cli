@@ -645,11 +645,34 @@ async fn configure_session_prompts(
     Ok(())
 }
 
+/// The agent's startup progress, on one line refreshed in place: amber while it waits, red when
+/// a provider failed to start, dim when it is done.
+fn show_startup_progress(progress: goose::acp::startup_progress::Progress) {
+    use std::io::Write;
+    let line = startup_progress_line(&progress);
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(line.as_bytes());
+    let _ = stderr.flush();
+}
+
+fn startup_progress_line(progress: &goose::acp::startup_progress::Progress) -> String {
+    use goose::acp::startup_progress::Progress;
+    const AMBER: &str = "\x1b[38;2;210;153;34m";
+    const RED: &str = "\x1b[38;2;229;72;77m";
+    const DIM: &str = "\x1b[2m";
+    match progress {
+        Progress::Waiting(text) => format!("\r\x1b[2K{AMBER}⏳ {text}\x1b[0m"),
+        Progress::Failed(text) => format!("\r\x1b[2K{RED}✗ {text}\x1b[0m\n"),
+        Progress::Done(text) => format!("\r\x1b[2K{DIM}{text}\x1b[0m\n"),
+    }
+}
+
 pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
     // The pane's relay owns the terminal from the first line, so the session header is in the
     // transcript rather than left behind on the screen the session then switches away from.
     if session_config.interactive && session_config.output_format == "text" {
         super::child_sessions::dock::begin_session();
+        goose::acp::startup_progress::set_hook(show_startup_progress);
     }
     #[cfg(feature = "telemetry")]
     goose::posthog::set_session_context("cli", session_config.resume);
@@ -931,6 +954,17 @@ fn is_provider_unavailable_error(e: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use goose::config::{set_provider_entry, ProviderEntry};
+
+    #[test]
+    fn startup_progress_rewrites_one_amber_line_then_ends_it() {
+        use goose::acp::startup_progress::Progress;
+        let waiting = startup_progress_line(&Progress::Waiting("starting: 10s…".into()));
+        assert!(waiting.starts_with("\r\x1b[2K\x1b[38;2;210;153;34m"), "{waiting:?}");
+        assert!(!waiting.ends_with('\n'), "a waiting line is refreshed in place");
+        let failed = startup_progress_line(&Progress::Failed("codex failed".into()));
+        assert!(failed.contains("\x1b[38;2;229;72;77m✗ codex failed") && failed.ends_with('\n'));
+        assert!(startup_progress_line(&Progress::Done("started".into())).ends_with('\n'));
+    }
     use goose::session::SessionManager;
     use tempfile::TempDir;
 
