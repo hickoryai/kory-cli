@@ -13,6 +13,13 @@ pub const WARN_AFTER: Duration = Duration::from_secs(10);
 pub const FAIL_AFTER: Duration = Duration::from_secs(120);
 /// How often the waiting message is refreshed.
 pub const TICK: Duration = Duration::from_secs(5);
+/// After a slow start, how long to wait past the reply for stderr to name a failed provider.
+pub const NAME_GRACE: Duration = Duration::from_millis(500);
+
+/// A failure message that names the provider(s), rather than only the elapsed time.
+pub fn names_a_provider(text: &str) -> bool {
+    text.contains(" did not finish starting within ")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
@@ -201,6 +208,18 @@ mod tests {
         };
         assert!(text.contains("codex@d16ac4a2… did not finish starting within 120s"), "{text}");
         assert!(text.contains("continuing with the providers that started"), "{text}");
+    }
+
+    #[test]
+    fn only_a_failure_naming_the_provider_replaces_a_generic_one() {
+        let generic = message("router-acp", Duration::from_secs(120), &Causes::default());
+        let named = message("router-acp", Duration::from_secs(121), &causes(&[FAILED]));
+        let (Some(Progress::Failed(generic)), Some(Progress::Failed(named))) = (generic, named)
+        else {
+            panic!("expected failures");
+        };
+        assert!(!names_a_provider(&generic), "{generic}");
+        assert!(names_a_provider(&named) && named.contains("codex@d16ac4a2…"), "{named}");
     }
 
     #[test]

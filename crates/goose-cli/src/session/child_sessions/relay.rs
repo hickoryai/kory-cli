@@ -817,6 +817,8 @@ struct View {
     transcript_rows: usize,
     /// Rows the header bar took at the last frame; mouse rows below it are counted from it.
     top: usize,
+    /// The last byte of output fed so far was a carriage return.
+    after_cr: bool,
     /// The transcript row at the top of the screen at the last frame, for mouse positions.
     view_start: usize,
     selection: Option<Selection>,
@@ -852,6 +854,7 @@ impl View {
             held_since: None,
             transcript_rows: 0,
             top: 0,
+            after_cr: false,
             view_start: 0,
             selection: None,
             clipboard: None,
@@ -897,7 +900,8 @@ impl View {
     }
 
     fn output(&mut self, bytes: &[u8]) {
-        self.log.extend_from_slice(bytes);
+        let fed = self.feed(bytes);
+        self.log.extend_from_slice(&fed);
         if self.log.len() > LOG_LIMIT {
             // Keep the newer half, from a line start.
             let cut = self.log.len() - LOG_LIMIT / 2;
@@ -907,7 +911,6 @@ impl View {
                 .map_or(cut, |offset| cut + offset + 1);
             self.log.drain(..cut);
         }
-        self.parser.process(bytes);
         self.take_marks();
         if let Some(question) = self.parser.callbacks_mut().question.take() {
             self.question = question;
@@ -915,6 +918,41 @@ impl View {
                 self.scroll_up = 0;
             }
         }
+    }
+
+    /// Feeds output to the emulator and returns what it was fed. A line feed with no carriage
+    /// return before it (written while something had the session's terminal in raw output mode,
+    /// OPOST/ONLCR off) gets one, as the terminal's own newline translation would have given it,
+    /// so the transcript never staircases. A full-screen program keeps its bare line feeds, which
+    /// may mean "down one row"; the screen is checked at each line feed, so switching to the
+    /// alternate screen partway through a chunk is honored.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() + 8);
+        let mut start = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            self.parser.process(&bytes[start..index]);
+            out.extend_from_slice(&bytes[start..index]);
+            let after_cr = match index.checked_sub(1) {
+                Some(previous) if previous >= start => bytes[previous] == b'\r',
+                _ => out.last().map_or(self.after_cr, |last| *last == b'\r'),
+            };
+            if !after_cr && !self.parser.screen().alternate_screen() {
+                self.parser.process(b"\r");
+                out.push(b'\r');
+            }
+            self.parser.process(b"\n");
+            out.push(b'\n');
+            start = index + 1;
+        }
+        self.parser.process(&bytes[start..]);
+        out.extend_from_slice(&bytes[start..]);
+        if let Some(last) = out.last() {
+            self.after_cr = *last == b'\r';
+        }
+        out
     }
 
     fn take_replies(&mut self) -> Vec<u8> {
@@ -1628,6 +1666,32 @@ mod tests {
         // A click on the bar opens nothing and starts no selection.
         let input = view.input(b"\x1b[<0;5;1M", Instant::now());
         assert!(input.activate.is_none() && view.selection.is_none());
+    }
+
+    #[test]
+    fn bare_line_feeds_return_the_carriage_so_the_transcript_never_staircases() {
+        // Written while something had the session's terminal in raw output mode (OPOST off).
+        let mut view = View::new(60, 8);
+        view.output(b"\xe2\x96\xb8 router-acp \xc2\xb7 resumed\n\xe2\x96\xb8 planner \xe2\x86\x92 opus\n");
+        // A line feed at the start of a chunk, after a chunk that ended mid-line.
+        view.output(b"tail");
+        view.output(b"\nnext\r\n");
+        let rows = screen(&view.frame(&[]), 60, 8);
+        assert_eq!(
+            &rows[..4],
+            ["▸ router-acp · resumed", "▸ planner → opus", "tail", "next"]
+        );
+        let log = String::from_utf8_lossy(&view.log).into_owned();
+        assert_eq!(log.matches("\r\n").count(), 4, "{log:?}");
+        assert!(!log.contains("\r\r\n"), "an existing CRLF is left alone: {log:?}");
+
+        // A full-screen program keeps its bare line feeds: there LF means "down one row".
+        let mut full = View::new(20, 6);
+        full.output(b"\x1b[?1049h\x1b[1;5Habc\ndef");
+        let screen = full.parser.screen();
+        let at = |col| screen.cell(1, col).map(|cell| cell.contents().to_string());
+        assert_eq!(at(7).as_deref(), Some("d"), "the bare LF kept the column");
+        assert_eq!(at(0).as_deref(), Some(""), "and did not return to the first one");
     }
 
     #[test]

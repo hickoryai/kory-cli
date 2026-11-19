@@ -662,8 +662,9 @@ fn startup_progress_line(progress: &goose::acp::startup_progress::Progress) -> S
     const DIM: &str = "\x1b[2m";
     match progress {
         Progress::Waiting(text) => format!("\r\x1b[2K{AMBER}⏳ {text}\x1b[0m"),
-        Progress::Failed(text) => format!("\r\x1b[2K{RED}✗ {text}\x1b[0m\n"),
-        Progress::Done(text) => format!("\r\x1b[2K{DIM}{text}\x1b[0m\n"),
+        // CRLF: the terminal may be in raw output mode, where a bare LF keeps its column.
+        Progress::Failed(text) => format!("\r\x1b[2K{RED}✗ {text}\x1b[0m\r\n"),
+        Progress::Done(text) => format!("\r\x1b[2K{DIM}{text}\x1b[0m\r\n"),
     }
 }
 
@@ -962,8 +963,8 @@ mod tests {
         assert!(waiting.starts_with("\r\x1b[2K\x1b[38;2;210;153;34m"), "{waiting:?}");
         assert!(!waiting.ends_with('\n'), "a waiting line is refreshed in place");
         let failed = startup_progress_line(&Progress::Failed("codex failed".into()));
-        assert!(failed.contains("\x1b[38;2;229;72;77m✗ codex failed") && failed.ends_with('\n'));
-        assert!(startup_progress_line(&Progress::Done("started".into())).ends_with('\n'));
+        assert!(failed.contains("\x1b[38;2;229;72;77m✗ codex failed") && failed.ends_with("\r\n"));
+        assert!(startup_progress_line(&Progress::Done("started".into())).ends_with("\r\n"));
     }
     use goose::session::SessionManager;
     use tempfile::TempDir;

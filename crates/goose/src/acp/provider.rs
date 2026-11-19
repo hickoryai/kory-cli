@@ -2027,11 +2027,25 @@ async fn wait_for_initialize<T>(
     progress::reset();
     let started = std::time::Instant::now();
     let mut shown = false;
-    let mut failed_shown = false;
+    // The failure shown last: a later one naming the provider replaces a generic one.
+    let mut failed: Option<String> = None;
     loop {
         tokio::select! {
             reply = &mut init_rx => {
                 if shown {
+                    // router-acp logs the provider that failed verification on stderr just
+                    // before it answers; give that line a moment to arrive and name it.
+                    let deadline = std::time::Instant::now() + progress::NAME_GRACE;
+                    while progress::snapshot().failed.is_empty() && std::time::Instant::now() < deadline {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if let Some(Progress::Failed(text)) =
+                        progress::message(agent, started.elapsed(), &progress::snapshot())
+                    {
+                        if progress::names_a_provider(&text) && failed.as_deref() != Some(text.as_str()) {
+                            progress::report(Progress::Failed(text));
+                        }
+                    }
                     progress::report(Progress::Done(format!(
                         "{agent} started after {}s",
                         started.elapsed().as_secs()
@@ -2041,12 +2055,15 @@ async fn wait_for_initialize<T>(
             }
             () = tokio::time::sleep(progress::TICK) => {
                 match progress::message(agent, started.elapsed(), &progress::snapshot()) {
-                    Some(Progress::Failed(text)) if !failed_shown => {
-                        failed_shown = true;
-                        shown = true;
-                        progress::report(Progress::Failed(text));
+                    Some(Progress::Failed(text)) if failed.as_deref() != Some(text.as_str()) => {
+                        // A generic failure is replaced only by one that names the provider.
+                        if failed.is_none() || progress::names_a_provider(&text) {
+                            shown = true;
+                            failed = Some(text.clone());
+                            progress::report(Progress::Failed(text));
+                        }
                     }
-                    Some(Progress::Waiting(text)) if !failed_shown => {
+                    Some(Progress::Waiting(text)) if failed.is_none() => {
                         shown = true;
                         progress::report(Progress::Waiting(text));
                     }
