@@ -56,6 +56,17 @@ const LEAVE: &str =
 const PILL: &str = " Jump to bottom (click) ↓ ";
 /// What can be clicked is drawn white under the pointer.
 const HOVER: &str = "\x1b[0m\x1b[97m";
+/// The header bar's and the pane's background: pure black, apart from the transcript.
+const BAR: &str = "\x1b[48;2;0;0;0m";
+
+/// `line` kept on the bar's background through its own resets, to the end of the row.
+fn on_bar(line: &str) -> String {
+    let kept = line
+        .replace("\x1b[0m", &format!("\x1b[0m{BAR}"))
+        .replace("\x1b[m", &format!("\x1b[m{BAR}"))
+        .replace("\x1b[49m", BAR);
+    format!("{BAR}{kept}{BAR}\x1b[K\x1b[0m")
+}
 /// SGR mouse button code for motion with no button held.
 const MOTION: u16 = 35;
 
@@ -119,6 +130,8 @@ struct Relay {
     real_termios: libc::termios,
     wake: [RawFd; 2],
     painter: Mutex<Option<Painter>>,
+    /// The bar pinned above the transcript (the account status), drawn on every frame.
+    header: Mutex<Option<Painter>>,
     /// A child session shown in place of the session's own transcript and pane.
     child: Mutex<Option<ChildFeed>>,
     stop: AtomicBool,
@@ -189,6 +202,14 @@ pub fn install(painter: Painter) -> bool {
 /// session's header and everything after it are in the transcript; the pane comes later.
 pub fn begin() -> bool {
     RELAY.get_or_init(start).is_some()
+}
+
+/// The bar drawn above the transcript, or none.
+pub fn set_header(header: Option<Painter>) {
+    if let Some(relay) = active() {
+        *relay.header.lock().unwrap() = header;
+        relay.wake();
+    }
 }
 
 /// The pane goes away; the transcript stays on screen.
@@ -355,6 +376,7 @@ fn start() -> Option<Arc<Relay>> {
             real_termios,
             wake,
             painter: Mutex::new(None),
+            header: Mutex::new(None),
             child: Mutex::new(None),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
@@ -612,12 +634,19 @@ impl Relay {
                 let pane = painter
                     .map(|painter| painter(size.0, size.1))
                     .unwrap_or_default();
+                let header = self
+                    .header
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .map(|header| header(size.0, size.1))
+                    .unwrap_or_default();
                 let mut out = view.forwarded();
                 match child.as_mut() {
                     Some(shown) => {
                         out.extend_from_slice(&shown.view.frame(&pane));
                     }
-                    None => out.extend_from_slice(&view.frame(&pane)),
+                    None => out.extend_from_slice(&view.frame_with(&header, &pane)),
                 }
                 write_fd(self.real_out, &out);
                 last_frame = Instant::now();
@@ -786,6 +815,8 @@ struct View {
     held_since: Option<Instant>,
     /// The transcript rows on screen at the last frame, for clicks on the pill.
     transcript_rows: usize,
+    /// Rows the header bar took at the last frame; mouse rows below it are counted from it.
+    top: usize,
     /// The transcript row at the top of the screen at the last frame, for mouse positions.
     view_start: usize,
     selection: Option<Selection>,
@@ -820,6 +851,7 @@ impl View {
             held: Vec::new(),
             held_since: None,
             transcript_rows: 0,
+            top: 0,
             view_start: 0,
             selection: None,
             clipboard: None,
@@ -1031,6 +1063,14 @@ impl View {
     }
 
     fn mouse(&mut self, (button, col, row, pressed): (u16, u16, u16, bool)) -> bool {
+        // Everything below the header bar counts its rows from the bar's bottom. On the bar a
+        // click or hover does nothing; a drag or release there acts at the first row under it.
+        let top = self.top as u16;
+        let on_bar = row < top;
+        let row = row.saturating_sub(top);
+        if on_bar && ((button == 0 && pressed) || button == MOTION) {
+            return std::mem::take(&mut self.hover).is_some();
+        }
         match button {
             64 => self.scroll(WHEEL_ROWS as isize),
             65 => self.scroll(-(WHEEL_ROWS as isize)),
@@ -1243,8 +1283,15 @@ impl View {
         out
     }
 
-    /// One frame: the transcript's rows down to the pane, the pill when scrolled up, the pane.
+    /// One frame with no header bar.
+    #[cfg(test)]
     fn frame(&mut self, pane: &[String]) -> Vec<u8> {
+        self.frame_with(&[], pane)
+    }
+
+    /// One frame: the header bar, the transcript's rows down to the pane, the pill when
+    /// scrolled up, the pane. The header and the pane sit on a black background.
+    fn frame_with(&mut self, header: &[String], pane: &[String]) -> Vec<u8> {
         let (cols, lines) = self.size();
         let mut out = b"\x1b[?2026h\x1b[?25l".to_vec();
         if self.parser.screen().alternate_screen() {
@@ -1276,6 +1323,17 @@ impl View {
                 console::truncate_str(line, cols.saturating_sub(1), "").into_owned()
             })
             .collect();
+        // The header takes the top rows only while at least one transcript row remains.
+        let top = header.len().min(lines.saturating_sub(pane.len() + 1));
+        self.top = top;
+        for (index, line) in header.iter().take(top).enumerate() {
+            out.extend(format!("\x1b[{};1H{BAR}\x1b[2K", index + 1).into_bytes());
+            out.extend(on_bar(&console::truncate_str(line, cols, "")).into_bytes());
+        }
+        // Below the header, rows are numbered as if it were not there; `place` puts them on
+        // the screen (1-based).
+        let place = |row: usize| row + top + 1;
+        let lines = lines - top;
         let rows = lines - pane.len();
         self.pane_children = children
             .into_iter()
@@ -1294,7 +1352,7 @@ impl View {
         self.view_start = view_start;
         let shown = self.rows(view_start, view_end);
         for row in 0..rows {
-            out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", row + 1).into_bytes());
+            out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", place(row)).into_bytes());
             if let Some(text) = shown.get(row) {
                 out.extend_from_slice(text);
                 out.extend_from_slice(b"\x1b[0m");
@@ -1309,7 +1367,7 @@ impl View {
                 out.extend(
                     format!(
                         "\x1b[{};{}H\x1b[0m\x1b[7m{}\x1b[0m",
-                        at - view_start + 1,
+                        place(at - view_start),
                         first + 1,
                         text.trim_end()
                     )
@@ -1324,7 +1382,7 @@ impl View {
             out.extend(
                 format!(
                     "\x1b[{};1H\x1b[0m\x1b[2K{HOVER}{}\x1b[0m",
-                    row + 1,
+                    place(row),
                     text.trim_end()
                 )
                 .into_bytes(),
@@ -1333,15 +1391,22 @@ impl View {
         if self.scroll_up > 0 && rows > 0 {
             let (start, _) = pill_columns(cols);
             out.extend(
-                format!("\x1b[{rows};{}H\x1b[0m\x1b[7m{PILL}\x1b[0m", start + 1).into_bytes(),
+                format!(
+                    "\x1b[{};{}H\x1b[0m\x1b[7m{PILL}\x1b[0m",
+                    place(rows - 1),
+                    start + 1
+                )
+                .into_bytes(),
             );
         }
         for (index, line) in pane.iter().enumerate() {
-            out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", rows + index + 1).into_bytes());
+            out.extend(format!("\x1b[{};1H{BAR}\x1b[2K", place(rows + index)).into_bytes());
             if hovered == Some(rows + index) {
-                out.extend(format!("{HOVER}{}", console::strip_ansi_codes(line)).into_bytes());
+                out.extend(
+                    on_bar(&format!("{HOVER}{}", console::strip_ansi_codes(line))).into_bytes(),
+                );
             } else {
-                out.extend_from_slice(line.as_bytes());
+                out.extend(on_bar(line).into_bytes());
             }
         }
         out.extend_from_slice(b"\x1b[0m");
@@ -1356,7 +1421,7 @@ impl View {
             out.extend(
                 format!(
                     "\x1b[{};{}H\x1b[?25h",
-                    transcript_row - view_start + 1,
+                    place(transcript_row - view_start),
                     col + 1
                 )
                 .into_bytes(),
@@ -1533,9 +1598,31 @@ mod tests {
 
         view.input(b"\x1b[<35;4;8M", Instant::now());
         let frame = String::from_utf8_lossy(&view.frame(&pane)).into_owned();
-        assert!(frame.contains(&format!("{HOVER}  child row")), "{frame:?}");
+        assert!(
+            frame.contains(&on_bar(&format!("{HOVER}  child row"))),
+            "{frame:?}"
+        );
         let input = view.input(b"\x1b[<0;4;8M", Instant::now());
         assert_eq!(input.activate, Some(Target::Child(3)));
+    }
+
+    #[test]
+    fn the_header_bar_sits_above_the_transcript_on_black_and_takes_no_clicks() {
+        let (mut view, pane) = clickable_view();
+        let header = vec!["● 2 claude".to_string(), "────".to_string()];
+        let frame = view.frame_with(&header, &pane);
+        let rows = screen(&frame, 60, 8);
+        assert_eq!(&rows[..3], ["● 2 claude", "────", "intro"]);
+        assert_eq!(rows[7], "  child row");
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        assert!(text.contains(&on_bar("● 2 claude")) && text.contains(&on_bar("── rule")));
+
+        // The tool call is now on screen row 4 (1-based): the click finds it there.
+        let input = view.input(b"\x1b[<0;5;4M\x1b[<0;5;4m", Instant::now());
+        assert_eq!(input.activate, Some(Target::ToolCall("call-1".into())));
+        // A click on the bar opens nothing and starts no selection.
+        let input = view.input(b"\x1b[<0;5;1M", Instant::now());
+        assert!(input.activate.is_none() && view.selection.is_none());
     }
 
     #[test]

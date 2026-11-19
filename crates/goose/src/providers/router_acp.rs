@@ -131,6 +131,106 @@ impl RouterStateSource {
         }
         parse_delegates(&output.stdout)
     }
+
+    /// Every account router-acp routes to, from its sanitized `account-status` reader (labels,
+    /// providers and availability only; it never prints a credential).
+    pub async fn accounts(&self, timeout: Duration) -> Result<Vec<RouterAccount>> {
+        parse_accounts(&self.run(&["account-status"], &[], timeout).await?)
+    }
+
+    /// The account (router agent, e.g. `claude@<id>`) a router session is routed to now.
+    pub async fn session_agent(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<String>> {
+        let output = self
+            .run(&["state-query"], &["v1", "session", "--session", session_id], timeout)
+            .await?;
+        parse_session_agent(&output)
+    }
+
+    /// `router-acp <command> --config <config> <rest>`, its stdout when it succeeds.
+    async fn run(&self, command_args: &[&str], rest: &[&str], timeout: Duration) -> Result<Vec<u8>> {
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
+            .args(command_args)
+            .arg("--config")
+            .arg(&self.config)
+            .args(rest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        crate::subprocess::configure_subprocess(&mut command);
+        let name = command_args.first().copied().unwrap_or("command");
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("router-acp {name} timed out"))??;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let reason = stderr.trim().lines().last().unwrap_or("no error output");
+            anyhow::bail!("router-acp {name} failed: {reason}");
+        }
+        Ok(output.stdout)
+    }
+}
+
+/// One account from `router-acp account-status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterAccount {
+    /// The router agent name, e.g. `claude@<id>`.
+    pub id: String,
+    pub provider: String,
+    /// The account's sign-in label (its email), or its id when it has none.
+    pub label: String,
+    /// The router would route to it now (signed in, not at a limit or cordoned).
+    pub available: bool,
+}
+
+pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
+    #[derive(Deserialize)]
+    struct Status {
+        accounts: Vec<Account>,
+    }
+    #[derive(Deserialize)]
+    struct Account {
+        id: String,
+        provider: Option<String>,
+        label: Option<String>,
+        routing: Option<Routing>,
+    }
+    #[derive(Deserialize)]
+    struct Routing {
+        available: Option<bool>,
+    }
+    let status: Status = serde_json::from_slice(json)?;
+    Ok(status
+        .accounts
+        .into_iter()
+        .map(|account| RouterAccount {
+            provider: account.provider.unwrap_or_else(|| {
+                account.id.split('@').next().unwrap_or_default().to_string()
+            }),
+            label: account
+                .label
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| account.id.clone()),
+            available: account.routing.and_then(|r| r.available).unwrap_or(false),
+            id: account.id,
+        })
+        .collect())
+}
+
+pub fn parse_session_agent(json: &[u8]) -> Result<Option<String>> {
+    let value: serde_json::Value = serde_json::from_slice(json)?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        anyhow::bail!("unexpected router-acp state-query session reply");
+    }
+    Ok(value
+        .pointer("/data/session/agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -333,6 +433,30 @@ impl ProviderDef for RouterAcpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_status_reads_provider_label_and_availability() {
+        let reply = br#"{"revision":"r","accounts":[
+            {"id":"claude@a","provider":"claude","label":"a@example.com","authState":"authenticated","routing":{"available":true,"reason":null}},
+            {"id":"claude@b","provider":"claude","label":"b@example.com","authState":"rejected","routing":{"available":false,"reason":"authentication"}},
+            {"id":"grok@c","label":"","routing":null}]}"#;
+        let accounts = parse_accounts(reply).unwrap();
+        assert_eq!(accounts.len(), 3);
+        assert!(accounts[0].available && accounts[0].label == "a@example.com");
+        assert!(!accounts[1].available);
+        assert_eq!(
+            (accounts[2].provider.as_str(), accounts[2].label.as_str(), accounts[2].available),
+            ("grok", "grok@c", false),
+            "a missing provider, label or routing falls back without guessing it routable"
+        );
+    }
+
+    #[test]
+    fn session_agent_comes_from_a_v1_session_envelope() {
+        let reply = br#"{"version":1,"command":"session","data":{"session":{"agent":"claude@a","model":"opus"}}}"#;
+        assert_eq!(parse_session_agent(reply).unwrap().as_deref(), Some("claude@a"));
+        assert!(parse_session_agent(br#"{"version":2}"#).is_err());
+    }
 
     #[test]
     fn delegates_reply_is_read_only_from_a_v1_delegates_envelope() {

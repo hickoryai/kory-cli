@@ -164,6 +164,8 @@ struct Shared {
 pub struct Dock {
     shared: Arc<Shared>,
     _task: AbortOnDropHandle<()>,
+    /// The account bar above the transcript, for a router session.
+    _accounts: Option<super::accounts::AccountBar>,
 }
 
 /// Where the pane's children come from: goose's own subagents and router-acp's delegates.
@@ -200,6 +202,9 @@ impl Dock {
             return None;
         }
         write_raw("\x1b[?2004h");
+        let accounts = sources.router.clone().map(|(source, session_id)| {
+            super::accounts::AccountBar::start(source, session_id)
+        });
         *ACTIVE.get_or_init(Mutex::default).lock().unwrap() = Arc::downgrade(&shared);
         let painter = shared.clone();
         let ticking = Arc::downgrade(&shared);
@@ -246,6 +251,7 @@ impl Dock {
         Some(Self {
             shared,
             _task: AbortOnDropHandle::new(task),
+            _accounts: accounts,
         })
     }
 
