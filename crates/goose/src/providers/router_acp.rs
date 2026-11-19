@@ -187,16 +187,22 @@ pub struct RouterAccount {
     pub state: AccountState,
 }
 
-/// Whether the router can use an account now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Whether an account is signed in, and whether the router can use it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountState {
     /// Signed in and routable.
     Available,
-    /// Signed in, but held back (a usage limit, a reserve, a cordon) until `resets_at`
-    /// (RFC 3339) when the router knows it.
-    Limited { resets_at: Option<String> },
-    /// Its sign-in is missing or was rejected; it needs `/login`.
+    /// Signed in (`authState` "authenticated"), but the router is not routing to it now: a
+    /// usage limit, a reserve or a cordon.
+    Paused,
+    /// Its sign-in is missing or was rejected (`authState` anything but "authenticated").
     SignedOut,
+}
+
+impl AccountState {
+    pub fn signed_in(self) -> bool {
+        self != AccountState::SignedOut
+    }
 }
 
 pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
@@ -214,31 +220,21 @@ pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
         routing: Option<Routing>,
     }
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct Routing {
         available: Option<bool>,
-        reason: Option<String>,
-        resets_at: Option<String>,
     }
     let status: Status = serde_json::from_slice(json)?;
     Ok(status
         .accounts
         .into_iter()
         .map(|account| {
-            let routing = account.routing.unwrap_or(Routing {
-                available: None,
-                reason: None,
-                resets_at: None,
-            });
-            let signed_in = account.auth_state.as_deref() == Some("authenticated");
-            let state = if routing.reason.as_deref() == Some("authentication") || !signed_in {
+            // Signed in is exactly authState "authenticated", whatever routing says.
+            let state = if account.auth_state.as_deref() != Some("authenticated") {
                 AccountState::SignedOut
-            } else if routing.available == Some(true) {
+            } else if account.routing.and_then(|r| r.available) == Some(true) {
                 AccountState::Available
             } else {
-                AccountState::Limited {
-                    resets_at: routing.resets_at,
-                }
+                AccountState::Paused
             };
             RouterAccount {
                 provider: account.provider.unwrap_or_else(|| {
@@ -468,7 +464,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn account_status_reads_available_limited_and_signed_out_accounts() {
+    fn account_status_signed_in_is_exactly_authenticated() {
         // The shape `router-acp account-status` printed on 2026-11-19 (labels replaced).
         let reply = br#"{"revision":"r","accounts":[
             {"id":"claude@a","provider":"claude","label":"a@example.com","plan":"Personal Max","authState":"authenticated","credentialPresent":true,"priority":1,"routing":{"available":true,"reason":null,"resetsAt":null}},
@@ -481,16 +477,15 @@ mod tests {
         assert_eq!(accounts[0].label, "a@example.com");
         assert_eq!(
             accounts[1].state,
-            AccountState::Limited {
-                resets_at: Some("2026-11-25T04:00:00.377938+00:00".into())
-            },
-            "signed in but at a limit is limited, never signed out"
+            AccountState::Paused,
+            "authenticated but at a limit is still signed in"
         );
+        assert!(accounts[1].state.signed_in());
         assert_eq!(accounts[2].state, AccountState::SignedOut);
         assert_eq!(
-            (accounts[3].provider.as_str(), accounts[3].label.as_str(), &accounts[3].state),
-            ("grok", "grok@c", &AccountState::SignedOut),
-            "a missing provider, label or sign-in falls back without guessing it routable"
+            (accounts[3].provider.as_str(), accounts[3].label.as_str(), accounts[3].state),
+            ("grok", "grok@c", AccountState::SignedOut),
+            "a missing provider, label or sign-in falls back without guessing it signed in"
         );
     }
 
