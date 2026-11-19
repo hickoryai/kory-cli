@@ -56,16 +56,80 @@ const LEAVE: &str =
 const PILL: &str = " Jump to bottom (click) ↓ ";
 /// What can be clicked is drawn white under the pointer.
 const HOVER: &str = "\x1b[0m\x1b[97m";
-/// The header bar's and the pane's background: pure black, apart from the transcript.
+/// The whole screen's background (header, transcript, input and pane): pure black, whatever
+/// the terminal's own theme background is.
 const BAR: &str = "\x1b[48;2;0;0;0m";
 
-/// `line` kept on the bar's background through its own resets, to the end of the row.
+/// `line` kept on black through its own resets, to the end of the row.
 fn on_bar(line: &str) -> String {
-    let kept = line
-        .replace("\x1b[0m", &format!("\x1b[0m{BAR}"))
-        .replace("\x1b[m", &format!("\x1b[m{BAR}"))
-        .replace("\x1b[49m", BAR);
-    format!("{BAR}{kept}{BAR}\x1b[K\x1b[0m")
+    String::from_utf8_lossy(&on_black(line.as_bytes())).into_owned()
+}
+
+/// `row` (terminal bytes) on black: black first, black again after every SGR that resets the
+/// background to the terminal's default (`0`, an empty SGR, `49`) without setting another, and
+/// the rest of the row erased in black. A background the row sets itself is kept.
+fn on_black(row: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(row.len() + 32);
+    out.extend_from_slice(BAR.as_bytes());
+    let mut i = 0;
+    while i < row.len() {
+        if row[i] == 0x1b && row.get(i + 1) == Some(&b'[') {
+            let body_start = i + 2;
+            let mut end = body_start;
+            while end < row.len() && !(0x40..=0x7e).contains(&row[end]) {
+                end += 1;
+            }
+            if end >= row.len() {
+                out.extend_from_slice(&row[i..]);
+                break;
+            }
+            out.extend_from_slice(&row[i..=end]);
+            if row[end] == b'm' && sgr_resets_background(&row[body_start..end]) {
+                out.extend_from_slice(BAR.as_bytes());
+            }
+            i = end + 1;
+        } else {
+            out.push(row[i]);
+            i += 1;
+        }
+    }
+    out.extend_from_slice(BAR.as_bytes());
+    out.extend_from_slice(b"\x1b[K\x1b[0m");
+    out
+}
+
+/// Whether an SGR's parameters leave the background at the terminal default: a reset (`0` or
+/// none) or `49` not followed by an explicit background. The arguments of 38/48/58 color
+/// selectors (`38;5;0`, `48;2;r;g;b`) are skipped, so a palette index 0 is not a reset.
+fn sgr_resets_background(params: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(params);
+    if text.is_empty() {
+        return true;
+    }
+    let fields: Vec<&str> = text.split(';').collect();
+    let mut default_bg = false;
+    let mut i = 0;
+    while i < fields.len() {
+        // A colon sub-parameter form (`38:2::r:g:b`) carries its arguments in one field.
+        let head = fields[i].split(':').next().unwrap_or("");
+        let colon_form = fields[i].contains(':');
+        match head.parse::<u16>() {
+            Err(_) if head.is_empty() => default_bg = true,
+            Ok(0 | 49) => default_bg = true,
+            // An explicit background: 48 (indexed or true color), 40–47, 100–107.
+            Ok(48 | 40..=47 | 100..=107) => default_bg = false,
+            _ => {}
+        }
+        if matches!(head, "38" | "48" | "58") && !colon_form {
+            i += match fields.get(i + 1).copied() {
+                Some("5") => 2,
+                Some("2") => 4,
+                _ => 0,
+            };
+        }
+        i += 1;
+    }
+    default_bg
 }
 /// SGR mouse button code for motion with no button held.
 const MOTION: u16 = 35;
@@ -1328,7 +1392,7 @@ impl View {
     }
 
     /// One frame: the header bar, the transcript's rows down to the pane, the pill when
-    /// scrolled up, the pane. The header and the pane sit on a black background.
+    /// scrolled up, the pane. Every row is drawn on black.
     fn frame_with(&mut self, header: &[String], pane: &[String]) -> Vec<u8> {
         let (cols, lines) = self.size();
         let mut out = b"\x1b[?2026h\x1b[?25l".to_vec();
@@ -1337,8 +1401,8 @@ impl View {
             self.top = 0;
             let screen = self.parser.screen();
             for (row, text) in screen.rows_formatted(0, cols as u16).enumerate() {
-                out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", row + 1).into_bytes());
-                out.extend_from_slice(&text);
+                out.extend(format!("\x1b[{};1H\x1b[0m{BAR}\x1b[2K", row + 1).into_bytes());
+                out.extend_from_slice(&on_black(&text));
             }
             let (row, col) = screen.cursor_position();
             out.extend(format!("\x1b[0m\x1b[{};{}H", row + 1, col + 1).into_bytes());
@@ -1395,11 +1459,9 @@ impl View {
         self.view_start = view_start;
         let shown = self.rows(view_start, view_end);
         for row in 0..rows {
-            out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", place(row)).into_bytes());
-            if let Some(text) = shown.get(row) {
-                out.extend_from_slice(text);
-                out.extend_from_slice(b"\x1b[0m");
-            }
+            out.extend(format!("\x1b[{};1H\x1b[0m{BAR}\x1b[2K", place(row)).into_bytes());
+            let text = shown.get(row).map_or(&[][..], Vec::as_slice);
+            out.extend_from_slice(&on_black(text));
         }
         if let Some(selection) = self.selection {
             for at in view_start..view_end {
@@ -1409,7 +1471,7 @@ impl View {
                 let (text, _) = self.row_text(at, first, width);
                 out.extend(
                     format!(
-                        "\x1b[{};{}H\x1b[0m\x1b[7m{}\x1b[0m",
+                        "\x1b[{};{}H\x1b[0m{BAR}\x1b[7m{}\x1b[0m",
                         place(at - view_start),
                         first + 1,
                         text.trim_end()
@@ -1422,14 +1484,8 @@ impl View {
         let hovered = self.hovered().map(|(row, _)| row);
         if let Some(row) = hovered.filter(|row| *row < rows) {
             let (text, _) = self.row_text(view_start + row, 0, cols);
-            out.extend(
-                format!(
-                    "\x1b[{};1H\x1b[0m\x1b[2K{HOVER}{}\x1b[0m",
-                    place(row),
-                    text.trim_end()
-                )
-                .into_bytes(),
-            );
+            out.extend(format!("\x1b[{};1H\x1b[0m{BAR}\x1b[2K", place(row)).into_bytes());
+            out.extend(on_bar(&format!("{HOVER}{}", text.trim_end())).into_bytes());
         }
         if self.scroll_up > 0 && rows > 0 {
             let (start, _) = pill_columns(cols);
@@ -1623,7 +1679,7 @@ mod tests {
         assert!(input.scrolled && input.forward.is_empty());
         let frame = String::from_utf8_lossy(&view.frame(&pane)).into_owned();
         assert!(
-            frame.contains(&format!("{HOVER}  ▸ Read file")),
+            frame.contains(&on_bar(&format!("{HOVER}  ▸ Read file"))),
             "{frame:?}"
         );
 
@@ -1666,6 +1722,40 @@ mod tests {
         // A click on the bar opens nothing and starts no selection.
         let input = view.input(b"\x1b[<0;5;1M", Instant::now());
         assert!(input.activate.is_none() && view.selection.is_none());
+    }
+
+    #[test]
+    fn a_row_stays_black_through_every_reset_but_keeps_its_own_backgrounds() {
+        let row = b"a\x1b[0mb\x1b[mc\x1b[49md\x1b[1;38;5;0me\x1b[48;5;4mf\x1b[0;48;2;1;2;3mg\x1b[0;31mh";
+        let out = String::from_utf8_lossy(&on_black(row)).into_owned();
+        assert!(out.starts_with(BAR) && out.ends_with(&format!("{BAR}\x1b[K\x1b[0m")), "{out:?}");
+        // Black again after each reset of the background.
+        assert!(out.contains(&format!("\x1b[0m{BAR}b")), "{out:?}");
+        assert!(out.contains(&format!("\x1b[m{BAR}c")), "{out:?}");
+        assert!(out.contains(&format!("\x1b[49m{BAR}d")), "{out:?}");
+        assert!(out.contains(&format!("\x1b[0;31m{BAR}h")), "{out:?}");
+        // Not after a foreground palette index 0, nor over a background the row sets itself.
+        assert!(out.contains("\x1b[1;38;5;0me"), "{out:?}");
+        assert!(out.contains("\x1b[48;5;4mf"), "{out:?}");
+        assert!(out.contains("\x1b[0;48;2;1;2;3mg"), "{out:?}");
+    }
+
+    #[test]
+    fn the_whole_screen_is_drawn_on_black() {
+        let (mut view, pane) = clickable_view();
+        let header = vec!["● claude".to_string(), "────".to_string()];
+        let frame = String::from_utf8_lossy(&view.frame_with(&header, &pane)).into_owned();
+        // Every row the frame positions (header, transcript, pane) is cleared in black, and the
+        // transcript's own resets cannot bring back the terminal's background.
+        for row in 1..=8 {
+            let clear = format!("\x1b[{row};1H");
+            let at = frame.find(&clear).unwrap_or_else(|| panic!("row {row} not drawn"));
+            let next = &frame[at + clear.len()..];
+            assert!(
+                next.starts_with(&format!("{BAR}\x1b[2K")) || next.starts_with(&format!("\x1b[0m{BAR}\x1b[2K")),
+                "row {row}: {next:?}"
+            );
+        }
     }
 
     #[test]
