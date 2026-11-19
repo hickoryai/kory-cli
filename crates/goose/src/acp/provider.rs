@@ -616,7 +616,7 @@ impl AcpProvider {
             thread: Some(loop_thread),
         };
 
-        let _init_response = init_rx
+        let _init_response = wait_for_initialize(&name, init_rx)
             .await
             .context("ACP client initialization cancelled")??;
 
@@ -2017,12 +2017,54 @@ async fn forward_child_stderr(mut stderr: tokio::process::ChildStderr) {
     emit_stderr_line(&mut line);
 }
 
+/// The agent's `initialize` reply, reporting progress while it takes long. It waits exactly
+/// as long as before: the ticks only report, they never time the wait out.
+async fn wait_for_initialize<T>(
+    agent: &str,
+    mut init_rx: oneshot::Receiver<T>,
+) -> std::result::Result<T, oneshot::error::RecvError> {
+    use super::startup_progress::{self as progress, Progress};
+    progress::reset();
+    let started = std::time::Instant::now();
+    let mut shown = false;
+    let mut failed_shown = false;
+    loop {
+        tokio::select! {
+            reply = &mut init_rx => {
+                if shown {
+                    progress::report(Progress::Done(format!(
+                        "{agent} started after {}s",
+                        started.elapsed().as_secs()
+                    )));
+                }
+                return reply;
+            }
+            () = tokio::time::sleep(progress::TICK) => {
+                match progress::message(agent, started.elapsed(), &progress::snapshot()) {
+                    Some(Progress::Failed(text)) if !failed_shown => {
+                        failed_shown = true;
+                        shown = true;
+                        progress::report(Progress::Failed(text));
+                    }
+                    Some(Progress::Waiting(text)) if !failed_shown => {
+                        shown = true;
+                        progress::report(Progress::Waiting(text));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 fn emit_stderr_line(line: &mut Vec<u8>) {
     if line.is_empty() {
         return;
     }
     let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
-    tracing::info!(target: "goose::acp::child::stderr", "{}", String::from_utf8_lossy(trimmed));
+    let text = String::from_utf8_lossy(trimmed);
+    super::startup_progress::observe_stderr(&text);
+    tracing::info!(target: "goose::acp::child::stderr", "{}", text);
     line.clear();
 }
 
