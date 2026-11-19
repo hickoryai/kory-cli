@@ -184,8 +184,19 @@ pub struct RouterAccount {
     pub provider: String,
     /// The account's sign-in label (its email), or its id when it has none.
     pub label: String,
-    /// The router would route to it now (signed in, not at a limit or cordoned).
-    pub available: bool,
+    pub state: AccountState,
+}
+
+/// Whether the router can use an account now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountState {
+    /// Signed in and routable.
+    Available,
+    /// Signed in, but held back (a usage limit, a reserve, a cordon) until `resets_at`
+    /// (RFC 3339) when the router knows it.
+    Limited { resets_at: Option<String> },
+    /// Its sign-in is missing or was rejected; it needs `/login`.
+    SignedOut,
 }
 
 pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
@@ -194,30 +205,52 @@ pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
         accounts: Vec<Account>,
     }
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Account {
         id: String,
         provider: Option<String>,
         label: Option<String>,
+        auth_state: Option<String>,
         routing: Option<Routing>,
     }
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Routing {
         available: Option<bool>,
+        reason: Option<String>,
+        resets_at: Option<String>,
     }
     let status: Status = serde_json::from_slice(json)?;
     Ok(status
         .accounts
         .into_iter()
-        .map(|account| RouterAccount {
-            provider: account.provider.unwrap_or_else(|| {
-                account.id.split('@').next().unwrap_or_default().to_string()
-            }),
-            label: account
-                .label
-                .filter(|label| !label.is_empty())
-                .unwrap_or_else(|| account.id.clone()),
-            available: account.routing.and_then(|r| r.available).unwrap_or(false),
-            id: account.id,
+        .map(|account| {
+            let routing = account.routing.unwrap_or(Routing {
+                available: None,
+                reason: None,
+                resets_at: None,
+            });
+            let signed_in = account.auth_state.as_deref() == Some("authenticated");
+            let state = if routing.reason.as_deref() == Some("authentication") || !signed_in {
+                AccountState::SignedOut
+            } else if routing.available == Some(true) {
+                AccountState::Available
+            } else {
+                AccountState::Limited {
+                    resets_at: routing.resets_at,
+                }
+            };
+            RouterAccount {
+                provider: account.provider.unwrap_or_else(|| {
+                    account.id.split('@').next().unwrap_or_default().to_string()
+                }),
+                label: account
+                    .label
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| account.id.clone()),
+                state,
+                id: account.id,
+            }
         })
         .collect())
 }
@@ -435,25 +468,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn account_status_reads_provider_label_and_availability() {
+    fn account_status_reads_available_limited_and_signed_out_accounts() {
+        // The shape `router-acp account-status` printed on 2026-11-19 (labels replaced).
         let reply = br#"{"revision":"r","accounts":[
-            {"id":"claude@a","provider":"claude","label":"a@example.com","authState":"authenticated","routing":{"available":true,"reason":null}},
-            {"id":"claude@b","provider":"claude","label":"b@example.com","authState":"rejected","routing":{"available":false,"reason":"authentication"}},
+            {"id":"claude@a","provider":"claude","label":"a@example.com","plan":"Personal Max","authState":"authenticated","credentialPresent":true,"priority":1,"routing":{"available":true,"reason":null,"resetsAt":null}},
+            {"id":"claude@w","provider":"claude","label":"w@example.com","authState":"authenticated","routing":{"available":false,"reason":"capacity","resetsAt":"2026-11-25T04:00:00.377938+00:00"}},
+            {"id":"claude@b","provider":"claude","label":"b@example.com","authState":"rejected","routing":{"available":false,"reason":"authentication","resetsAt":null}},
             {"id":"grok@c","label":"","routing":null}]}"#;
         let accounts = parse_accounts(reply).unwrap();
-        assert_eq!(accounts.len(), 3);
-        assert!(accounts[0].available && accounts[0].label == "a@example.com");
-        assert!(!accounts[1].available);
+        assert_eq!(accounts.len(), 4);
+        assert_eq!(accounts[0].state, AccountState::Available);
+        assert_eq!(accounts[0].label, "a@example.com");
         assert_eq!(
-            (accounts[2].provider.as_str(), accounts[2].label.as_str(), accounts[2].available),
-            ("grok", "grok@c", false),
-            "a missing provider, label or routing falls back without guessing it routable"
+            accounts[1].state,
+            AccountState::Limited {
+                resets_at: Some("2026-11-25T04:00:00.377938+00:00".into())
+            },
+            "signed in but at a limit is limited, never signed out"
+        );
+        assert_eq!(accounts[2].state, AccountState::SignedOut);
+        assert_eq!(
+            (accounts[3].provider.as_str(), accounts[3].label.as_str(), &accounts[3].state),
+            ("grok", "grok@c", &AccountState::SignedOut),
+            "a missing provider, label or sign-in falls back without guessing it routable"
         );
     }
 
     #[test]
     fn session_agent_comes_from_a_v1_session_envelope() {
-        let reply = br#"{"version":1,"command":"session","data":{"session":{"agent":"claude@a","model":"opus"}}}"#;
+        // The shape `router-acp state-query v1 session --session <id>` printed for a live
+        // planner parent on 2026-11-19 (trimmed).
+        let reply = br#"{"version":1,"command":"session","data":{"session":{"router_session_id":"rtr-1","agent":"claude@a","model":"claude-opus-5-5","routing":{"candidate":"claude@a/claude-opus-5-5"}}}}"#;
         assert_eq!(parse_session_agent(reply).unwrap().as_deref(), Some("claude@a"));
         assert!(parse_session_agent(br#"{"version":2}"#).is_err());
     }

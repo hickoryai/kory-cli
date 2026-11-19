@@ -1295,7 +1295,8 @@ impl View {
         let (cols, lines) = self.size();
         let mut out = b"\x1b[?2026h\x1b[?25l".to_vec();
         if self.parser.screen().alternate_screen() {
-            // A full-screen program: its screen as is.
+            // A full-screen program: its screen as is, with no header over it.
+            self.top = 0;
             let screen = self.parser.screen();
             for (row, text) in screen.rows_formatted(0, cols as u16).enumerate() {
                 out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", row + 1).into_bytes());
@@ -1327,8 +1328,12 @@ impl View {
         let top = header.len().min(lines.saturating_sub(pane.len() + 1));
         self.top = top;
         for (index, line) in header.iter().take(top).enumerate() {
+            // Like the pane's rows, never into the last column: a row written there leaves the
+            // terminal waiting to wrap, and some wrap at once and carry the rest onto the next row.
             out.extend(format!("\x1b[{};1H{BAR}\x1b[2K", index + 1).into_bytes());
-            out.extend(on_bar(&console::truncate_str(line, cols, "")).into_bytes());
+            out.extend(
+                on_bar(&console::truncate_str(line, cols.saturating_sub(1), "")).into_bytes(),
+            );
         }
         // Below the header, rows are numbered as if it were not there; `place` puts them on
         // the screen (1-based).
@@ -1623,6 +1628,31 @@ mod tests {
         // A click on the bar opens nothing and starts no selection.
         let input = view.input(b"\x1b[<0;5;1M", Instant::now());
         assert!(input.activate.is_none() && view.selection.is_none());
+    }
+
+    #[test]
+    fn the_transcript_starts_exactly_the_header_height_down_and_keeps_its_rows() {
+        let banner: String = (0..30).map(|i| format!("  ▄▀ banner {i}\r\n")).collect();
+        let mut plain = View::new(60, 12);
+        plain.output(banner.as_bytes());
+        let mut headed = View::new(60, 12);
+        headed.output(banner.as_bytes());
+        // Full-width header rows, as an account bar on a narrow terminal could produce.
+        let header = vec!["●".repeat(60), "─".repeat(60)];
+        let without = screen(&plain.frame(&pane()), 60, 12);
+        let frame = headed.frame_with(&header, &pane());
+        let with = screen(&frame, 60, 12);
+        assert_eq!(headed.top, header.len(), "the transcript's top offset is the header height");
+        // The transcript is bottom-aligned in both: below the header the rows are the same.
+        assert_eq!(&with[2..10], &without[2..10]);
+        assert_eq!(&with[10..], &without[10..], "the pane stays at the bottom");
+        // Neither header row is drawn into the last column, so nothing wraps.
+        assert_eq!(with[0].chars().count(), 59);
+        assert_eq!(with[1].chars().count(), 59);
+        // A full-screen program draws over the whole screen with no offset.
+        headed.output(b"\x1b[?1049h");
+        headed.frame_with(&header, &pane());
+        assert_eq!(headed.top, 0);
     }
 
     #[test]
