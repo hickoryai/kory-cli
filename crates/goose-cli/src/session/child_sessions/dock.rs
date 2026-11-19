@@ -1326,6 +1326,7 @@ mod tests {
                 }),
             }),
             _task: AbortOnDropHandle::new(tokio::spawn(async {})),
+            _accounts: None,
         }
     }
 
