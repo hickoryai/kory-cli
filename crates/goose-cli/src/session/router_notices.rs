@@ -13,6 +13,27 @@ pub enum Segment {
 
 const PREFIX: &str = "router-acp ·";
 
+/// Completed context/model transitions get a visible transcript boundary. A
+/// preparation, deferral or quota warning alone has not changed the context.
+pub fn context_boundary(notice: &str) -> Option<String> {
+    let headline = notice.lines().next()?.strip_prefix(PREFIX)?.trim_start();
+    if headline.starts_with("parent context refreshed") {
+        Some(format!("CONTEXT HANDOFF · {}", plain(headline)))
+    } else if headline.starts_with("failover:") {
+        Some(format!(
+            "AUTOMATIC MODEL FAILOVER · {}",
+            summary(notice).trim_start_matches(PREFIX).trim()
+        ))
+    } else if headline.starts_with("switched ") {
+        Some(format!(
+            "MODEL HANDOFF · {}",
+            summary(notice).trim_start_matches(PREFIX).trim()
+        ))
+    } else {
+        None
+    }
+}
+
 /// The notice text of a quoted line that starts a notice, if it does.
 fn notice_start(line: &str) -> Option<&str> {
     let quoted = line.strip_prefix('>')?.trim_start();
