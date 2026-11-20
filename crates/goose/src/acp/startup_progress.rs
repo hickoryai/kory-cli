@@ -2,8 +2,8 @@
 //! until every provider adapter it starts has been probed (up to its `probe_timeout_ms`, two
 //! minutes by default), and a slow adapter used to leave the session on a blank screen for that
 //! whole time. After [`WARN_AFTER`] the session is told it is still starting, and why when the
-//! agent's stderr names a cause; at [`FAIL_AFTER`] the providers that failed verification are
-//! named. The wait itself is unchanged: nothing here holds startup longer.
+//! agent's stderr names a cause. Failed verification is reported when observed; elapsed time
+//! alone does not establish that an adapter failed.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -18,17 +18,16 @@ pub const NAME_GRACE: Duration = Duration::from_millis(500);
 
 /// A failure message that names the provider(s), rather than only the elapsed time.
 pub fn names_a_provider(text: &str) -> bool {
-    text.contains(" did not finish starting within ")
+    text.contains(" failed verification;")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
     /// Still waiting: one line, refreshed in place.
     Waiting(String),
-    /// Past the probe timeout: these providers failed verification; the agent carries on with
-    /// the ones that started.
+    /// Verification failed, initialization failed, or startup is taking unusually long.
     Failed(String),
-    /// `initialize` answered after a waiting message was shown.
+    /// `initialize` succeeded after a waiting message was shown.
     Done(String),
 }
 
@@ -60,6 +59,21 @@ pub(crate) fn snapshot() -> Causes {
 /// A new wait starts with no causes from an earlier agent.
 pub(crate) fn reset() {
     *CAUSES.lock().unwrap() = Causes::new();
+}
+
+pub(crate) fn completion<T, E>(
+    agent: &str,
+    elapsed: Duration,
+    reply: &Result<Result<T, E>, tokio::sync::oneshot::error::RecvError>,
+) -> Progress {
+    let seconds = elapsed.as_secs();
+    match reply {
+        Ok(Ok(_)) => Progress::Done(format!("{agent} started after {seconds}s")),
+        Ok(Err(_)) => Progress::Failed(format!("{agent} initialization failed after {seconds}s")),
+        Err(_) => Progress::Failed(format!(
+            "{agent} initialization was cancelled after {seconds}s"
+        )),
+    }
 }
 
 /// What the agent's stderr said about its provider adapters.
@@ -103,9 +117,8 @@ pub fn message(agent: &str, elapsed: Duration, causes: &Causes) -> Option<Progre
     let seconds = elapsed.as_secs();
     if !causes.failed.is_empty() {
         return Some(Progress::Failed(format!(
-            "{agent}: {} did not finish starting within {}s; continuing with the providers that started",
-            names(&causes.failed),
-            FAIL_AFTER.as_secs()
+            "{agent}: {} failed verification; waiting for initialization to finish",
+            names(&causes.failed)
         )));
     }
     if elapsed >= FAIL_AFTER {
@@ -218,19 +231,13 @@ mod tests {
     fn a_failed_verification_is_named_as_an_error() {
         let Some(Progress::Failed(text)) = message(
             "router-acp",
-            Duration::from_secs(121),
+            Duration::from_secs(30),
             &causes(&[STARTED, FAILED]),
         ) else {
             panic!("expected a failure");
         };
-        assert!(
-            text.contains("codex@d16ac4a2… did not finish starting within 120s"),
-            "{text}"
-        );
-        assert!(
-            text.contains("continuing with the providers that started"),
-            "{text}"
-        );
+        assert!(text.contains("codex@d16ac4a2…"), "{text}");
+        assert!(!text.contains("120"), "no timeout was observed: {text}");
     }
 
     #[test]
@@ -256,5 +263,24 @@ mod tests {
             panic!("expected a failure");
         };
         assert!(text.contains("after 130s"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn initialization_reports_success_only_for_a_successful_reply() {
+        for result in [Some(Ok(())), Some(Err("initialize rejected")), None] {
+            let succeeded = matches!(result, Some(Ok(())));
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            if let Some(result) = result {
+                sender.send(result).unwrap();
+            } else {
+                drop(sender);
+            }
+            let reply = receiver.await;
+            let progress = completion("router-acp", Duration::from_secs(130), &reply);
+            assert_eq!(matches!(progress, Progress::Done(_)), succeeded);
+            if !succeeded {
+                assert!(matches!(progress, Progress::Failed(_)));
+            }
+        }
     }
 }

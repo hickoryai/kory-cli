@@ -649,19 +649,24 @@ async fn configure_session_prompts(
 /// a provider failed to start, dim when it is done.
 fn show_startup_progress(progress: goose::acp::startup_progress::Progress) {
     use std::io::Write;
-    let line = startup_progress_line(&progress);
+    let cols = console::Term::stderr().size().1 as usize;
+    let line = startup_progress_line(&progress, cols);
     let mut stderr = std::io::stderr().lock();
     let _ = stderr.write_all(line.as_bytes());
     let _ = stderr.flush();
 }
 
-fn startup_progress_line(progress: &goose::acp::startup_progress::Progress) -> String {
+fn startup_progress_line(progress: &goose::acp::startup_progress::Progress, cols: usize) -> String {
     use goose::acp::startup_progress::Progress;
     const AMBER: &str = "\x1b[38;2;210;153;34m";
     const RED: &str = "\x1b[38;2;229;72;77m";
     const DIM: &str = "\x1b[2m";
     match progress {
-        Progress::Waiting(text) => format!("\r\x1b[2K{AMBER}⏳ {text}\x1b[0m"),
+        Progress::Waiting(text) => {
+            let text = format!("⏳ {text}");
+            let text = console::truncate_str(&text, cols.saturating_sub(1), "");
+            format!("\r\x1b[2K{AMBER}{text}\x1b[0m")
+        }
         // CRLF: the terminal may be in raw output mode, where a bare LF keeps its column.
         Progress::Failed(text) => format!("\r\x1b[2K{RED}✗ {text}\x1b[0m\r\n"),
         Progress::Done(text) => format!("\r\x1b[2K{DIM}{text}\x1b[0m\r\n"),
@@ -959,12 +964,38 @@ mod tests {
     #[test]
     fn startup_progress_rewrites_one_amber_line_then_ends_it() {
         use goose::acp::startup_progress::Progress;
-        let waiting = startup_progress_line(&Progress::Waiting("starting: 10s…".into()));
-        assert!(waiting.starts_with("\r\x1b[2K\x1b[38;2;210;153;34m"), "{waiting:?}");
-        assert!(!waiting.ends_with('\n'), "a waiting line is refreshed in place");
-        let failed = startup_progress_line(&Progress::Failed("codex failed".into()));
+        let waiting = startup_progress_line(&Progress::Waiting("starting: 10s…".into()), 80);
+        assert!(
+            waiting.starts_with("\r\x1b[2K\x1b[38;2;210;153;34m"),
+            "{waiting:?}"
+        );
+        assert!(
+            !waiting.ends_with('\n'),
+            "a waiting line is refreshed in place"
+        );
+        let failed = startup_progress_line(&Progress::Failed("codex failed".into()), 80);
         assert!(failed.contains("\x1b[38;2;229;72;77m✗ codex failed") && failed.ends_with("\r\n"));
-        assert!(startup_progress_line(&Progress::Done("started".into())).ends_with("\r\n"));
+        assert!(startup_progress_line(&Progress::Done("started".into()), 80).ends_with("\r\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_progress_replaces_long_unicode_lines_without_leaving_wrapped_text() {
+        use goose::acp::startup_progress::Progress;
+        for cols in [1, 2, 20, 80] {
+            let mut terminal = vt100::Parser::new(4, cols, 0);
+            for text in [
+                "starting 開発者用アカウント with multiple adapters ".repeat(4),
+                "ready".into(),
+            ] {
+                terminal.process(
+                    startup_progress_line(&Progress::Waiting(text), cols as usize).as_bytes(),
+                );
+                assert_eq!(terminal.screen().cursor_position().0, 0);
+            }
+            let expected = console::truncate_str("⏳ ready", cols as usize - 1, "").into_owned();
+            assert_eq!(terminal.screen().contents(), expected);
+        }
     }
     use goose::session::SessionManager;
     use tempfile::TempDir;

@@ -145,13 +145,22 @@ impl RouterStateSource {
         timeout: Duration,
     ) -> Result<Option<String>> {
         let output = self
-            .run(&["state-query"], &["v1", "session", "--session", session_id], timeout)
+            .run(
+                &["state-query"],
+                &["v1", "session", "--session", session_id],
+                timeout,
+            )
             .await?;
         parse_session_agent(&output)
     }
 
     /// `router-acp <command> --config <config> <rest>`, its stdout when it succeeds.
-    async fn run(&self, command_args: &[&str], rest: &[&str], timeout: Duration) -> Result<Vec<u8>> {
+    async fn run(
+        &self,
+        command_args: &[&str],
+        rest: &[&str],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
         let mut command = tokio::process::Command::new(&self.binary);
         command
             .args(command_args)
@@ -195,7 +204,7 @@ pub enum AccountState {
     /// Signed in (`authState` "authenticated"), but the router is not routing to it now: a
     /// usage limit, a reserve or a cordon.
     Paused,
-    /// Its sign-in is missing or was rejected (`authState` anything but "authenticated").
+    /// Authentication failed, or neither authentication nor routability is confirmed.
     SignedOut,
 }
 
@@ -222,17 +231,20 @@ pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
     #[derive(Deserialize)]
     struct Routing {
         available: Option<bool>,
+        reason: Option<String>,
     }
     let status: Status = serde_json::from_slice(json)?;
     Ok(status
         .accounts
         .into_iter()
         .map(|account| {
-            // Signed in is exactly authState "authenticated", whatever routing says.
-            let state = if account.auth_state.as_deref() != Some("authenticated") {
+            let routing = account.routing.as_ref();
+            let state = if routing.and_then(|r| r.reason.as_deref()) == Some("authentication") {
                 AccountState::SignedOut
-            } else if account.routing.and_then(|r| r.available) == Some(true) {
+            } else if routing.and_then(|r| r.available) == Some(true) {
                 AccountState::Available
+            } else if account.auth_state.as_deref() != Some("authenticated") {
+                AccountState::SignedOut
             } else {
                 AccountState::Paused
             };
@@ -464,7 +476,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn account_status_signed_in_is_exactly_authenticated() {
+    fn account_status_preserves_authentication_and_routing_evidence() {
         // The shape `router-acp account-status` printed on 2026-11-19 (labels replaced).
         let reply = br#"{"revision":"r","accounts":[
             {"id":"claude@a","provider":"claude","label":"a@example.com","plan":"Personal Max","authState":"authenticated","credentialPresent":true,"priority":1,"routing":{"available":true,"reason":null,"resetsAt":null}},
@@ -483,9 +495,27 @@ mod tests {
         assert!(accounts[1].state.signed_in());
         assert_eq!(accounts[2].state, AccountState::SignedOut);
         assert_eq!(
-            (accounts[3].provider.as_str(), accounts[3].label.as_str(), accounts[3].state),
+            (
+                accounts[3].provider.as_str(),
+                accounts[3].label.as_str(),
+                accounts[3].state
+            ),
             ("grok", "grok@c", AccountState::SignedOut),
             "a missing provider, label or sign-in falls back without guessing it signed in"
+        );
+        let sparse = parse_accounts(br#"{"accounts":[
+            {"id":"codex@a","routing":{"available":true}},
+            {"id":"codex@b","authState":"refreshing","routing":{"available":true}},
+            {"id":"codex@c","authState":"authenticated","routing":{"available":true,"reason":"authentication"}},
+            {"id":"grok@d"}]}"#).unwrap();
+        assert_eq!(
+            sparse.iter().map(|a| a.state).collect::<Vec<_>>(),
+            [
+                AccountState::Available,
+                AccountState::Available,
+                AccountState::SignedOut,
+                AccountState::SignedOut
+            ]
         );
     }
 
@@ -494,7 +524,10 @@ mod tests {
         // The shape `router-acp state-query v1 session --session <id>` printed for a live
         // planner parent on 2026-11-19 (trimmed).
         let reply = br#"{"version":1,"command":"session","data":{"session":{"router_session_id":"rtr-1","agent":"claude@a","model":"claude-opus-5-5","routing":{"candidate":"claude@a/claude-opus-5-5"}}}}"#;
-        assert_eq!(parse_session_agent(reply).unwrap().as_deref(), Some("claude@a"));
+        assert_eq!(
+            parse_session_agent(reply).unwrap().as_deref(),
+            Some("claude@a")
+        );
         assert!(parse_session_agent(br#"{"version":2}"#).is_err());
     }
 

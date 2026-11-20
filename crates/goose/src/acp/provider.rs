@@ -2019,10 +2019,10 @@ async fn forward_child_stderr(mut stderr: tokio::process::ChildStderr) {
 
 /// The agent's `initialize` reply, reporting progress while it takes long. It waits exactly
 /// as long as before: the ticks only report, they never time the wait out.
-async fn wait_for_initialize<T>(
+async fn wait_for_initialize<T, E>(
     agent: &str,
-    mut init_rx: oneshot::Receiver<T>,
-) -> std::result::Result<T, oneshot::error::RecvError> {
+    mut init_rx: oneshot::Receiver<std::result::Result<T, E>>,
+) -> std::result::Result<std::result::Result<T, E>, oneshot::error::RecvError> {
     use super::startup_progress::{self as progress, Progress};
     progress::reset();
     let started = std::time::Instant::now();
@@ -2046,10 +2046,7 @@ async fn wait_for_initialize<T>(
                             progress::report(Progress::Failed(text));
                         }
                     }
-                    progress::report(Progress::Done(format!(
-                        "{agent} started after {}s",
-                        started.elapsed().as_secs()
-                    )));
+                    progress::report(progress::completion(agent, started.elapsed(), &reply));
                 }
                 return reply;
             }

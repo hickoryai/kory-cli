@@ -67,7 +67,7 @@ fn on_bar(line: &str) -> String {
 
 /// `row` (terminal bytes) on black: black first, black again after every SGR that resets the
 /// background to the terminal's default (`0`, an empty SGR, `49`) without setting another, and
-/// the rest of the row erased in black. A background the row sets itself is kept.
+/// a background the row sets itself is kept. The caller clears the row before painting it.
 fn on_black(row: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(row.len() + 32);
     out.extend_from_slice(BAR.as_bytes());
@@ -93,8 +93,7 @@ fn on_black(row: &[u8]) -> Vec<u8> {
             i += 1;
         }
     }
-    out.extend_from_slice(BAR.as_bytes());
-    out.extend_from_slice(b"\x1b[K\x1b[0m");
+    out.extend_from_slice(b"\x1b[0m");
     out
 }
 
@@ -134,7 +133,7 @@ fn sgr_resets_background(params: &[u8]) -> bool {
 /// SGR mouse button code for motion with no button held.
 const MOTION: u16 = 35;
 
-use base64::prelude::{BASE64_STANDARD, Engine as _};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 
 /// Something on screen a click opens, as the arrow keys and Enter would.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -708,7 +707,7 @@ impl Relay {
                 let mut out = view.forwarded();
                 match child.as_mut() {
                     Some(shown) => {
-                        out.extend_from_slice(&shown.view.frame(&pane));
+                        out.extend_from_slice(&shown.view.frame_with(&header, &pane));
                     }
                     None => out.extend_from_slice(&view.frame_with(&header, &pane)),
                 }
@@ -1714,7 +1713,7 @@ mod tests {
         assert_eq!(&rows[..3], ["● 2 claude", "────", "intro"]);
         assert_eq!(rows[7], "  child row");
         let text = String::from_utf8_lossy(&frame).into_owned();
-        assert!(text.contains(&on_bar("● 2 claude")) && text.contains(&on_bar("── rule")));
+        assert!(text.contains(&on_bar("● 2 claude")) && text.contains(&on_bar("────")));
 
         // The tool call is now on screen row 4 (1-based): the click finds it there.
         let input = view.input(b"\x1b[<0;5;4M\x1b[<0;5;4m", Instant::now());
@@ -1728,20 +1727,36 @@ mod tests {
     fn a_row_stays_black_through_every_reset_but_keeps_its_own_backgrounds() {
         let row =
             b"a\x1b[0mb\x1b[mc\x1b[49md\x1b[1;38;5;0me\x1b[48;5;4mf\x1b[0;48;2;1;2;3mg\x1b[0;31mh";
-        let out = String::from_utf8_lossy(&on_black(row)).into_owned();
-        assert!(
-            out.starts_with(BAR) && out.ends_with(&format!("{BAR}\x1b[K\x1b[0m")),
-            "{out:?}"
+        let mut terminal = vt100::Parser::new(2, 8, 0);
+        terminal.process(&on_black(row));
+        assert_eq!(terminal.screen().contents(), "abcdefgh");
+        for col in [0, 1, 2, 3, 4, 7] {
+            assert_eq!(
+                terminal.screen().cell(0, col).unwrap().bgcolor(),
+                vt100::Color::Rgb(0, 0, 0)
+            );
+        }
+        assert_eq!(
+            terminal.screen().cell(0, 5).unwrap().bgcolor(),
+            vt100::Color::Idx(4)
         );
-        // Black again after each reset of the background.
-        assert!(out.contains(&format!("\x1b[0m{BAR}b")), "{out:?}");
-        assert!(out.contains(&format!("\x1b[m{BAR}c")), "{out:?}");
-        assert!(out.contains(&format!("\x1b[49m{BAR}d")), "{out:?}");
-        assert!(out.contains(&format!("\x1b[0;31m{BAR}h")), "{out:?}");
-        // Not after a foreground palette index 0, nor over a background the row sets itself.
-        assert!(out.contains("\x1b[1;38;5;0me"), "{out:?}");
-        assert!(out.contains("\x1b[48;5;4mf"), "{out:?}");
-        assert!(out.contains("\x1b[0;48;2;1;2;3mg"), "{out:?}");
+        assert_eq!(
+            terminal.screen().cell(0, 6).unwrap().bgcolor(),
+            vt100::Color::Rgb(1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn full_width_transcript_and_alternate_screen_rows_keep_the_last_cell() {
+        for alternate in [false, true] {
+            let mut view = View::new(8, 4);
+            if alternate {
+                view.output(b"\x1b[?1049h");
+            }
+            view.output(b"12345678\r\nABCDEFGH");
+            let rows = screen(&view.frame(&[]), 8, 4);
+            assert_eq!(rows.get(..2).unwrap(), ["12345678", "ABCDEFGH"]);
+        }
     }
 
     #[test]

@@ -202,9 +202,10 @@ impl Dock {
             return None;
         }
         write_raw("\x1b[?2004h");
-        let accounts = sources.router.clone().map(|(source, session_id)| {
-            super::accounts::AccountBar::start(source, session_id)
-        });
+        let accounts = sources
+            .router
+            .clone()
+            .map(|(source, session_id)| super::accounts::AccountBar::start(source, session_id));
         *ACTIVE.get_or_init(Mutex::default).lock().unwrap() = Arc::downgrade(&shared);
         let painter = shared.clone();
         let ticking = Arc::downgrade(&shared);

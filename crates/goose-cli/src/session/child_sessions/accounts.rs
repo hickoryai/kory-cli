@@ -90,11 +90,18 @@ pub fn header_lines(accounts: &[RouterAccount], active: Option<&str>, cols: usiz
     let left = status_text(accounts);
     let right = active
         .and_then(|id| accounts.iter().find(|account| account.id == id))
-        .map(|account| format!("{GREEN}{ACTIVE}{DEFAULT_FG} {}: {}", account.provider, account.label))
+        .map(|account| {
+            format!(
+                "{GREEN}{ACTIVE}{DEFAULT_FG} {}: {}",
+                account.provider, account.label
+            )
+        })
         .unwrap_or_default();
     let right_width = console::measure_text_width(&right);
-    let line = if right.is_empty() || right_width + 2 > width {
+    let line = if right.is_empty() {
         console::truncate_str(&left, width, "…").into_owned()
+    } else if right_width >= width {
+        console::truncate_str(&right, width, "…").into_owned()
     } else {
         let left = console::truncate_str(&left, width - right_width - 1, "…").into_owned();
         let gap = width - console::measure_text_width(&left) - right_width;
@@ -120,14 +127,21 @@ fn status_text(accounts: &[RouterAccount]) -> String {
         let of: Vec<&RouterAccount> = accounts.iter().filter(|a| a.provider == provider).collect();
         let signed_in = of.iter().filter(|a| a.state.signed_in()).count();
         let routable = of.iter().any(|a| a.state == AccountState::Available);
-        let (color, icon) = if routable { (GREEN, UP) } else { (AMBER, PAUSED) };
+        let (color, icon) = if routable {
+            (GREEN, UP)
+        } else {
+            (AMBER, PAUSED)
+        };
         match signed_in {
             0 => {}
             1 => parts.push(format!("{color}{icon}{DEFAULT_FG} {provider}")),
             _ => parts.push(format!("{color}{icon}{DEFAULT_FG} {provider} x{signed_in}")),
         }
         for account in of.iter().filter(|a| a.state == AccountState::SignedOut) {
-            parts.push(format!("{RED}{DOWN}{DEFAULT_FG} {provider}: {}", account.label));
+            parts.push(format!(
+                "{RED}{DOWN}{DEFAULT_FG} {provider}: {}",
+                account.label
+            ));
         }
     }
     parts.join(" ")
@@ -178,7 +192,9 @@ mod tests {
             "● claude x4 ■ claude: b@x.com ● codex x2 ● grok"
         );
         let colored = status_text(&fleet());
-        assert!(colored.contains(&format!("{GREEN}{UP}")) && colored.contains(&format!("{RED}{DOWN}")));
+        assert!(
+            colored.contains(&format!("{GREEN}{UP}")) && colored.contains(&format!("{RED}{DOWN}"))
+        );
         // True color, never the terminal palette's green/yellow/red.
         for code in [GREEN, AMBER, RED] {
             assert!(code.starts_with("\x1b[38;2;"), "{code:?}");
@@ -233,7 +249,29 @@ mod tests {
         let lines = header_lines(&fleet(), Some("claude@3"), 40);
         let top = console::strip_ansi_codes(&lines[0]).into_owned();
         assert!(console::measure_text_width(&top) < 40, "{top}");
-        assert!(top.ends_with("▶ claude: d@x.com") && top.contains('…'), "{top}");
+        assert!(
+            top.ends_with("▶ claude: d@x.com") && top.contains('…'),
+            "{top}"
+        );
+
+        let accounts = [account(
+            "claude@1",
+            "alexandra.morris@company.com",
+            AccountState::Available,
+        )];
+        for cols in [40, 41] {
+            let lines = header_lines(&accounts, Some("claude@1"), cols);
+            let top = plain(&lines[0]);
+            assert!(
+                top.ends_with("▶ claude: alexandra.morris@company.com"),
+                "{top}"
+            );
+            assert!(console::measure_text_width(&top) < cols);
+        }
+        let lines = header_lines(&accounts, Some("claude@1"), 20);
+        let top = plain(&lines[0]);
+        assert!(top.starts_with(" ▶ claude:") && top.ends_with('…'), "{top}");
+        assert!(console::measure_text_width(&top) < 20);
     }
 
     #[test]

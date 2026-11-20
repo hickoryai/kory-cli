@@ -2922,13 +2922,18 @@ impl CliSession {
             };
             if let Some(step) = quit.key(key) {
                 match step {
-                    shutdown::QuitStep::Confirm => output::print_status_line(shutdown::QUIT_CONFIRM),
+                    shutdown::QuitStep::Confirm => {
+                        output::print_status_line(shutdown::QUIT_CONFIRM)
+                    }
                     shutdown::QuitStep::Quit => {
                         output::print_status_line(shutdown::EXIT_WARNING);
                         break true;
                     }
                 }
-            } else if matches!(key, child_sessions::Key::Enter | child_sessions::Key::SendNow) {
+            } else if matches!(
+                key,
+                child_sessions::Key::Enter | child_sessions::Key::SendNow
+            ) {
                 output::print_status_line(shutdown::BLOCKED);
             }
         };
