@@ -1,7 +1,7 @@
 use crate::session::builder::ExtensionFailure;
 use anstream::{adapter::strip_str, eprintln};
 use bat::WrappingMode;
-use console::{measure_text_width, style, Color, StyledObject, Term};
+use console::{Color, StyledObject, Term, measure_text_width, style};
 use goose::config::Config;
 use goose::conversation::message::{
     ActionRequiredData, Message, MessageContent, SystemNotificationContent, SystemNotificationType,
@@ -1613,7 +1613,7 @@ fn extract_markdown_table(content: &str) -> Option<(String, Vec<&str>, &str)> {
 }
 
 fn print_table(table_lines: &[&str], theme: Theme) {
-    use comfy_table::{presets, Cell, CellAlignment, ContentArrangement, Table};
+    use comfy_table::{Cell, CellAlignment, ContentArrangement, Table, presets};
 
     let mut table = Table::new();
     table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -2281,9 +2281,11 @@ mod tests {
             );
             flush_markdown_buffer_current_theme(&mut buffer);
         });
-        assert!(strip_str(&rendered)
-            .to_string()
-            .contains("Admitted the worker."));
+        assert!(
+            strip_str(&rendered)
+                .to_string()
+                .contains("Admitted the worker.")
+        );
         assert!(!is_capturing());
     }
 
@@ -2711,25 +2713,45 @@ mod tests {
                 "router-acp · switched codex/sol → claude/opus — outage",
                 "MODEL HANDOFF",
             ),
+            (
+                "router-acp · Reserve reached: switching to GPT-6.1 Sol",
+                "AUTOMATIC MODEL FAILOVER",
+            ),
+            (
+                "router-acp · Claude Opus outage: retrying Claude Opus",
+                "AUTOMATIC MODEL FAILOVER",
+            ),
         ] {
             let before = Message::assistant().with_text("earlier history remains\n");
             let boundary = Message::assistant().with_text(format!("> {notice}\n\n"));
             let after = Message::assistant().with_text("continued history remains\n");
-            let output = stream(&[before, boundary, after]);
-            let start = output.find("earlier history remains").unwrap();
-            let split = output.find(title).unwrap();
-            let end = output.find("continued history remains").unwrap();
-            assert!(start < split && split < end);
-            assert!(output[..split].contains('━') && output[split..].contains('━'));
+            let messages = [before, boundary, after];
+            let replay = capture_output(|| {
+                for message in &messages {
+                    render_message(message, false);
+                }
+            });
+            for output in [stream(&messages), replay] {
+                let start = output.find("earlier history remains").unwrap();
+                let split = output.find(title).unwrap();
+                let end = output.find("continued history remains").unwrap();
+                assert!(start < split && split < end);
+                assert!(output[..split].contains('━') && output[split..].contains('━'));
+            }
         }
-        let ordinary = stream(&[Message::assistant().with_text(
-            "> router-acp · parent handoff deferred: standby unavailable\n\nStill working.",
-        )]);
-        assert!(
-            !ordinary.contains('━'),
-            "a failed preparation is not a context boundary"
-        );
-        assert!(ordinary.contains("Still working."));
+        for notice in [
+            "parent handoff deferred: standby unavailable",
+            "Account limit: no other model can serve; retrying GPT-6.1 Sol in 4m",
+            "Account limit: retrying GPT-6.1 Sol now",
+        ] {
+            let ordinary = stream(&[Message::assistant()
+                .with_text(format!("> router-acp · {notice}\n\nStill working."))]);
+            assert!(
+                !ordinary.contains('━'),
+                "a deferred or pending attempt is not a context boundary"
+            );
+            assert!(ordinary.contains("Still working."));
+        }
     }
 
     #[test]

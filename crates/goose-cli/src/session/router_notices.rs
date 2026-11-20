@@ -19,11 +19,15 @@ pub fn context_boundary(notice: &str) -> Option<String> {
     let headline = notice.lines().next()?.strip_prefix(PREFIX)?.trim_start();
     if headline.starts_with("parent context refreshed") {
         Some(format!("CONTEXT HANDOFF · {}", plain(headline)))
-    } else if headline.starts_with("failover:") {
-        Some(format!(
-            "AUTOMATIC MODEL FAILOVER · {}",
-            summary(notice).trim_start_matches(PREFIX).trim()
-        ))
+    } else if headline.starts_with("failover:")
+        || headline.split_once(": ").is_some_and(|(_, action)| {
+            action.starts_with("switching to ")
+                || (action.starts_with("retrying ")
+                    && !action.contains(" in ")
+                    && !action.ends_with(" now"))
+        })
+    {
+        Some(format!("AUTOMATIC MODEL FAILOVER · {}", plain(headline)))
     } else if headline.starts_with("switched ") {
         Some(format!(
             "MODEL HANDOFF · {}",
