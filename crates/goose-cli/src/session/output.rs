@@ -2736,7 +2736,8 @@ mod tests {
                 let split = output.find(title).unwrap();
                 let end = output.find("continued history remains").unwrap();
                 assert!(start < split && split < end);
-                assert!(output[..split].contains('━') && output[split..].contains('━'));
+                let (before_label, after_label) = output.split_at(split);
+                assert!(before_label.contains('━') && after_label.contains('━'));
             }
         }
         for notice in [

@@ -134,7 +134,7 @@ fn sgr_resets_background(params: &[u8]) -> bool {
 /// SGR mouse button code for motion with no button held.
 const MOTION: u16 = 35;
 
-use base64::prelude::{Engine as _, BASE64_STANDARD};
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 
 /// Something on screen a click opens, as the arrow keys and Enter would.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1726,9 +1726,13 @@ mod tests {
 
     #[test]
     fn a_row_stays_black_through_every_reset_but_keeps_its_own_backgrounds() {
-        let row = b"a\x1b[0mb\x1b[mc\x1b[49md\x1b[1;38;5;0me\x1b[48;5;4mf\x1b[0;48;2;1;2;3mg\x1b[0;31mh";
+        let row =
+            b"a\x1b[0mb\x1b[mc\x1b[49md\x1b[1;38;5;0me\x1b[48;5;4mf\x1b[0;48;2;1;2;3mg\x1b[0;31mh";
         let out = String::from_utf8_lossy(&on_black(row)).into_owned();
-        assert!(out.starts_with(BAR) && out.ends_with(&format!("{BAR}\x1b[K\x1b[0m")), "{out:?}");
+        assert!(
+            out.starts_with(BAR) && out.ends_with(&format!("{BAR}\x1b[K\x1b[0m")),
+            "{out:?}"
+        );
         // Black again after each reset of the background.
         assert!(out.contains(&format!("\x1b[0m{BAR}b")), "{out:?}");
         assert!(out.contains(&format!("\x1b[m{BAR}c")), "{out:?}");
@@ -1749,10 +1753,13 @@ mod tests {
         // transcript's own resets cannot bring back the terminal's background.
         for row in 1..=8 {
             let clear = format!("\x1b[{row};1H");
-            let at = frame.find(&clear).unwrap_or_else(|| panic!("row {row} not drawn"));
-            let next = &frame[at + clear.len()..];
+            let at = frame
+                .find(&clear)
+                .unwrap_or_else(|| panic!("row {row} not drawn"));
+            let next = frame.get(at + clear.len()..).unwrap();
             assert!(
-                next.starts_with(&format!("{BAR}\x1b[2K")) || next.starts_with(&format!("\x1b[0m{BAR}\x1b[2K")),
+                next.starts_with(&format!("{BAR}\x1b[2K"))
+                    || next.starts_with(&format!("\x1b[0m{BAR}\x1b[2K")),
                 "row {row}: {next:?}"
             );
         }
@@ -1762,7 +1769,9 @@ mod tests {
     fn bare_line_feeds_return_the_carriage_so_the_transcript_never_staircases() {
         // Written while something had the session's terminal in raw output mode (OPOST off).
         let mut view = View::new(60, 8);
-        view.output(b"\xe2\x96\xb8 router-acp \xc2\xb7 resumed\n\xe2\x96\xb8 planner \xe2\x86\x92 opus\n");
+        view.output(
+            b"\xe2\x96\xb8 router-acp \xc2\xb7 resumed\n\xe2\x96\xb8 planner \xe2\x86\x92 opus\n",
+        );
         // A line feed at the start of a chunk, after a chunk that ended mid-line.
         view.output(b"tail");
         view.output(b"\nnext\r\n");
@@ -1773,7 +1782,10 @@ mod tests {
         );
         let log = String::from_utf8_lossy(&view.log).into_owned();
         assert_eq!(log.matches("\r\n").count(), 4, "{log:?}");
-        assert!(!log.contains("\r\r\n"), "an existing CRLF is left alone: {log:?}");
+        assert!(
+            !log.contains("\r\r\n"),
+            "an existing CRLF is left alone: {log:?}"
+        );
 
         // A full-screen program keeps its bare line feeds: there LF means "down one row".
         let mut full = View::new(20, 6);
@@ -1781,7 +1793,11 @@ mod tests {
         let screen = full.parser.screen();
         let at = |col| screen.cell(1, col).map(|cell| cell.contents().to_string());
         assert_eq!(at(7).as_deref(), Some("d"), "the bare LF kept the column");
-        assert_eq!(at(0).as_deref(), Some(""), "and did not return to the first one");
+        assert_eq!(
+            at(0).as_deref(),
+            Some(""),
+            "and did not return to the first one"
+        );
     }
 
     #[test]
@@ -1796,7 +1812,11 @@ mod tests {
         let without = screen(&plain.frame(&pane()), 60, 12);
         let frame = headed.frame_with(&header, &pane());
         let with = screen(&frame, 60, 12);
-        assert_eq!(headed.top, header.len(), "the transcript's top offset is the header height");
+        assert_eq!(
+            headed.top,
+            header.len(),
+            "the transcript's top offset is the header height"
+        );
         // The transcript is bottom-aligned in both: below the header the rows are the same.
         assert_eq!(&with[2..10], &without[2..10]);
         assert_eq!(&with[10..], &without[10..], "the pane stays at the bottom");
