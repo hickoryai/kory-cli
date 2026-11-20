@@ -39,15 +39,7 @@ impl KeyListener {
     fn start_with(ctrl_keys: bool) -> std::io::Result<Self> {
         let fd = std::io::stdin().as_raw_fd();
         let original = get_termios(fd)?;
-        let mut cbreak = original;
-        cbreak.c_lflag &= !(libc::ICANON | libc::ECHO);
-        if ctrl_keys {
-            cbreak.c_lflag &= !libc::ISIG;
-        }
-        // Enter arrives as CR and Ctrl+J as LF, so they stay two keys.
-        cbreak.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IXON);
-        cbreak.c_cc[libc::VMIN] = 1;
-        cbreak.c_cc[libc::VTIME] = 0;
+        let cbreak = input_mode(original, ctrl_keys);
         set_termios(fd, &cbreak)?;
         let typed_ahead = enters_restored(read_pending(fd));
 
@@ -66,6 +58,21 @@ impl KeyListener {
     pub async fn next(&mut self) -> Option<Key> {
         self.keys.recv().await
     }
+}
+
+fn input_mode(mut mode: libc::termios, ctrl_keys: bool) -> libc::termios {
+    mode.c_lflag &= !(libc::ICANON | libc::ECHO);
+    if ctrl_keys {
+        mode.c_lflag &= !libc::ISIG;
+    }
+    // A previous raw-mode reader may have disabled output processing. The session
+    // still writes ordinary newlines while this listener owns input.
+    mode.c_oflag |= libc::OPOST | libc::ONLCR;
+    // Enter arrives as CR and Ctrl+J as LF, so they stay two keys.
+    mode.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IXON);
+    mode.c_cc[libc::VMIN] = 1;
+    mode.c_cc[libc::VTIME] = 0;
+    mode
 }
 
 impl Drop for KeyListener {
@@ -219,6 +226,43 @@ fn write_raw(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_after_a_raw_reader_starts_each_line_at_the_left_margin() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        // Use an isolated terminal; never change the test runner's own terminal.
+        let (mut master, mut slave) = unsafe {
+            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(fd >= 0);
+            let master = std::fs::File::from_raw_fd(fd);
+            assert_eq!(libc::grantpt(fd), 0);
+            assert_eq!(libc::unlockpt(fd), 0);
+            let name = libc::ptsname(fd);
+            assert!(!name.is_null());
+            let slave_fd = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(slave_fd >= 0);
+            (master, std::fs::File::from_raw_fd(slave_fd))
+        };
+        for ctrl_keys in [false, true] {
+            let mut raw = get_termios(slave.as_raw_fd()).unwrap();
+            unsafe { libc::cfmakeraw(&mut raw) };
+            set_termios(slave.as_raw_fd(), &input_mode(raw, ctrl_keys)).unwrap();
+            slave.write_all(b"first\nsecond\n").unwrap();
+            let mut output = Vec::new();
+            while output.iter().filter(|&&b| b == b'\n').count() < 2 {
+                let mut chunk = [0; 128];
+                let count = master.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                output.extend_from_slice(&chunk[..count]);
+            }
+            let mut terminal = vt100::Parser::new(4, 40, 0);
+            terminal.process(&output);
+            assert_eq!(terminal.screen().contents(), "first\nsecond");
+            assert_eq!(terminal.screen().cursor_position(), (2, 0));
+        }
+    }
 
     #[test]
     fn enter_typed_before_the_listener_started_still_sends() {

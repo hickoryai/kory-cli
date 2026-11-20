@@ -14,9 +14,6 @@ use tokio_util::task::AbortOnDropHandle;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-/// A delegate router-acp reports no lifecycle state for (not a planner worker) that has
-/// logged nothing for this long without having answered is shown as stopped.
-const LIVE_WINDOW: chrono::Duration = chrono::Duration::minutes(3);
 const TASK_LINES: usize = 12;
 const ACTIVITY_CHARS: usize = 120;
 
@@ -164,34 +161,30 @@ pub fn delegate_label(delegate: &RouterDelegate) -> String {
     }
 }
 
-pub fn delegate_status(delegate: &RouterDelegate, now: DateTime<Utc>) -> ChildStatus {
+pub fn delegate_status(delegate: &RouterDelegate, _now: DateTime<Utc>) -> ChildStatus {
     if let Some(state) = &delegate.state {
         return match state.as_str() {
             "running" | "allocating" | "admitted" => ChildStatus::Running,
             "interrupted" | "blocked" | "corrections" => ChildStatus::Stopped,
-            _ => ChildStatus::Completed,
+            "review-pending" | "accepted" | "finished" | "integrated" | "watching" | "retired"
+            | "ended" => ChildStatus::Completed,
+            _ => ChildStatus::Unknown,
         };
     }
-    let last = delegate
-        .log
-        .iter()
-        .rev()
-        .find(|entry| !matches!(entry.kind.as_str(), "session_update"));
+    // Ordinary delegates expose their turn boundaries in the same read result.
+    // A quiet turn remains running until the router records its response or failure.
+    let last = delegate.log.iter().rev().find(|entry| {
+        matches!(
+            entry.kind.as_str(),
+            "delegate_task" | "delegate_followup" | "agent_response" | "error"
+        )
+    });
     match last.map(|entry| entry.kind.as_str()) {
-        Some("agent_response") => return ChildStatus::Completed,
-        Some("error") => return ChildStatus::Failed,
-        _ => {}
-    }
-    let last_seen = delegate
-        .log
-        .iter()
-        .filter_map(|entry| entry.ts)
-        .chain(delegate.updated_at)
-        .max();
-    match last_seen {
-        Some(seen) if now - seen <= LIVE_WINDOW => ChildStatus::Running,
+        Some("agent_response") => ChildStatus::Completed,
+        Some("error") => ChildStatus::Failed,
+        Some("delegate_task" | "delegate_followup") => ChildStatus::Running,
         _ if delegate.has_response => ChildStatus::Completed,
-        _ => ChildStatus::Stopped,
+        _ => ChildStatus::Unknown,
     }
 }
 
@@ -452,10 +445,10 @@ mod tests {
     }
 
     #[test]
-    fn quiet_delegates_without_a_response_are_stopped() {
+    fn silence_does_not_stop_a_delegate_without_a_response() {
         let delegates = captured();
         let rows = rows_for(&delegates, ROOT, at("2026-10-13T21:30:00Z"));
-        assert!(rows.iter().all(|row| row.status == ChildStatus::Stopped));
+        assert!(rows.iter().all(|row| row.status == ChildStatus::Running));
     }
 
     #[test]
@@ -529,6 +522,11 @@ mod tests {
 
         delegate.log.push(entry("error", "delegated prompt failed"));
         assert_eq!(delegate_status(&delegate, now), ChildStatus::Failed);
+        delegate.log.push(entry("delegate_followup", "Continue"));
+        assert_eq!(delegate_status(&delegate, now), ChildStatus::Running);
+        delegate.log.clear();
+        delegate.has_response = false;
+        assert_eq!(delegate_status(&delegate, now), ChildStatus::Unknown);
     }
 
     #[test]

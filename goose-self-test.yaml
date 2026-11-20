@@ -516,6 +516,19 @@ prompt: |
   Log results to: {{ workspace_dir }}/zai_coding_plan.md
   {% endif %}
 
+  {% if test_phases == "all" or "clipboard" in test_phases %}
+  ## Transcript Clipboard
+
+  From a source checkout, run `cargo test -p goose-cli --lib --no-default-features --features rustls-tls session::child_sessions::relay::tests`.
+  In an interactive Kory terminal, drag across transcript lines, right-click elsewhere,
+  and paste into another application. Verify the selected text was copied, the highlight
+  cleared, and the transcript stayed at the same scroll position. Repeat in a child view.
+  Right-clicking again without a selection must leave the clipboard unchanged.
+  Record the interactive check as NOT RUN when no interactive terminal is available.
+
+  Log results to: {{ workspace_dir }}/clipboard.md
+  {% endif %}
+
   {% if test_phases == "all" or "acp-effort" in test_phases %}
   ## 🧠 PHASE 3D: ACP Thinking-Effort Testing
 

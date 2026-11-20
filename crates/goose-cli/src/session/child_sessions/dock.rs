@@ -26,6 +26,7 @@ use super::router;
 use super::view::{self, ChildRow, ChildStatus};
 use super::Key;
 use console::style;
+use goose::acp::session_activity::{self, SessionActivity, SessionTurn};
 use goose::providers::router_acp::RouterStateSource;
 use goose::session::SessionManager;
 use std::io::Write;
@@ -117,6 +118,8 @@ struct State {
     /// How long the last turn took and when it ended (`1h 30m (12:34am)`), shown at the prompt
     /// where `working` was.
     finished: Option<String>,
+    /// The existing router activity notification, independent of local prompt/output state.
+    router_activity: Option<SessionActivity>,
     /// A session-wide state the status line leads with, e.g. `shutting down 1/3`.
     status: Option<String>,
     /// Tokens in the context and the model's limit.
@@ -146,6 +149,14 @@ pub enum GoalKey {
     Stay,
 }
 
+impl State {
+    fn working(&self) -> bool {
+        self.router_activity
+            .as_ref()
+            .map_or(self.turn_started.is_some(), |activity| activity.busy)
+    }
+}
+
 struct Shared {
     state: Mutex<State>,
 }
@@ -170,6 +181,7 @@ impl Dock {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 always_list: sources.router.is_some(),
+                router_activity: sources.router.as_ref().map(|_| session_activity::current()),
                 size: terminal_size(),
                 ..State::default()
             }),
@@ -199,14 +211,26 @@ impl Dock {
                     let Some(shared) = ticking.upgrade() else {
                         return;
                     };
-                    let working = shared.state.lock().unwrap().turn_started.is_some();
-                    if working || CHILD_WORKING.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (working, changed) = {
+                        let mut state = shared.state.lock().unwrap();
+                        let mut changed = false;
+                        if let Some(activity) = &mut state.router_activity {
+                            let latest = session_activity::current();
+                            changed = *activity != latest;
+                            *activity = latest;
+                        }
+                        (state.working(), changed)
+                    };
+                    if working
+                        || changed
+                        || CHILD_WORKING.load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         relay::repaint();
                     }
                 }
             }));
             loop {
-                let turn_active = painter.state.lock().unwrap().turn_started.is_some();
+                let turn_active = painter.state.lock().unwrap().working();
                 let goal = load_goal(&sources).await;
                 {
                     let mut state = painter.state.lock().unwrap();
@@ -240,10 +264,13 @@ impl Dock {
     pub fn end_turn(&self) {
         let mut state = self.shared.state.lock().unwrap();
         if let Some(started) = state.turn_started.take() {
-            let stamp = turn_stamp(started.elapsed(), chrono::Local::now());
-            state.finished = Some(stamp.clone());
-            drop(state);
-            super::super::output::print_turn_stamp(&stamp);
+            // Returning to the local prompt does not end a router-owned turn.
+            if state.router_activity.is_none() {
+                let stamp = turn_stamp(started.elapsed(), chrono::Local::now());
+                state.finished = Some(stamp.clone());
+                drop(state);
+                super::super::output::print_turn_stamp(&stamp);
+            }
         }
         relay::repaint();
     }
@@ -966,7 +993,17 @@ fn top_rule(state: &State, width: usize) -> String {
     if let Some(status) = &state.status {
         left.push(style(status.clone()).yellow().to_string());
     }
-    if let Some(started) = state.turn_started {
+    let (started, finished) = match &state.router_activity {
+        Some(activity) => match &activity.turn {
+            Some(SessionTurn::Running(started)) => (Some(*started), None),
+            Some(SessionTurn::Finished { elapsed, ended }) => {
+                (None, Some(turn_stamp(*elapsed, *ended)))
+            }
+            None => (None, None),
+        },
+        None => (state.turn_started, state.finished.clone()),
+    };
+    if let Some(started) = started {
         left.push(format!(
             "{} {}",
             super::super::output::sapling_green(format!(
@@ -975,7 +1012,7 @@ fn top_rule(state: &State, width: usize) -> String {
             )),
             style(format_elapsed(started.elapsed())).dim()
         ));
-    } else if let Some(finished) = &state.finished {
+    } else if let Some(finished) = finished {
         // The last turn's length and end, where `working` was.
         left.push(format!(
             "{} {}",
@@ -1290,6 +1327,46 @@ mod tests {
         let dock = typing();
         dock.begin_turn();
         dock
+    }
+
+    #[tokio::test]
+    async fn router_activity_overrides_local_prompt_completion_and_old_finished_stamps() {
+        let dock = in_turn();
+        dock.end_turn();
+        let started = Instant::now() - Duration::from_secs(600);
+        dock.shared.state.lock().unwrap().router_activity = Some(SessionActivity {
+            busy: true,
+            turn: Some(SessionTurn::Running(started)),
+            ..SessionActivity::default()
+        });
+        // Router wakes do not have a local prompt in flight. Silence does not stop them.
+        dock.end_turn();
+        let state = dock.shared.state.lock().unwrap();
+        let line = &painted(&state, 100, 20)[0];
+        assert!(line.contains("working"), "{line}");
+        assert!(!line.contains('⏹'));
+        assert!(state.working());
+        drop(state);
+
+        // Only the router's completed transition makes the footer show a stop time,
+        // even if the local request is still unwinding.
+        dock.begin_turn();
+        let ended = chrono::Local::now();
+        dock.shared.state.lock().unwrap().router_activity = Some(SessionActivity {
+            turn: Some(SessionTurn::Finished {
+                elapsed: Duration::from_secs(600),
+                ended,
+            }),
+            ..SessionActivity::default()
+        });
+        let state = dock.shared.state.lock().unwrap();
+        let line = &painted(&state, 100, 20)[0];
+        assert!(
+            line.contains(&turn_stamp(Duration::from_secs(600), ended)),
+            "{line}"
+        );
+        assert!(line.contains('⏹') && !line.contains("working"));
+        assert!(!state.working());
     }
 
     fn plain(lines: &[String]) -> Vec<String> {

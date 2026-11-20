@@ -46,6 +46,30 @@ curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_
 - [Governance](https://github.com/aaif-goose/goose/blob/main/GOVERNANCE.md)
 - [Custom Distributions](https://github.com/aaif-goose/goose/blob/main/CUSTOM_DISTROS.md) — build your own goose distro with preconfigured providers, extensions, and branding
 
+## CLI activity footer
+
+The router session's footer reads the same `session_info_update` activity state as the
+terminal title (`_meta.routerAcp.busy`). Router-reported starts and stops control the
+timer, including autonomous wakes. Output pauses and returning to the local prompt do
+not mark the session stopped. The duration and local stop time are recorded when those
+router notifications arrive. Child sessions read their lifecycle from the existing
+`state-query v1 delegates` result. Other providers use the local interactive turn.
+
+ACP terminal exit waits and releases run outside the incoming message handler, so a
+running background command cannot block the output and kill requests needed to interrupt it.
+
+The shutdown screen handles Ctrl-C from both operating-system signals and extended
+keyboard input through the same two-press confirmation. Terminal key events must not
+leave a saved, drained session unable to exit while a protocol response is delayed.
+
+The terminal relay and prompt key listener enable newline translation on the session's
+pseudo-terminal, including when the preceding input reader left it in raw mode. Transcript
+lines therefore return to the left margin while the footer keeps accepting input.
+
+Drag to select transcript text; right-click copies the selection and clears its highlight
+without moving the view. Copying uses the local system clipboard as well as OSC 52 for
+terminals that support clipboard forwarding, including remote sessions.
+
 ## Need help?
 - [Diagnostics & Reporting](https://goose-docs.ai/docs/troubleshooting/diagnostics-and-reporting)
 - [Known Issues](https://goose-docs.ai/docs/troubleshooting/known-issues)

@@ -1620,6 +1620,7 @@ impl AcpClientLoop {
                                     .and_then(|router| router.get("busy"))
                                     .and_then(|busy| busy.as_bool());
                                 super::session_activity::update(
+                                    notification.session_id.0.as_ref(),
                                     update.title.value().cloned(),
                                     busy,
                                 );
@@ -1889,25 +1890,34 @@ impl AcpClientLoop {
             .on_receive_request(
                 {
                     let terminal_manager = terminal_manager.clone();
-                    async move |request: WaitForTerminalExitRequest, responder, _cx| {
+                    async move |request: WaitForTerminalExitRequest, responder, cx| {
                         if !terminal_enabled {
                             return responder.respond_with_error(
                                 agent_client_protocol::Error::method_not_found(),
                             );
                         }
-                        match terminal_manager
-                            .wait_for_exit(
-                                request.session_id.0.as_ref(),
-                                request.terminal_id.0.as_ref(),
-                            )
-                            .await
-                        {
-                            Some(status) => {
-                                responder.respond(WaitForTerminalExitResponse::new(status))
+                        let terminal_manager = terminal_manager.clone();
+                        // The incoming actor must remain available for terminal/kill
+                        // while this request waits for that terminal to exit.
+                        cx.spawn(async move {
+                            match terminal_manager
+                                .wait_for_exit(
+                                    request.session_id.0.as_ref(),
+                                    request.terminal_id.0.as_ref(),
+                                )
+                                .await
+                            {
+                                Some(status) => {
+                                    responder.respond(WaitForTerminalExitResponse::new(status))
+                                }
+                                None => responder.respond_with_error(
+                                    agent_client_protocol::Error::internal_error().data(format!(
+                                        "unknown terminal {}",
+                                        request.terminal_id.0
+                                    )),
+                                ),
                             }
-                            None => Err(agent_client_protocol::Error::internal_error()
-                                .data(format!("unknown terminal {}", request.terminal_id.0))),
-                        }
+                        })
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -1933,19 +1943,22 @@ impl AcpClientLoop {
             .on_receive_request(
                 {
                     let terminal_manager = terminal_manager.clone();
-                    async move |request: ReleaseTerminalRequest, responder, _cx| {
+                    async move |request: ReleaseTerminalRequest, responder, cx| {
                         if !terminal_enabled {
                             return responder.respond_with_error(
                                 agent_client_protocol::Error::method_not_found(),
                             );
                         }
-                        terminal_manager
-                            .release(
-                                request.session_id.0.as_ref(),
-                                request.terminal_id.0.as_ref(),
-                            )
-                            .await;
-                        responder.respond(ReleaseTerminalResponse::new())
+                        let terminal_manager = terminal_manager.clone();
+                        cx.spawn(async move {
+                            terminal_manager
+                                .release(
+                                    request.session_id.0.as_ref(),
+                                    request.terminal_id.0.as_ref(),
+                                )
+                                .await;
+                            responder.respond(ReleaseTerminalResponse::new())
+                        })
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
