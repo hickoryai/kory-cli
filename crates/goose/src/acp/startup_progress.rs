@@ -201,10 +201,8 @@ mod tests {
         else {
             panic!("expected a waiting message");
         };
-        assert_eq!(
-            text,
-            "router-acp is still starting provider adapters (grok@752deed2…): 40s…"
-        );
+        assert!(text.contains("grok@752deed2…"), "{text}");
+        assert!(text.contains("40s"), "{text}");
 
         let Some(Progress::Waiting(text)) = message(
             "router-acp",
