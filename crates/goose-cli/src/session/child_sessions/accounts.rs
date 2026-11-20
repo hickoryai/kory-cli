@@ -1,9 +1,9 @@
 //! The account bar pinned above a router session's transcript: every router-acp account's
-//! status on the left, the account the session runs on now on the right, a white rule under
+//! status on the right, the account the session runs on now on the left, a white rule under
 //! them.
 //!
 //! ```text
-//!   ● claude x4 ■ claude: b@example.com ⏸ codex x2 ● grok              ▶ claude: a@example.com
+//!   ▶ claude: a@example.com (45%/80%)              ● claude x4 ■ claude: b@example.com ⏸ codex x2
 //!   ─────────────────────────────────────────────────────────────────────────────────────────
 //! ```
 //!
@@ -87,24 +87,31 @@ pub fn header_lines(accounts: &[RouterAccount], active: Option<&str>, cols: usiz
     }
     // One leading space and the last column kept free.
     let width = cols - 2;
-    let left = status_text(accounts);
-    let right = active
+    let right = status_text(accounts);
+    let left = active
         .and_then(|id| accounts.iter().find(|account| account.id == id))
         .map(|account| {
+            let usage = account
+                .usage
+                .as_ref()
+                .map(|usage| match usage.max_percent {
+                    Some(max) => format!(" ({}%/{max}%)", usage.percent),
+                    None => format!(" ({}%)", usage.percent),
+                })
+                .unwrap_or_default();
             format!(
-                "{GREEN}{ACTIVE}{DEFAULT_FG} {}: {}",
+                "{GREEN}{ACTIVE}{DEFAULT_FG} {}: {}{usage}",
                 account.provider, account.label
             )
         })
         .unwrap_or_default();
-    let right_width = console::measure_text_width(&right);
-    let line = if right.is_empty() {
+    let left_width = console::measure_text_width(&left);
+    let line = if left_width >= width {
         console::truncate_str(&left, width, "…").into_owned()
-    } else if right_width >= width {
-        console::truncate_str(&right, width, "…").into_owned()
     } else {
-        let left = console::truncate_str(&left, width - right_width - 1, "…").into_owned();
-        let gap = width - console::measure_text_width(&left) - right_width;
+        let room = width - left_width - usize::from(!left.is_empty());
+        let right = console::truncate_str(&right, room, "…").into_owned();
+        let gap = width - left_width - console::measure_text_width(&right);
         format!("{left}{}{right}", " ".repeat(gap))
     };
     vec![
@@ -157,6 +164,7 @@ mod tests {
             provider: id.split('@').next().unwrap().into(),
             label: label.into(),
             state,
+            usage: None,
         }
     }
 
@@ -231,12 +239,12 @@ mod tests {
     }
 
     #[test]
-    fn the_active_account_is_right_justified_above_a_white_rule() {
+    fn the_active_account_is_on_the_left_and_status_is_right_justified() {
         let lines = header_lines(&fleet(), Some("claude@3"), 120);
         assert_eq!(lines.len(), 2, "one text row and the rule, nothing more");
         let top = console::strip_ansi_codes(&lines[0]).into_owned();
-        assert!(top.starts_with(" ● claude x4"), "{top}");
-        assert!(top.ends_with("▶ claude: d@x.com"), "{top}");
+        assert!(top.starts_with(" ▶ claude: d@x.com"), "{top}");
+        assert!(top.ends_with("● grok"), "{top}");
         assert!(lines[0].contains(&format!("{GREEN}{ACTIVE}")));
         // Neither row reaches the last column, so the terminal never wraps it.
         assert_eq!(console::measure_text_width(&lines[0]), 119);
@@ -250,7 +258,7 @@ mod tests {
         let top = console::strip_ansi_codes(&lines[0]).into_owned();
         assert!(console::measure_text_width(&top) < 40, "{top}");
         assert!(
-            top.ends_with("▶ claude: d@x.com") && top.contains('…'),
+            top.starts_with(" ▶ claude: d@x.com") && top.contains('…'),
             "{top}"
         );
 
@@ -263,7 +271,7 @@ mod tests {
             let lines = header_lines(&accounts, Some("claude@1"), cols);
             let top = plain(&lines[0]);
             assert!(
-                top.ends_with("▶ claude: alexandra.morris@company.com"),
+                top.starts_with(" ▶ claude: alexandra.morris@company.com"),
                 "{top}"
             );
             assert!(console::measure_text_width(&top) < cols);
@@ -275,13 +283,47 @@ mod tests {
     }
 
     #[test]
-    fn an_unrouted_session_shows_nothing_on_the_right() {
+    fn an_unrouted_session_shows_only_the_fleet_status() {
         assert!(header_lines(&[], Some("claude@1"), 80).is_empty());
         for active in [None, Some("claude@9")] {
             let lines = header_lines(&fleet(), active, 80);
             let top = console::strip_ansi_codes(&lines[0]).into_owned();
             assert!(!top.contains('▶'), "{top}");
             assert!(console::measure_text_width(&top) < 80, "{top}");
+        }
+    }
+
+    #[test]
+    fn current_account_shows_session_usage_then_weekly_with_the_matching_reserve() {
+        let accounts = goose::providers::router_acp::parse_accounts(
+            br#"{"accounts":[
+            {"id":"claude@a","label":"zane@chordzy.com","routing":{"available":true},
+             "reserveCapacity":{"session":20,"weekly":10},"usage":{"windows":[
+                {"id":"weekly","percent":92,"reserveKind":"weekly"},
+                {"id":"session","percent":45,"reserveKind":"session"},
+                {"id":"weekly_scoped","percent":99,"scope":"Opus","reserveKind":"weekly"}]}},
+            {"id":"codex@b","routing":{"available":true},
+             "reserveCapacity":{"session":20,"weekly":15},"usage":{"windows":[
+                {"id":"primary","percent":34,"reserveKind":"weekly"},
+                {"id":"secondary","percent":12,"reserveKind":"weekly"},
+                {"id":"member","percent":99,"reserveKind":null}]}},
+            {"id":"claude@c","routing":{"available":true},"usage":{"windows":[
+                {"id":"session","percent":0,"reserveKind":"session"},
+                {"id":"weekly","percent":60,"reserveKind":"weekly"}]}},
+            {"id":"grok@d","routing":{"available":true}}]}"#,
+        )
+        .unwrap();
+        for (id, label) in [
+            ("claude@a", "claude: zane@chordzy.com (45%/80%)"),
+            ("codex@b", "codex: codex@b (34%/85%)"),
+            ("claude@c", "claude: claude@c (0%)"),
+            ("grok@d", "grok: grok@d"),
+        ] {
+            let lines = header_lines(&accounts, Some(id), 120);
+            let top = plain(&lines[0]);
+            assert!(top.starts_with(&format!(" ▶ {label} ")), "{top}");
+            assert!(top.ends_with("● grok"), "{top}");
+            assert_eq!(console::measure_text_width(&top), 119);
         }
     }
 }

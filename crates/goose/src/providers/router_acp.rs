@@ -186,7 +186,7 @@ impl RouterStateSource {
 }
 
 /// One account from `router-acp account-status`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouterAccount {
     /// The router agent name, e.g. `claude@<id>`.
     pub id: String,
@@ -194,6 +194,14 @@ pub struct RouterAccount {
     /// The account's sign-in label (its email), or its id when it has none.
     pub label: String,
     pub state: AccountState,
+    pub usage: Option<AccountUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountUsage {
+    pub percent: i64,
+    /// The selected window's consumption ceiling when capacity is reserved.
+    pub max_percent: Option<f64>,
 }
 
 /// Whether an account is signed in, and whether the router can use it now.
@@ -227,11 +235,31 @@ pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
         label: Option<String>,
         auth_state: Option<String>,
         routing: Option<Routing>,
+        usage: Option<Usage>,
+        reserve_capacity: Option<ReserveCapacity>,
     }
     #[derive(Deserialize)]
     struct Routing {
         available: Option<bool>,
         reason: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Usage {
+        #[serde(default)]
+        windows: Vec<Window>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Window {
+        id: Option<String>,
+        percent: Option<i64>,
+        scope: Option<String>,
+        reserve_kind: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct ReserveCapacity {
+        session: Option<f64>,
+        weekly: Option<f64>,
     }
     let status: Status = serde_json::from_slice(json)?;
     Ok(status
@@ -248,6 +276,40 @@ pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
             } else {
                 AccountState::Paused
             };
+            // Use the router's normalized windows, excluding model-scoped and spend caps.
+            // For multiple pools, show the most consumed window of the preferred kind.
+            let usage = account.usage.as_ref().and_then(|usage| {
+                let window = usage
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        window.scope.is_none()
+                            && window.id.as_deref() != Some("weekly_scoped")
+                            && window.percent.is_some_and(|percent| percent >= 0)
+                            && matches!(window.reserve_kind.as_deref(), Some("session" | "weekly"))
+                    })
+                    .max_by_key(|window| {
+                        (
+                            window.reserve_kind.as_deref() == Some("session"),
+                            window.percent,
+                        )
+                    })?;
+                let reserve = account.reserve_capacity.as_ref().and_then(|reserve| {
+                    if window.reserve_kind.as_deref() == Some("session") {
+                        reserve.session
+                    } else {
+                        reserve.weekly
+                    }
+                });
+                Some(AccountUsage {
+                    percent: window.percent?,
+                    max_percent: reserve
+                        .filter(|reserve| {
+                            reserve.is_finite() && *reserve > 0.0 && *reserve <= 100.0
+                        })
+                        .map(|reserve| 100.0 - reserve),
+                })
+            });
             RouterAccount {
                 provider: account.provider.unwrap_or_else(|| {
                     account.id.split('@').next().unwrap_or_default().to_string()
@@ -257,6 +319,7 @@ pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
                     .filter(|label| !label.is_empty())
                     .unwrap_or_else(|| account.id.clone()),
                 state,
+                usage,
                 id: account.id,
             }
         })

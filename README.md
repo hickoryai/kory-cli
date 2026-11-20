@@ -52,6 +52,16 @@ curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_
 
 ## CLI activity footer
 
+Router sessions pin the current account on the left of the header and fleet status
+on the right. The current account shows session-cap consumption when available,
+otherwise weekly consumption: `claude: zane@chordzy.com (45%)`. A matching capacity
+reserve adds the consumption ceiling: `(45%/80%)` means a 20% session reserve.
+The header reads router-acp's normalized account usage; model-scoped and spend caps
+are excluded, and multiple pools use the highest consumption for the selected window
+kind. Missing usage stays blank. Account data refreshes every ten seconds, with the
+last successful reading retained if a query fails. Narrow terminals prioritize the
+current account.
+
 The router session's footer reads the same `session_info_update` activity state as the
 terminal title (`_meta.routerAcp.busy`). Router-reported starts and stops control the
 timer, including autonomous wakes. Output pauses and returning to the local prompt do
