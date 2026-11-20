@@ -1153,6 +1153,9 @@ fn render_reply_text(text: &str, buffer: &mut MarkdownBuffer, theme: Theme) {
                 flush_markdown_buffer(buffer, theme);
                 if let Some(label) = super::router_notices::context_boundary(&notice) {
                     print_context_boundary(&label);
+                    for detail in notice.lines().skip(1) {
+                        print_status_line(detail);
+                    }
                     continue;
                 }
                 if let Some(message) = super::router_notices::external_message(&notice) {
@@ -2721,7 +2724,9 @@ mod tests {
             ),
         ] {
             let before = Message::assistant().with_text("earlier history remains\n");
-            let boundary = Message::assistant().with_text(format!("> {notice}\n\n"));
+            let boundary = Message::assistant().with_text(format!(
+                "> {notice}\n> reason: provider quota exhausted\n> account: claude@standby\n\n"
+            ));
             let after = Message::assistant().with_text("continued history remains\n");
             let messages = [before, boundary, after];
             let replay = capture_output(|| {
@@ -2736,7 +2741,15 @@ mod tests {
                 assert!(start < split && split < end);
                 let (before_label, after_label) = output.split_at(split);
                 assert!(before_label.contains('━') && after_label.contains('━'));
+                assert!(after_label.contains("reason: provider quota exhausted"));
+                assert!(after_label.contains("account: claude@standby"));
             }
+            let calls = super::super::tool_calls::collect(&messages);
+            assert!(calls
+                .iter()
+                .any(|call| call.output.iter().any(|text| text.contains(notice)
+                    && text.contains("reason: provider quota exhausted")
+                    && text.contains("account: claude@standby"))));
         }
         for notice in [
             "parent handoff deferred: standby unavailable",
