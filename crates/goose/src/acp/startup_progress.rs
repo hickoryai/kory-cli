@@ -128,7 +128,9 @@ fn names(targets: &[String]) -> String {
     targets
         .iter()
         .map(|target| match target.split_once('@') {
-            Some((provider, id)) if id.len() > 8 => format!("{provider}@{}…", &id[..8]),
+            Some((provider, id)) if id.chars().count() > 8 => {
+                format!("{provider}@{}…", id.chars().take(8).collect::<String>())
+            }
             _ => target.clone(),
         })
         .collect::<Vec<_>>()
@@ -138,7 +140,7 @@ fn names(targets: &[String]) -> String {
 /// The value of `key=` in a tracing line, up to the next space.
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let at = line.find(&format!("{key}="))? + key.len() + 1;
-    let value = line[at..].split_whitespace().next()?;
+    let value = line.get(at..)?.split_whitespace().next()?;
     Some(value.trim_matches('"')).filter(|v| !v.is_empty())
 }
 
@@ -186,7 +188,10 @@ mod tests {
 
     #[test]
     fn nothing_is_shown_for_the_first_ten_seconds() {
-        assert_eq!(message("router-acp", Duration::from_secs(9), &Causes::default()), None);
+        assert_eq!(
+            message("router-acp", Duration::from_secs(9), &Causes::default()),
+            None
+        );
     }
 
     #[test]
@@ -196,18 +201,38 @@ mod tests {
         else {
             panic!("expected a waiting message");
         };
-        assert_eq!(text, "router-acp is still starting provider adapters (grok@752deed2…): 40s…");
+        assert_eq!(
+            text,
+            "router-acp is still starting provider adapters (grok@752deed2…): 40s…"
+        );
+
+        let Some(Progress::Waiting(text)) = message(
+            "router-acp",
+            Duration::from_secs(40),
+            &causes(&["interposing adapter target=codex@開発者用アカウント名"]),
+        ) else {
+            panic!("expected a waiting message for a Unicode account");
+        };
+        assert!(text.contains("codex@開発者用アカウン…"), "{text}");
     }
 
     #[test]
     fn a_failed_verification_is_named_as_an_error() {
-        let Some(Progress::Failed(text)) =
-            message("router-acp", Duration::from_secs(121), &causes(&[STARTED, FAILED]))
-        else {
+        let Some(Progress::Failed(text)) = message(
+            "router-acp",
+            Duration::from_secs(121),
+            &causes(&[STARTED, FAILED]),
+        ) else {
             panic!("expected a failure");
         };
-        assert!(text.contains("codex@d16ac4a2… did not finish starting within 120s"), "{text}");
-        assert!(text.contains("continuing with the providers that started"), "{text}");
+        assert!(
+            text.contains("codex@d16ac4a2… did not finish starting within 120s"),
+            "{text}"
+        );
+        assert!(
+            text.contains("continuing with the providers that started"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -219,7 +244,10 @@ mod tests {
             panic!("expected failures");
         };
         assert!(!names_a_provider(&generic), "{generic}");
-        assert!(names_a_provider(&named) && named.contains("codex@d16ac4a2…"), "{named}");
+        assert!(
+            names_a_provider(&named) && named.contains("codex@d16ac4a2…"),
+            "{named}"
+        );
     }
 
     #[test]
