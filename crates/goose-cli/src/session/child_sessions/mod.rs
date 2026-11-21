@@ -7,6 +7,7 @@
 //! rule (working time, context bar) and input box. A child has no children, so nothing is
 //! drawn below its input box. Esc on an empty input box goes back.
 
+mod accounts;
 pub mod dock;
 mod keys;
 #[cfg(unix)]

@@ -24,6 +24,10 @@ goose is a general-purpose AI agent that runs on your machine. Not just for code
 
 A native desktop app for macOS, Linux, and Windows. A full CLI for terminal workflows. An API to embed it anywhere. Built in Rust for performance and portability.
 
+In Kory's CLI, router context handoffs and model failovers append prominent red
+dividers to the transcript. Earlier conversation remains in the session history
+and scrollback; each divider identifies the transition without clearing the screen.
+
 goose works with 15+ providers — Anthropic, OpenAI, Google, Ollama, OpenRouter, Azure, Bedrock, and more. Use API keys or your existing Claude, ChatGPT, or Gemini subscriptions via [ACP](https://goose-docs.ai/docs/guides/acp-providers). Connect to 70+ extensions via the [Model Context Protocol](https://modelcontextprotocol.io/) open standard.
 
 goose is part of the [Agentic AI Foundation (AAIF)](https://aaif.io/) at the Linux Foundation.
@@ -48,12 +52,27 @@ curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_
 
 ## CLI activity footer
 
+Router sessions pin the current account on the left of the header and fleet status
+on the right. The current account shows session-cap consumption when available,
+otherwise weekly consumption: `claude: zane@chordzy.com (45%)`. A matching capacity
+reserve adds the consumption ceiling: `(45%/80%)` means a 20% session reserve.
+The header reads router-acp's normalized account usage; model-scoped and spend caps
+are excluded, and multiple pools use the highest consumption for the selected window
+kind. Missing usage stays blank. Account data refreshes every ten seconds, with the
+last successful reading retained if a query fails. Narrow terminals prioritize the
+current account.
+
 The router session's footer reads the same `session_info_update` activity state as the
 terminal title (`_meta.routerAcp.busy`). Router-reported starts and stops control the
 timer, including autonomous wakes. Output pauses and returning to the local prompt do
 not mark the session stopped. The duration and local stop time are recorded when those
 router notifications arrive. Child sessions read their lifecycle from the existing
 `state-query v1 delegates` result. Other providers use the local interactive turn.
+
+The context bar refreshes from the provider every three seconds for the entire footer
+lifetime, including autonomous router turns while the input prompt is waiting. It follows
+the current context size after handoff or compaction, including decreases; cumulative turn
+tokens are never substituted for ACP context usage. Child-session queries do not delay it.
 
 ACP terminal exit waits and releases run outside the incoming message handler, so a
 running background command cannot block the output and kill requests needed to interrupt it.

@@ -14,6 +14,8 @@ pub fn begin() -> bool {
 
 pub fn remove_painter() {}
 
+pub fn set_header(_header: Option<Painter>) {}
+
 pub fn show_child(_transcript: &str, _painter: Painter) -> bool {
     false
 }

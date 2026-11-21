@@ -616,7 +616,7 @@ impl AcpProvider {
             thread: Some(loop_thread),
         };
 
-        let _init_response = init_rx
+        let _init_response = wait_for_initialize(&name, init_rx)
             .await
             .context("ACP client initialization cancelled")??;
 
@@ -2017,12 +2017,68 @@ async fn forward_child_stderr(mut stderr: tokio::process::ChildStderr) {
     emit_stderr_line(&mut line);
 }
 
+/// The agent's `initialize` reply, reporting progress while it takes long. It waits exactly
+/// as long as before: the ticks only report, they never time the wait out.
+async fn wait_for_initialize<T, E>(
+    agent: &str,
+    mut init_rx: oneshot::Receiver<std::result::Result<T, E>>,
+) -> std::result::Result<std::result::Result<T, E>, oneshot::error::RecvError> {
+    use super::startup_progress::{self as progress, Progress};
+    progress::reset();
+    let started = std::time::Instant::now();
+    let mut shown = false;
+    // The failure shown last: a later one naming the provider replaces a generic one.
+    let mut failed: Option<String> = None;
+    loop {
+        tokio::select! {
+            reply = &mut init_rx => {
+                if shown {
+                    // router-acp logs the provider that failed verification on stderr just
+                    // before it answers; give that line a moment to arrive and name it.
+                    let deadline = std::time::Instant::now() + progress::NAME_GRACE;
+                    while progress::snapshot().failed.is_empty() && std::time::Instant::now() < deadline {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if let Some(Progress::Failed(text)) =
+                        progress::message(agent, started.elapsed(), &progress::snapshot())
+                    {
+                        if progress::names_a_provider(&text) && failed.as_deref() != Some(text.as_str()) {
+                            progress::report(Progress::Failed(text));
+                        }
+                    }
+                    progress::report(progress::completion(agent, started.elapsed(), &reply));
+                }
+                return reply;
+            }
+            () = tokio::time::sleep(progress::TICK) => {
+                match progress::message(agent, started.elapsed(), &progress::snapshot()) {
+                    Some(Progress::Failed(text)) if failed.as_deref() != Some(text.as_str()) => {
+                        // A generic failure is replaced only by one that names the provider.
+                        if failed.is_none() || progress::names_a_provider(&text) {
+                            shown = true;
+                            failed = Some(text.clone());
+                            progress::report(Progress::Failed(text));
+                        }
+                    }
+                    Some(Progress::Waiting(text)) if failed.is_none() => {
+                        shown = true;
+                        progress::report(Progress::Waiting(text));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 fn emit_stderr_line(line: &mut Vec<u8>) {
     if line.is_empty() {
         return;
     }
     let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
-    tracing::info!(target: "goose::acp::child::stderr", "{}", String::from_utf8_lossy(trimmed));
+    let text = String::from_utf8_lossy(trimmed);
+    super::startup_progress::observe_stderr(&text);
+    tracing::info!(target: "goose::acp::child::stderr", "{}", text);
     line.clear();
 }
 

@@ -164,6 +164,8 @@ struct Shared {
 pub struct Dock {
     shared: Arc<Shared>,
     _task: AbortOnDropHandle<()>,
+    /// The account bar above the transcript, for a router session.
+    _accounts: Option<super::accounts::AccountBar>,
 }
 
 /// Where the pane's children come from: goose's own subagents and router-acp's delegates.
@@ -200,10 +202,31 @@ impl Dock {
             return None;
         }
         write_raw("\x1b[?2004h");
+        let accounts = sources
+            .router
+            .clone()
+            .map(|(source, session_id)| super::accounts::AccountBar::start(source, session_id));
         *ACTIVE.get_or_init(Mutex::default).lock().unwrap() = Arc::downgrade(&shared);
         let painter = shared.clone();
         let ticking = Arc::downgrade(&shared);
+        let context_agent = sources.agent.clone();
+        let context_session = sources.session_id.clone();
+        let context_painter = shared.clone();
         let task = tokio::spawn(async move {
+            // Router wakes keep running while the local prompt waits for input.
+            // Child queries must not hold up the provider's context display.
+            let _context = context_agent.map(|agent| {
+                AbortOnDropHandle::new(tokio::spawn(async move {
+                    let mut ticks = tokio::time::interval(super::super::CONTEXT_REFRESH);
+                    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        ticks.tick().await;
+                        context_painter
+                            .refresh_context(&agent, &context_session)
+                            .await;
+                    }
+                }))
+            });
             // The spinner turns while the session, or a child on screen, works.
             let _ticker = AbortOnDropHandle::new(tokio::spawn(async move {
                 loop {
@@ -246,6 +269,7 @@ impl Dock {
         Some(Self {
             shared,
             _task: AbortOnDropHandle::new(task),
+            _accounts: accounts,
         })
     }
 
@@ -760,6 +784,20 @@ fn with_active<R>(f: impl FnOnce(&Shared) -> R) -> Option<R> {
 }
 
 impl Shared {
+    async fn refresh_context(&self, agent: &goose::agents::Agent, session_id: &str) {
+        if let Ok(context) = super::super::load_context_usage(agent, session_id).await {
+            let changed = {
+                let mut state = self.state.lock().unwrap();
+                let changed = state.context != context;
+                state.context = context;
+                changed
+            };
+            if changed {
+                relay::repaint();
+            }
+        }
+    }
+
     /// New rows from a load; `None` (a failed query) keeps the rows already shown.
     fn update(&self, rows: Option<Vec<ChildRow>>) {
         if let Some(rows) = rows {
@@ -1300,6 +1338,78 @@ fn write_raw(text: &str) {
 mod tests {
     use super::*;
 
+    struct ContextProvider(Mutex<Option<(usize, usize)>>);
+
+    #[async_trait::async_trait]
+    impl goose::providers::base::Provider for ContextProvider {
+        fn get_name(&self) -> &str {
+            "context-test"
+        }
+        fn manages_own_context(&self) -> bool {
+            true
+        }
+        fn context_tokens(&self) -> Option<usize> {
+            self.0.lock().unwrap().map(|(used, _)| used)
+        }
+        async fn get_context_limit(&self, _model: &str, _override_limit: Option<usize>) -> usize {
+            self.0.lock().unwrap().map_or(1_000_000, |(_, size)| size)
+        }
+        async fn stream(
+            &self,
+            _model: &goose_providers::model::ModelConfig,
+            _system: &str,
+            _messages: &[goose::conversation::message::Message],
+            _tools: &[rmcp::model::Tool],
+        ) -> Result<goose::providers::base::MessageStream, goose_providers::errors::ProviderError>
+        {
+            panic!("context refresh must never prompt the provider")
+        }
+    }
+
+    #[tokio::test]
+    async fn context_refresh_at_the_prompt_tracks_autonomous_turns_and_handoffs() {
+        let session = super::super::super::tests::session_with_loader(None, false).await;
+        let provider = Arc::new(ContextProvider(Mutex::new(Some((220_000, 1_000_000)))));
+        session
+            .agent
+            .update_provider(
+                provider.clone(),
+                goose_providers::model::ModelConfig::new("context-test"),
+                &session.session_id,
+            )
+            .await
+            .unwrap();
+        let dock = typing();
+        // No local turn is started. The persistent footer still consumes every update.
+        for (report, expected) in [
+            (Some((220_000, 1_000_000)), "22% 220k/1.0M"),
+            (Some((890_000, 1_000_000)), "89% 890k/1.0M"),
+            (Some((40_000, 200_000)), "20% 40k/200k"),
+            (Some((0, 200_000)), "0% 0/200k"),
+        ] {
+            *provider.0.lock().unwrap() = report;
+            dock.shared
+                .refresh_context(&session.agent, &session.session_id)
+                .await;
+            let state = dock.shared.state.lock().unwrap();
+            assert!(state.turn_started.is_none());
+            let lines = painted(&state, 100, 40);
+            assert!(lines[0].contains(expected), "{lines:?}");
+        }
+        dock.shared
+            .refresh_context(&session.agent, "missing-session")
+            .await;
+        assert_eq!(
+            dock.shared.state.lock().unwrap().context,
+            Some((0, 200_000))
+        );
+        *provider.0.lock().unwrap() = None;
+        dock.shared
+            .refresh_context(&session.agent, &session.session_id)
+            .await;
+        assert_eq!(dock.shared.state.lock().unwrap().context, None);
+    }
+
     fn row(id: &str, status: ChildStatus) -> ChildRow {
         ChildRow {
             id: id.into(),
@@ -1320,6 +1430,7 @@ mod tests {
                 }),
             }),
             _task: AbortOnDropHandle::new(tokio::spawn(async {})),
+            _accounts: None,
         }
     }
 
