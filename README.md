@@ -69,6 +69,11 @@ not mark the session stopped. The duration and local stop time are recorded when
 router notifications arrive. Child sessions read their lifecycle from the existing
 `state-query v1 delegates` result. Other providers use the local interactive turn.
 
+The context bar refreshes from the provider every three seconds for the entire footer
+lifetime, including autonomous router turns while the input prompt is waiting. It follows
+the current context size after handoff or compaction, including decreases; cumulative turn
+tokens are never substituted for ACP context usage. Child-session queries do not delay it.
+
 ACP terminal exit waits and releases run outside the incoming message handler, so a
 running background command cannot block the output and kill requests needed to interrupt it.
 
