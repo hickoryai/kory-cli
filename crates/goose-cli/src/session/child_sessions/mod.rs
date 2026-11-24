@@ -474,7 +474,8 @@ impl ChildSessionNavigator {
                 .into_iter()
                 .filter(|id| is_router_delegate(id))
                 .collect();
-            router.follow(&router_path);
+            let child = view.child.as_ref().map(|child| child.id.as_str());
+            router.follow(&router_path, child.filter(|id| is_router_delegate(id)));
         }
         if let Some(child) = view.child.as_mut() {
             let loaded = load_child(
@@ -510,12 +511,15 @@ impl ChildSessionNavigator {
 
     pub fn close(&mut self) {
         self.open = None;
+        if let Some(router) = &self.router {
+            router.unfollow();
+        }
     }
 
     /// Hands stdin back to prompts that read it themselves; listening resumes on the next
     /// observed message.
     pub fn suspend(&mut self) {
-        self.open = None;
+        self.close();
         self.listener = None;
     }
 
@@ -782,15 +786,18 @@ async fn load_goose_snapshot(
     turn_active: bool,
 ) -> anyhow::Result<Snapshot> {
     let id = current.unwrap_or(root_id);
+    let listed = session_manager.list_child_sessions(id).await?;
+    // Polled every second: the conversation is only read for children whose state it holds.
+    if current.is_none() && listed.is_empty() {
+        return Ok(Snapshot::default());
+    }
     let session = session_manager.get_session(id, true).await?;
     let messages = session
         .conversation
         .map(|conversation| conversation.messages().clone())
         .unwrap_or_default();
     let states = subagent_states(&messages);
-    let children = session_manager
-        .list_child_sessions(id)
-        .await?
+    let children = listed
         .into_iter()
         .map(|child| ChildRow {
             status: child_status(states.get(&child.id).copied(), turn_active),

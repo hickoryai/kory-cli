@@ -466,6 +466,13 @@ impl SessionManager {
         self.storage.get_session(id, include_messages).await
     }
 
+    /// The session with the running turn, at least `context` messages before it and the first
+    /// human message, and whether older messages were left out. A partial conversation must
+    /// never be written back as the whole one.
+    pub async fn get_recent_session(&self, id: &str, context: usize) -> Result<(Session, bool)> {
+        self.storage.get_recent_session(id, context).await
+    }
+
     pub fn update(&self, id: &str) -> SessionUpdateBuilder<'_> {
         SessionUpdateBuilder::new(self, id.to_string())
     }
@@ -848,6 +855,52 @@ fn normalized_message_timestamp_sql(column: &str) -> String {
 
 fn user_visible_message_sql(column: &str) -> String {
     format!("COALESCE(json_extract({column}, '$.userVisible'), 1) != 0")
+}
+
+type MessageRow = (String, String, i64, Option<String>, Option<String>);
+
+/// Parses stored messages away from the calling task. Decoding and sanitizing tool results has
+/// no yield points, so a long conversation parsed in place freezes whatever else that task
+/// drives; in the CLI that is the input line.
+async fn parse_messages(rows: Vec<MessageRow>) -> Result<Vec<Message>> {
+    tokio::task::spawn_blocking(move || {
+        let mut messages = Vec::with_capacity(rows.len());
+        for (role, content_json, created_timestamp, metadata_json, message_id) in rows {
+            let role = match role.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                _ => continue,
+            };
+            let content = serde_json::from_str(&content_json)?;
+            let mut message = Message::new(role, created_timestamp, content);
+            message.metadata = metadata_json
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+            if let Some(id) = message_id {
+                message = message.with_id(id);
+            }
+            messages.push(message);
+        }
+        Ok(messages)
+    })
+    .await?
+}
+
+/// A message the user sent, which starts a turn.
+fn is_turn_start(message: &Message) -> bool {
+    message.role == Role::User && message.is_user_visible() && !message.is_tool_response()
+}
+
+impl Session {
+    fn set_loaded_conversation(&mut self, conversation: Conversation) {
+        let messages = conversation.messages();
+        self.message_count = messages.iter().filter(|m| m.is_user_visible()).count();
+        self.last_message_at = messages
+            .iter()
+            .filter_map(|message| message_timestamp_to_datetime(message.created))
+            .max();
+        self.conversation = Some(conversation);
+    }
 }
 
 fn session_sort_at(session: &Session) -> DateTime<Utc> {
@@ -1808,7 +1861,43 @@ impl SessionStorage {
 
     async fn get_session(&self, id: &str, include_messages: bool) -> Result<Session> {
         let pool = self.pool().await?;
-        let mut session = sqlx::query_as::<_, Session>(
+        let mut session = self.session_row(id).await?;
+
+        if include_messages {
+            let conv = self.get_conversation(&session.id).await?;
+            session.set_loaded_conversation(conv);
+        } else {
+            let sql = format!(
+                "SELECT COUNT(*) FILTER (WHERE {}), MAX({}) FROM messages WHERE session_id = ?",
+                user_visible_message_sql("metadata_json"),
+                normalized_message_timestamp_sql("created_timestamp")
+            );
+            let (count, last_message_timestamp): (i64, Option<i64>) =
+                sqlx::query_as(AssertSqlSafe(sql))
+                    .bind(&session.id)
+                    .fetch_one(pool)
+                    .await?;
+            session.message_count = count as usize;
+            session.last_message_at =
+                last_message_timestamp.and_then(message_timestamp_to_datetime);
+        }
+
+        Ok(session)
+    }
+
+    /// A session with only its recent conversation: the running turn, at least `context`
+    /// messages before it, and the session's first human message. Cost follows the turn rather
+    /// than the age of the session. The flag is whether older messages were left out.
+    async fn get_recent_session(&self, id: &str, context: usize) -> Result<(Session, bool)> {
+        let mut session = self.session_row(id).await?;
+        let (conversation, partial) = self.get_recent_conversation(&session.id, context).await?;
+        session.set_loaded_conversation(conversation);
+        Ok((session, partial))
+    }
+
+    async fn session_row(&self, id: &str) -> Result<Session> {
+        let pool = self.pool().await?;
+        sqlx::query_as::<_, Session>(
             r#"
         SELECT id, working_dir, name, description, user_set_name, session_type, created_at, updated_at, extension_data,
                total_tokens, input_tokens, output_tokens,
@@ -1827,38 +1916,7 @@ impl SessionStorage {
             .bind(id)
             .fetch_optional(pool)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-
-        if include_messages {
-            let conv = self.get_conversation(&session.id).await?;
-            session.message_count = conv
-                .messages()
-                .iter()
-                .filter(|m| m.is_user_visible())
-                .count();
-            session.last_message_at = conv
-                .messages()
-                .iter()
-                .filter_map(|message| message_timestamp_to_datetime(message.created))
-                .max();
-            session.conversation = Some(conv);
-        } else {
-            let sql = format!(
-                "SELECT COUNT(*) FILTER (WHERE {}), MAX({}) FROM messages WHERE session_id = ?",
-                user_visible_message_sql("metadata_json"),
-                normalized_message_timestamp_sql("created_timestamp")
-            );
-            let (count, last_message_timestamp): (i64, Option<i64>) =
-                sqlx::query_as(AssertSqlSafe(sql))
-                    .bind(&session.id)
-                    .fetch_one(pool)
-                    .await?;
-            session.message_count = count as usize;
-            session.last_message_at =
-                last_message_timestamp.and_then(message_timestamp_to_datetime);
-        }
-
-        Ok(session)
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2081,30 +2139,72 @@ impl SessionStorage {
             .fetch_all(pool)
             .await?;
 
-        let mut messages = Vec::new();
-        for (role_str, content_json, created_timestamp, metadata_json, message_id) in
-            rows.into_iter()
-        {
-            let role = match role_str.as_str() {
-                "user" => Role::User,
-                "assistant" => Role::Assistant,
-                _ => continue,
-            };
+        Ok(Conversation::new_unvalidated(parse_messages(rows).await?))
+    }
 
-            let content = serde_json::from_str(&content_json)?;
-            let metadata = metadata_json
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default();
-
-            let mut message = Message::new(role, created_timestamp, content);
-            message.metadata = metadata;
-            if let Some(id) = message_id {
-                message = message.with_id(id);
+    async fn get_recent_conversation(
+        &self,
+        session_id: &str,
+        context: usize,
+    ) -> Result<(Conversation, bool)> {
+        let pool = self.pool().await?;
+        let page = context.max(1);
+        let mut before = (i64::MAX, i64::MAX);
+        // Newest page first; each page is in conversation order.
+        let mut pages: Vec<Vec<Message>> = Vec::new();
+        let mut turn_started = false;
+        let mut reached_start = false;
+        loop {
+            let rows = sqlx::query_as::<_, (i64, i64, String, String, Option<String>, Option<String>)>(
+                "SELECT id, created_timestamp, role, content_json, metadata_json, message_id FROM messages \
+                 WHERE session_id = ? AND (created_timestamp, id) < (?, ?) \
+                 ORDER BY created_timestamp DESC, id DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(before.0)
+            .bind(before.1)
+            .bind(page as i64)
+            .fetch_all(pool)
+            .await?;
+            reached_start |= rows.len() < page;
+            if let Some(oldest) = rows.last() {
+                before = (oldest.1, oldest.0);
             }
-            messages.push(message);
+            let rows = rows
+                .into_iter()
+                .rev()
+                .map(|(_, created, role, content, metadata, id)| {
+                    (role, content, created, metadata, id)
+                })
+                .collect();
+            let had_turn = turn_started;
+            let messages = parse_messages(rows).await?;
+            turn_started |= messages.iter().any(is_turn_start);
+            pages.push(messages);
+            // One more page than the one the turn starts in is `context` messages before it.
+            if reached_start || had_turn {
+                break;
+            }
         }
+        let mut messages: Vec<Message> = pages.into_iter().rev().flatten().collect();
 
-        Ok(Conversation::new_unvalidated(messages))
+        if !reached_start {
+            let rows = sqlx::query_as::<_, (String, String, i64, Option<String>, Option<String>)>(
+                "SELECT role, content_json, created_timestamp, metadata_json, message_id FROM messages \
+                 WHERE session_id = ? ORDER BY created_timestamp, id LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(page as i64)
+            .fetch_all(pool)
+            .await?;
+            let opening = parse_messages(rows).await?;
+            if let Some(first) = opening.into_iter().find(is_turn_start) {
+                if first.id.is_none() || !messages.iter().any(|message| message.id == first.id) {
+                    messages.insert(0, first);
+                }
+            }
+        }
+        Ok((Conversation::new_unvalidated(messages), !reached_start))
     }
 
     async fn add_message(&self, session_id: &str, message: &Message) -> Result<()> {
@@ -5072,6 +5172,89 @@ mod tests {
         insert_usage_ledger_row(&mut tx, session_id, None, usage).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn add_texts(sm: &SessionManager, session_id: &str, texts: &[(&str, &str)]) {
+        for (index, (role, text)) in texts.iter().enumerate() {
+            let message = if *role == "user" {
+                Message::user()
+            } else {
+                Message::assistant()
+            };
+            let mut message = message.with_text(*text).with_id(*text);
+            message.created = 1_700_000_000 + index as i64 / 3;
+            sm.add_message(session_id, &message).await.unwrap();
+        }
+    }
+
+    fn texts(session: &Session) -> Vec<String> {
+        let conversation = session.conversation.as_ref().unwrap();
+        conversation
+            .messages()
+            .iter()
+            .map(Message::as_concat_text)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn recent_session_keeps_the_turn_its_context_and_the_first_human_message() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let id = new_session(&sm).await;
+        add_texts(
+            &sm,
+            &id,
+            &[
+                ("assistant", "banner"),
+                ("user", "first"),
+                ("assistant", "a1"),
+                ("assistant", "a2"),
+                ("assistant", "a3"),
+                ("assistant", "a4"),
+                ("assistant", "a5"),
+                ("user", "latest"),
+                ("assistant", "b1"),
+            ],
+        )
+        .await;
+
+        let (recent, partial) = sm.get_recent_session(&id, 2).await.unwrap();
+        assert!(partial);
+        assert_eq!(texts(&recent), ["first", "a4", "a5", "latest", "b1"]);
+
+        let whole = sm.get_session(&id, true).await.unwrap();
+        let (all, partial) = sm.get_recent_session(&id, 100).await.unwrap();
+        assert!(!partial);
+        assert_eq!(texts(&all), texts(&whole));
+    }
+
+    #[tokio::test]
+    async fn recent_session_reaches_back_to_a_turn_longer_than_its_context() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let id = new_session(&sm).await;
+        add_texts(
+            &sm,
+            &id,
+            &[
+                ("user", "old"),
+                ("assistant", "o1"),
+                ("assistant", "o2"),
+                ("assistant", "o3"),
+                ("user", "latest"),
+                ("assistant", "b1"),
+                ("assistant", "b2"),
+                ("assistant", "b3"),
+                ("assistant", "b4"),
+            ],
+        )
+        .await;
+
+        let (recent, _) = sm.get_recent_session(&id, 2).await.unwrap();
+        let texts = texts(&recent);
+        let turn = texts.iter().position(|text| text == "latest").unwrap();
+        assert_eq!(&texts[turn..], ["latest", "b1", "b2", "b3", "b4"]);
+        assert!(texts[..turn].contains(&"old".to_string()));
     }
 
     #[tokio::test]

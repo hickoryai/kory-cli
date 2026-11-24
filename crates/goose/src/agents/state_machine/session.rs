@@ -153,14 +153,46 @@ impl EffectHandler<Session, GooseEffect> for SessionManager {
     }
 }
 
+/// Messages before the running turn that a provider holding its own context may still need:
+/// the handoff memo for a fresh agent, and the provider session to resume.
+const RECENT_CONTEXT: usize = 500;
+
 struct TurnRuntime<'a> {
     session_manager: &'a SessionManager,
     usage: std::sync::Mutex<goose_providers::conversation::token_usage::Usage>,
+    /// The provider holds the conversation itself, so a turn needs only its recent part.
+    recent_only: bool,
+    /// The last load left older messages out.
+    partial: std::sync::atomic::AtomicBool,
+}
+
+/// Slash commands and recipes may rewrite the whole conversation, so they load all of it.
+fn needs_whole_conversation(session: &Session) -> bool {
+    session.recipe.is_some()
+        || session
+            .conversation()
+            .and_then(|conversation| {
+                crate::agents::state_machine::messages_since_kickoff(conversation).ok()
+            })
+            .and_then(|turn| turn.first())
+            .is_some_and(|kickoff| kickoff.as_concat_text().trim_start().starts_with('/'))
 }
 
 #[async_trait]
 impl SessionLoader<Session> for TurnRuntime<'_> {
     async fn load(&self, session_id: &str) -> Result<Session> {
+        use std::sync::atomic::Ordering;
+        if self.recent_only {
+            let (session, partial) = self
+                .session_manager
+                .get_recent_session(session_id, RECENT_CONTEXT)
+                .await?;
+            if !partial || !needs_whole_conversation(&session) {
+                self.partial.store(partial, Ordering::Release);
+                return Ok(session);
+            }
+        }
+        self.partial.store(false, Ordering::Release);
         self.session_manager.load(session_id).await
     }
 }
@@ -173,6 +205,18 @@ impl EffectHandler<Session, GooseEffect> for TurnRuntime<'_> {
         effects: &mut [GooseEffect],
         emit: &Emitter,
     ) -> Result<()> {
+        // Replacing deletes every stored message first; from a partial load that would lose
+        // the messages it left out.
+        if self.partial.load(std::sync::atomic::Ordering::Acquire)
+            && effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    GooseEffect::Conversation(ConversationEffect::ReplaceConversation(_))
+                )
+            })
+        {
+            anyhow::bail!("refusing to replace a conversation that was only partly loaded");
+        }
         self.session_manager
             .apply_effects(session, effects, emit)
             .await?;
@@ -306,7 +350,14 @@ pub(crate) async fn run(
     hook_manager: &HookManager,
     session_id: &str,
     emit: &Emitter,
+    recent_only: bool,
 ) -> Result<Session> {
+    let runtime = TurnRuntime {
+        session_manager: runtime,
+        usage: Default::default(),
+        recent_only,
+        partial: Default::default(),
+    };
     let entry_session = runtime.load(session_id).await?;
     run_turn_start_hooks(hook_manager, &entry_session).await?;
     tracing::Span::current().record(
@@ -330,10 +381,6 @@ pub(crate) async fn run(
         tracing::Span::current().record("trace_input", input.as_str());
     }
 
-    let runtime = TurnRuntime {
-        session_manager: runtime,
-        usage: Default::default(),
-    };
     let session = machine.run(&runtime, session_id, emit).await?;
     let turn_usage = runtime.usage.into_inner().unwrap();
     let last_assistant_text = session
@@ -367,6 +414,57 @@ mod tests {
     use crate::config::GooseMode;
     use crate::conversation::message::Message;
     use crate::session::session_manager::SessionType;
+
+    #[tokio::test]
+    async fn a_partial_load_never_replaces_the_stored_conversation() {
+        let manager = SessionManager::new(tempfile::tempdir().unwrap().keep());
+        let session = manager
+            .create_session(
+                "/tmp".into(),
+                "long".into(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let total = RECENT_CONTEXT * 3;
+        for index in 0..total {
+            let message = if index == 0 || index + 1 == total {
+                Message::user().with_text(format!("ask {index}"))
+            } else {
+                Message::assistant().with_text(format!("reply {index}"))
+            };
+            manager.add_message(&session.id, &message).await.unwrap();
+        }
+        let runtime = TurnRuntime {
+            session_manager: &manager,
+            usage: Default::default(),
+            recent_only: true,
+            partial: Default::default(),
+        };
+        let loaded = runtime.load(&session.id).await.unwrap();
+        assert!(loaded.conversation().unwrap().len() < total);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let emit = Emitter::new(tx, tokio_util::sync::CancellationToken::new());
+        let mut effects = vec![GooseEffect::Conversation(
+            ConversationEffect::ReplaceConversation(Conversation::default()),
+        )];
+        assert!(runtime
+            .apply_effects(&loaded, &mut effects, &emit)
+            .await
+            .is_err());
+        let stored = manager.get_session(&session.id, true).await.unwrap();
+        assert_eq!(stored.conversation.unwrap().len(), total);
+
+        // A slash command may rewrite the conversation, so it gets all of it.
+        manager
+            .add_message(&session.id, &Message::user().with_text("/clear"))
+            .await
+            .unwrap();
+        let loaded = runtime.load(&session.id).await.unwrap();
+        assert_eq!(loaded.conversation().unwrap().len(), total + 1);
+    }
 
     #[tokio::test]
     async fn live_replacement_preserves_concurrent_transcript_and_hidden_handoff() {
