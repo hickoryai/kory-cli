@@ -166,16 +166,31 @@ struct TurnRuntime<'a> {
     partial: std::sync::atomic::AtomicBool,
 }
 
-/// Slash commands and recipes may rewrite the whole conversation, so they load all of it.
+/// Recipes and the commands that rewrite the conversation load all of it. A command is acted on
+/// only as its turn's first step. Every other command is an ordinary turn: `/implement` runs for
+/// the life of a planner run.
 fn needs_whole_conversation(session: &Session) -> bool {
-    session.recipe.is_some()
-        || session
-            .conversation()
-            .and_then(|conversation| {
-                crate::agents::state_machine::messages_since_kickoff(conversation).ok()
-            })
-            .and_then(|turn| turn.first())
-            .is_some_and(|kickoff| kickoff.as_concat_text().trim_start().starts_with('/'))
+    if session.recipe.is_some() {
+        return true;
+    }
+    let Some(turn) = session.conversation().and_then(|conversation| {
+        crate::agents::state_machine::messages_since_kickoff(conversation).ok()
+    }) else {
+        return false;
+    };
+    let [command] = turn else { return false };
+    crate::agents::execute_commands::parse_slash_command(
+        &command.agent_visible_content().as_concat_text(),
+    )
+    .is_some_and(|parsed| matches!(parsed.command, "compact" | "clear"))
+}
+
+fn replaces_conversation(effect: &GooseEffect) -> bool {
+    matches!(
+        effect,
+        GooseEffect::Conversation(ConversationEffect::ReplaceConversation(_))
+            | GooseEffect::CompactConversation { .. }
+    )
 }
 
 #[async_trait]
@@ -208,12 +223,7 @@ impl EffectHandler<Session, GooseEffect> for TurnRuntime<'_> {
         // Replacing deletes every stored message first; from a partial load that would lose
         // the messages it left out.
         if self.partial.load(std::sync::atomic::Ordering::Acquire)
-            && effects.iter().any(|effect| {
-                matches!(
-                    effect,
-                    GooseEffect::Conversation(ConversationEffect::ReplaceConversation(_))
-                )
-            })
+            && effects.iter().any(replaces_conversation)
         {
             anyhow::bail!("refusing to replace a conversation that was only partly loaded");
         }
@@ -447,23 +457,52 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let emit = Emitter::new(tx, tokio_util::sync::CancellationToken::new());
-        let mut effects = vec![GooseEffect::Conversation(
-            ConversationEffect::ReplaceConversation(Conversation::default()),
-        )];
-        assert!(runtime
-            .apply_effects(&loaded, &mut effects, &emit)
-            .await
-            .is_err());
+        for effect in [
+            GooseEffect::Conversation(ConversationEffect::ReplaceConversation(
+                Conversation::default(),
+            )),
+            GooseEffect::CompactConversation {
+                conversation: Conversation::default(),
+                usage: None,
+            },
+        ] {
+            assert!(runtime
+                .apply_effects(&loaded, &mut [effect], &emit)
+                .await
+                .is_err());
+        }
         let stored = manager.get_session(&session.id, true).await.unwrap();
         assert_eq!(stored.conversation.unwrap().len(), total);
 
-        // A slash command may rewrite the conversation, so it gets all of it.
+        // `/implement` is the turn of a whole planner run, so it loads its recent part. Only a
+        // command that rewrites the conversation gets all of it.
+        let mut stored = total;
+        for (command, whole) in [
+            ("/implement", false),
+            ("/implement all", false),
+            ("/clear", true),
+            ("/compact", true),
+            ("/summarize", true),
+            ("Please compact this conversation", true),
+        ] {
+            manager
+                .add_message(&session.id, &Message::user().with_text(command))
+                .await
+                .unwrap();
+            stored += 1;
+            let loaded = runtime.load(&session.id).await.unwrap();
+            assert_eq!(
+                loaded.conversation().unwrap().len() == stored,
+                whole,
+                "{command}"
+            );
+        }
         manager
-            .add_message(&session.id, &Message::user().with_text("/clear"))
+            .add_message(&session.id, &Message::assistant().with_text("done"))
             .await
             .unwrap();
         let loaded = runtime.load(&session.id).await.unwrap();
-        assert_eq!(loaded.conversation().unwrap().len(), total + 1);
+        assert!(loaded.conversation().unwrap().len() < stored);
     }
 
     #[tokio::test]
