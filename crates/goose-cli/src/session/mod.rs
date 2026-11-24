@@ -1577,9 +1577,7 @@ impl CliSession {
         }
         let mut deferred_messages: Vec<Message> = Vec::new();
         let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
-        // An ACP agent reports its context in `usage_update`s, not turn usage, so the pane's
-        // context bar reads it on a clock while the turn runs.
-        let mut refresh_context = tokio::time::interval(CONTEXT_REFRESH);
+        let mut refresh_background = tokio::time::interval(CONTEXT_REFRESH);
         // Messages queued in the footer reach the running turn one at a time.
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut steer_retry = tokio::time::interval(STEER_RETRY);
@@ -1812,8 +1810,7 @@ impl CliSession {
                 _ = steer_retry.tick(), if self.dock().is_some_and(|dock| dock.has_queued()) => {
                     self.start_steer(&steer_tx);
                 }
-                _ = refresh_context.tick(), if self.dock().is_some() => {
-                    let _ = self.display_context_usage().await;
+                _ = refresh_background.tick(), if background.is_some() => {
                     if let Some(view) = background.as_mut() {
                         view.refresh();
                     }
@@ -2499,6 +2496,7 @@ impl CliSession {
 
     /// Display enhanced context usage with session totals
     pub async fn display_context_usage(&self) -> Result<()> {
+        // The persistent dock refreshes independently of local prompt lifetime.
         let provider = self.agent.provider(&self.session_id).await?;
         let model_config = self
             .agent
@@ -2922,13 +2920,18 @@ impl CliSession {
             };
             if let Some(step) = quit.key(key) {
                 match step {
-                    shutdown::QuitStep::Confirm => output::print_status_line(shutdown::QUIT_CONFIRM),
+                    shutdown::QuitStep::Confirm => {
+                        output::print_status_line(shutdown::QUIT_CONFIRM)
+                    }
                     shutdown::QuitStep::Quit => {
                         output::print_status_line(shutdown::EXIT_WARNING);
                         break true;
                     }
                 }
-            } else if matches!(key, child_sessions::Key::Enter | child_sessions::Key::SendNow) {
+            } else if matches!(
+                key,
+                child_sessions::Key::Enter | child_sessions::Key::SendNow
+            ) {
                 output::print_status_line(shutdown::BLOCKED);
             }
         };
@@ -3903,6 +3906,33 @@ fn headless_run_error(
 /// Tokens the context holds now. A provider that manages its own context reports this itself
 /// (ACP `usage_update.used`); its turn usage sums every model call of the turn, so it is never
 /// shown as context. For goose's own loop the last call's usage is the context.
+async fn load_context_usage(
+    agent: &goose::agents::Agent,
+    session_id: &str,
+) -> Result<Option<(usize, usize)>> {
+    let provider = agent.provider(session_id).await?;
+    let model = agent.model_config_for_session(session_id).await?;
+    let limit =
+        goose::context_limit::get_context_limit(provider.as_ref(), &model.model_name).await?;
+    let last_call = if provider.manages_own_context() {
+        None
+    } else {
+        agent
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?
+            .usage
+            .total_tokens
+    };
+    Ok(context_in_use(
+        provider.context_tokens(),
+        provider.manages_own_context(),
+        last_call,
+    )
+    .map(|used| (used, limit)))
+}
+
 fn context_in_use(
     reported: Option<usize>,
     manages_own_context: bool,
@@ -4480,7 +4510,7 @@ mod tests {
         }
     }
 
-    async fn session_with_loader(
+    pub(in crate::session) async fn session_with_loader(
         extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
         refresh_completions: bool,
     ) -> CliSession {

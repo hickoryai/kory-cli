@@ -56,6 +56,80 @@ const LEAVE: &str =
 const PILL: &str = " Jump to bottom (click) ↓ ";
 /// What can be clicked is drawn white under the pointer.
 const HOVER: &str = "\x1b[0m\x1b[97m";
+/// The whole screen's background (header, transcript, input and pane): pure black, whatever
+/// the terminal's own theme background is.
+const BAR: &str = "\x1b[48;2;0;0;0m";
+
+/// `line` kept on black through its own resets, to the end of the row.
+fn on_bar(line: &str) -> String {
+    String::from_utf8_lossy(&on_black(line.as_bytes())).into_owned()
+}
+
+/// `row` (terminal bytes) on black: black first, black again after every SGR that resets the
+/// background to the terminal's default (`0`, an empty SGR, `49`) without setting another, and
+/// a background the row sets itself is kept. The caller clears the row before painting it.
+fn on_black(row: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(row.len() + 32);
+    out.extend_from_slice(BAR.as_bytes());
+    let mut i = 0;
+    while i < row.len() {
+        if row[i] == 0x1b && row.get(i + 1) == Some(&b'[') {
+            let body_start = i + 2;
+            let mut end = body_start;
+            while end < row.len() && !(0x40..=0x7e).contains(&row[end]) {
+                end += 1;
+            }
+            if end >= row.len() {
+                out.extend_from_slice(&row[i..]);
+                break;
+            }
+            out.extend_from_slice(&row[i..=end]);
+            if row[end] == b'm' && sgr_resets_background(&row[body_start..end]) {
+                out.extend_from_slice(BAR.as_bytes());
+            }
+            i = end + 1;
+        } else {
+            out.push(row[i]);
+            i += 1;
+        }
+    }
+    out.extend_from_slice(b"\x1b[0m");
+    out
+}
+
+/// Whether an SGR's parameters leave the background at the terminal default: a reset (`0` or
+/// none) or `49` not followed by an explicit background. The arguments of 38/48/58 color
+/// selectors (`38;5;0`, `48;2;r;g;b`) are skipped, so a palette index 0 is not a reset.
+fn sgr_resets_background(params: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(params);
+    if text.is_empty() {
+        return true;
+    }
+    let fields: Vec<&str> = text.split(';').collect();
+    let mut default_bg = false;
+    let mut i = 0;
+    while i < fields.len() {
+        // A colon sub-parameter form (`38:2::r:g:b`) carries its arguments in one field.
+        let head = fields[i].split(':').next().unwrap_or("");
+        let colon_form = fields[i].contains(':');
+        match head.parse::<u16>() {
+            Err(_) if head.is_empty() => default_bg = true,
+            Ok(0 | 49) => default_bg = true,
+            // An explicit background: 48 (indexed or true color), 40–47, 100–107.
+            Ok(48 | 40..=47 | 100..=107) => default_bg = false,
+            _ => {}
+        }
+        if matches!(head, "38" | "48" | "58") && !colon_form {
+            i += match fields.get(i + 1).copied() {
+                Some("5") => 2,
+                Some("2") => 4,
+                _ => 0,
+            };
+        }
+        i += 1;
+    }
+    default_bg
+}
 /// SGR mouse button code for motion with no button held.
 const MOTION: u16 = 35;
 
@@ -119,6 +193,8 @@ struct Relay {
     real_termios: libc::termios,
     wake: [RawFd; 2],
     painter: Mutex<Option<Painter>>,
+    /// The bar pinned above the transcript (the account status), drawn on every frame.
+    header: Mutex<Option<Painter>>,
     /// A child session shown in place of the session's own transcript and pane.
     child: Mutex<Option<ChildFeed>>,
     stop: AtomicBool,
@@ -189,6 +265,14 @@ pub fn install(painter: Painter) -> bool {
 /// session's header and everything after it are in the transcript; the pane comes later.
 pub fn begin() -> bool {
     RELAY.get_or_init(start).is_some()
+}
+
+/// The bar drawn above the transcript, or none.
+pub fn set_header(header: Option<Painter>) {
+    if let Some(relay) = active() {
+        *relay.header.lock().unwrap() = header;
+        relay.wake();
+    }
 }
 
 /// The pane goes away; the transcript stays on screen.
@@ -355,6 +439,7 @@ fn start() -> Option<Arc<Relay>> {
             real_termios,
             wake,
             painter: Mutex::new(None),
+            header: Mutex::new(None),
             child: Mutex::new(None),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
@@ -612,12 +697,19 @@ impl Relay {
                 let pane = painter
                     .map(|painter| painter(size.0, size.1))
                     .unwrap_or_default();
+                let header = self
+                    .header
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .map(|header| header(size.0, size.1))
+                    .unwrap_or_default();
                 let mut out = view.forwarded();
                 match child.as_mut() {
                     Some(shown) => {
-                        out.extend_from_slice(&shown.view.frame(&pane));
+                        out.extend_from_slice(&shown.view.frame_with(&header, &pane));
                     }
-                    None => out.extend_from_slice(&view.frame(&pane)),
+                    None => out.extend_from_slice(&view.frame_with(&header, &pane)),
                 }
                 write_fd(self.real_out, &out);
                 last_frame = Instant::now();
@@ -786,6 +878,10 @@ struct View {
     held_since: Option<Instant>,
     /// The transcript rows on screen at the last frame, for clicks on the pill.
     transcript_rows: usize,
+    /// Rows the header bar took at the last frame; mouse rows below it are counted from it.
+    top: usize,
+    /// The last byte of output fed so far was a carriage return.
+    after_cr: bool,
     /// The transcript row at the top of the screen at the last frame, for mouse positions.
     view_start: usize,
     selection: Option<Selection>,
@@ -820,6 +916,8 @@ impl View {
             held: Vec::new(),
             held_since: None,
             transcript_rows: 0,
+            top: 0,
+            after_cr: false,
             view_start: 0,
             selection: None,
             clipboard: None,
@@ -865,7 +963,8 @@ impl View {
     }
 
     fn output(&mut self, bytes: &[u8]) {
-        self.log.extend_from_slice(bytes);
+        let fed = self.feed(bytes);
+        self.log.extend_from_slice(&fed);
         if self.log.len() > LOG_LIMIT {
             // Keep the newer half, from a line start.
             let cut = self.log.len() - LOG_LIMIT / 2;
@@ -875,7 +974,6 @@ impl View {
                 .map_or(cut, |offset| cut + offset + 1);
             self.log.drain(..cut);
         }
-        self.parser.process(bytes);
         self.take_marks();
         if let Some(question) = self.parser.callbacks_mut().question.take() {
             self.question = question;
@@ -883,6 +981,41 @@ impl View {
                 self.scroll_up = 0;
             }
         }
+    }
+
+    /// Feeds output to the emulator and returns what it was fed. A line feed with no carriage
+    /// return before it (written while something had the session's terminal in raw output mode,
+    /// OPOST/ONLCR off) gets one, as the terminal's own newline translation would have given it,
+    /// so the transcript never staircases. A full-screen program keeps its bare line feeds, which
+    /// may mean "down one row"; the screen is checked at each line feed, so switching to the
+    /// alternate screen partway through a chunk is honored.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() + 8);
+        let mut start = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            self.parser.process(&bytes[start..index]);
+            out.extend_from_slice(&bytes[start..index]);
+            let after_cr = match index.checked_sub(1) {
+                Some(previous) if previous >= start => bytes[previous] == b'\r',
+                _ => out.last().map_or(self.after_cr, |last| *last == b'\r'),
+            };
+            if !after_cr && !self.parser.screen().alternate_screen() {
+                self.parser.process(b"\r");
+                out.push(b'\r');
+            }
+            self.parser.process(b"\n");
+            out.push(b'\n');
+            start = index + 1;
+        }
+        self.parser.process(&bytes[start..]);
+        out.extend_from_slice(&bytes[start..]);
+        if let Some(last) = out.last() {
+            self.after_cr = *last == b'\r';
+        }
+        out
     }
 
     fn take_replies(&mut self) -> Vec<u8> {
@@ -1031,6 +1164,14 @@ impl View {
     }
 
     fn mouse(&mut self, (button, col, row, pressed): (u16, u16, u16, bool)) -> bool {
+        // Everything below the header bar counts its rows from the bar's bottom. On the bar a
+        // click or hover does nothing; a drag or release there acts at the first row under it.
+        let top = self.top as u16;
+        let on_bar = row < top;
+        let row = row.saturating_sub(top);
+        if on_bar && ((button == 0 && pressed) || button == MOTION) {
+            return std::mem::take(&mut self.hover).is_some();
+        }
         match button {
             64 => self.scroll(WHEEL_ROWS as isize),
             65 => self.scroll(-(WHEEL_ROWS as isize)),
@@ -1243,16 +1384,24 @@ impl View {
         out
     }
 
-    /// One frame: the transcript's rows down to the pane, the pill when scrolled up, the pane.
+    /// One frame with no header bar.
+    #[cfg(test)]
     fn frame(&mut self, pane: &[String]) -> Vec<u8> {
+        self.frame_with(&[], pane)
+    }
+
+    /// One frame: the header bar, the transcript's rows down to the pane, the pill when
+    /// scrolled up, the pane. Every row is drawn on black.
+    fn frame_with(&mut self, header: &[String], pane: &[String]) -> Vec<u8> {
         let (cols, lines) = self.size();
         let mut out = b"\x1b[?2026h\x1b[?25l".to_vec();
         if self.parser.screen().alternate_screen() {
-            // A full-screen program: its screen as is.
+            // A full-screen program: its screen as is, with no header over it.
+            self.top = 0;
             let screen = self.parser.screen();
             for (row, text) in screen.rows_formatted(0, cols as u16).enumerate() {
-                out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", row + 1).into_bytes());
-                out.extend_from_slice(&text);
+                out.extend(format!("\x1b[{};1H\x1b[0m{BAR}\x1b[2K", row + 1).into_bytes());
+                out.extend_from_slice(&on_black(&text));
             }
             let (row, col) = screen.cursor_position();
             out.extend(format!("\x1b[0m\x1b[{};{}H", row + 1, col + 1).into_bytes());
@@ -1276,6 +1425,21 @@ impl View {
                 console::truncate_str(line, cols.saturating_sub(1), "").into_owned()
             })
             .collect();
+        // The header takes the top rows only while at least one transcript row remains.
+        let top = header.len().min(lines.saturating_sub(pane.len() + 1));
+        self.top = top;
+        for (index, line) in header.iter().take(top).enumerate() {
+            // Like the pane's rows, never into the last column: a row written there leaves the
+            // terminal waiting to wrap, and some wrap at once and carry the rest onto the next row.
+            out.extend(format!("\x1b[{};1H{BAR}\x1b[2K", index + 1).into_bytes());
+            out.extend(
+                on_bar(&console::truncate_str(line, cols.saturating_sub(1), "")).into_bytes(),
+            );
+        }
+        // Below the header, rows are numbered as if it were not there; `place` puts them on
+        // the screen (1-based).
+        let place = |row: usize| row + top + 1;
+        let lines = lines - top;
         let rows = lines - pane.len();
         self.pane_children = children
             .into_iter()
@@ -1294,11 +1458,9 @@ impl View {
         self.view_start = view_start;
         let shown = self.rows(view_start, view_end);
         for row in 0..rows {
-            out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", row + 1).into_bytes());
-            if let Some(text) = shown.get(row) {
-                out.extend_from_slice(text);
-                out.extend_from_slice(b"\x1b[0m");
-            }
+            out.extend(format!("\x1b[{};1H\x1b[0m{BAR}\x1b[2K", place(row)).into_bytes());
+            let text = shown.get(row).map_or(&[][..], Vec::as_slice);
+            out.extend_from_slice(&on_black(text));
         }
         if let Some(selection) = self.selection {
             for at in view_start..view_end {
@@ -1308,8 +1470,8 @@ impl View {
                 let (text, _) = self.row_text(at, first, width);
                 out.extend(
                     format!(
-                        "\x1b[{};{}H\x1b[0m\x1b[7m{}\x1b[0m",
-                        at - view_start + 1,
+                        "\x1b[{};{}H\x1b[0m{BAR}\x1b[7m{}\x1b[0m",
+                        place(at - view_start),
                         first + 1,
                         text.trim_end()
                     )
@@ -1321,27 +1483,28 @@ impl View {
         let hovered = self.hovered().map(|(row, _)| row);
         if let Some(row) = hovered.filter(|row| *row < rows) {
             let (text, _) = self.row_text(view_start + row, 0, cols);
-            out.extend(
-                format!(
-                    "\x1b[{};1H\x1b[0m\x1b[2K{HOVER}{}\x1b[0m",
-                    row + 1,
-                    text.trim_end()
-                )
-                .into_bytes(),
-            );
+            out.extend(format!("\x1b[{};1H\x1b[0m{BAR}\x1b[2K", place(row)).into_bytes());
+            out.extend(on_bar(&format!("{HOVER}{}", text.trim_end())).into_bytes());
         }
         if self.scroll_up > 0 && rows > 0 {
             let (start, _) = pill_columns(cols);
             out.extend(
-                format!("\x1b[{rows};{}H\x1b[0m\x1b[7m{PILL}\x1b[0m", start + 1).into_bytes(),
+                format!(
+                    "\x1b[{};{}H\x1b[0m\x1b[7m{PILL}\x1b[0m",
+                    place(rows - 1),
+                    start + 1
+                )
+                .into_bytes(),
             );
         }
         for (index, line) in pane.iter().enumerate() {
-            out.extend(format!("\x1b[{};1H\x1b[0m\x1b[2K", rows + index + 1).into_bytes());
+            out.extend(format!("\x1b[{};1H{BAR}\x1b[2K", place(rows + index)).into_bytes());
             if hovered == Some(rows + index) {
-                out.extend(format!("{HOVER}{}", console::strip_ansi_codes(line)).into_bytes());
+                out.extend(
+                    on_bar(&format!("{HOVER}{}", console::strip_ansi_codes(line))).into_bytes(),
+                );
             } else {
-                out.extend_from_slice(line.as_bytes());
+                out.extend(on_bar(line).into_bytes());
             }
         }
         out.extend_from_slice(b"\x1b[0m");
@@ -1356,7 +1519,7 @@ impl View {
             out.extend(
                 format!(
                     "\x1b[{};{}H\x1b[?25h",
-                    transcript_row - view_start + 1,
+                    place(transcript_row - view_start),
                     col + 1
                 )
                 .into_bytes(),
@@ -1515,7 +1678,7 @@ mod tests {
         assert!(input.scrolled && input.forward.is_empty());
         let frame = String::from_utf8_lossy(&view.frame(&pane)).into_owned();
         assert!(
-            frame.contains(&format!("{HOVER}  ▸ Read file")),
+            frame.contains(&on_bar(&format!("{HOVER}  ▸ Read file"))),
             "{frame:?}"
         );
 
@@ -1533,9 +1696,152 @@ mod tests {
 
         view.input(b"\x1b[<35;4;8M", Instant::now());
         let frame = String::from_utf8_lossy(&view.frame(&pane)).into_owned();
-        assert!(frame.contains(&format!("{HOVER}  child row")), "{frame:?}");
+        assert!(
+            frame.contains(&on_bar(&format!("{HOVER}  child row"))),
+            "{frame:?}"
+        );
         let input = view.input(b"\x1b[<0;4;8M", Instant::now());
         assert_eq!(input.activate, Some(Target::Child(3)));
+    }
+
+    #[test]
+    fn the_header_bar_sits_above_the_transcript_on_black_and_takes_no_clicks() {
+        let (mut view, pane) = clickable_view();
+        let header = vec!["● 2 claude".to_string(), "────".to_string()];
+        let frame = view.frame_with(&header, &pane);
+        let rows = screen(&frame, 60, 8);
+        assert_eq!(&rows[..3], ["● 2 claude", "────", "intro"]);
+        assert_eq!(rows[7], "  child row");
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        assert!(text.contains(&on_bar("● 2 claude")) && text.contains(&on_bar("────")));
+
+        // The tool call is now on screen row 4 (1-based): the click finds it there.
+        let input = view.input(b"\x1b[<0;5;4M\x1b[<0;5;4m", Instant::now());
+        assert_eq!(input.activate, Some(Target::ToolCall("call-1".into())));
+        // A click on the bar opens nothing and starts no selection.
+        let input = view.input(b"\x1b[<0;5;1M", Instant::now());
+        assert!(input.activate.is_none() && view.selection.is_none());
+    }
+
+    #[test]
+    fn a_row_stays_black_through_every_reset_but_keeps_its_own_backgrounds() {
+        let row =
+            b"a\x1b[0mb\x1b[mc\x1b[49md\x1b[1;38;5;0me\x1b[48;5;4mf\x1b[0;48;2;1;2;3mg\x1b[0;31mh";
+        let mut terminal = vt100::Parser::new(2, 8, 0);
+        terminal.process(&on_black(row));
+        assert_eq!(terminal.screen().contents(), "abcdefgh");
+        for col in [0, 1, 2, 3, 4, 7] {
+            assert_eq!(
+                terminal.screen().cell(0, col).unwrap().bgcolor(),
+                vt100::Color::Rgb(0, 0, 0)
+            );
+        }
+        assert_eq!(
+            terminal.screen().cell(0, 5).unwrap().bgcolor(),
+            vt100::Color::Idx(4)
+        );
+        assert_eq!(
+            terminal.screen().cell(0, 6).unwrap().bgcolor(),
+            vt100::Color::Rgb(1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn full_width_transcript_and_alternate_screen_rows_keep_the_last_cell() {
+        for alternate in [false, true] {
+            let mut view = View::new(8, 4);
+            if alternate {
+                view.output(b"\x1b[?1049h");
+            }
+            view.output(b"12345678\r\nABCDEFGH");
+            let rows = screen(&view.frame(&[]), 8, 4);
+            assert_eq!(rows.get(..2).unwrap(), ["12345678", "ABCDEFGH"]);
+        }
+    }
+
+    #[test]
+    fn the_whole_screen_is_drawn_on_black() {
+        let (mut view, pane) = clickable_view();
+        let header = vec!["● claude".to_string(), "────".to_string()];
+        let frame = String::from_utf8_lossy(&view.frame_with(&header, &pane)).into_owned();
+        // Every row the frame positions (header, transcript, pane) is cleared in black, and the
+        // transcript's own resets cannot bring back the terminal's background.
+        for row in 1..=8 {
+            let clear = format!("\x1b[{row};1H");
+            let at = frame
+                .find(&clear)
+                .unwrap_or_else(|| panic!("row {row} not drawn"));
+            let next = frame.get(at + clear.len()..).unwrap();
+            assert!(
+                next.starts_with(&format!("{BAR}\x1b[2K"))
+                    || next.starts_with(&format!("\x1b[0m{BAR}\x1b[2K")),
+                "row {row}: {next:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_line_feeds_return_the_carriage_so_the_transcript_never_staircases() {
+        // Written while something had the session's terminal in raw output mode (OPOST off).
+        let mut view = View::new(60, 8);
+        view.output(
+            b"\xe2\x96\xb8 router-acp \xc2\xb7 resumed\n\xe2\x96\xb8 planner \xe2\x86\x92 opus\n",
+        );
+        // A line feed at the start of a chunk, after a chunk that ended mid-line.
+        view.output(b"tail");
+        view.output(b"\nnext\r\n");
+        let rows = screen(&view.frame(&[]), 60, 8);
+        assert_eq!(
+            &rows[..4],
+            ["▸ router-acp · resumed", "▸ planner → opus", "tail", "next"]
+        );
+        let log = String::from_utf8_lossy(&view.log).into_owned();
+        assert_eq!(log.matches("\r\n").count(), 4, "{log:?}");
+        assert!(
+            !log.contains("\r\r\n"),
+            "an existing CRLF is left alone: {log:?}"
+        );
+
+        // A full-screen program keeps its bare line feeds: there LF means "down one row".
+        let mut full = View::new(20, 6);
+        full.output(b"\x1b[?1049h\x1b[1;5Habc\ndef");
+        let screen = full.parser.screen();
+        let at = |col| screen.cell(1, col).map(|cell| cell.contents().to_string());
+        assert_eq!(at(7).as_deref(), Some("d"), "the bare LF kept the column");
+        assert_eq!(
+            at(0).as_deref(),
+            Some(""),
+            "and did not return to the first one"
+        );
+    }
+
+    #[test]
+    fn the_transcript_starts_exactly_the_header_height_down_and_keeps_its_rows() {
+        let banner: String = (0..30).map(|i| format!("  ▄▀ banner {i}\r\n")).collect();
+        let mut plain = View::new(60, 12);
+        plain.output(banner.as_bytes());
+        let mut headed = View::new(60, 12);
+        headed.output(banner.as_bytes());
+        // Full-width header rows, as an account bar on a narrow terminal could produce.
+        let header = vec!["●".repeat(60), "─".repeat(60)];
+        let without = screen(&plain.frame(&pane()), 60, 12);
+        let frame = headed.frame_with(&header, &pane());
+        let with = screen(&frame, 60, 12);
+        assert_eq!(
+            headed.top,
+            header.len(),
+            "the transcript's top offset is the header height"
+        );
+        // The transcript is bottom-aligned in both: below the header the rows are the same.
+        assert_eq!(&with[2..10], &without[2..10]);
+        assert_eq!(&with[10..], &without[10..], "the pane stays at the bottom");
+        // Neither header row is drawn into the last column, so nothing wraps.
+        assert_eq!(with[0].chars().count(), 59);
+        assert_eq!(with[1].chars().count(), 59);
+        // A full-screen program draws over the whole screen with no offset.
+        headed.output(b"\x1b[?1049h");
+        headed.frame_with(&header, &pane());
+        assert_eq!(headed.top, 0);
     }
 
     #[test]

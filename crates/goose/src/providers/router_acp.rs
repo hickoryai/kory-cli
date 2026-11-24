@@ -131,6 +131,210 @@ impl RouterStateSource {
         }
         parse_delegates(&output.stdout)
     }
+
+    /// Every account router-acp routes to, from its sanitized `account-status` reader (labels,
+    /// providers and availability only; it never prints a credential).
+    pub async fn accounts(&self, timeout: Duration) -> Result<Vec<RouterAccount>> {
+        parse_accounts(&self.run(&["account-status"], &[], timeout).await?)
+    }
+
+    /// The account (router agent, e.g. `claude@<id>`) a router session is routed to now.
+    pub async fn session_agent(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<String>> {
+        let output = self
+            .run(
+                &["state-query"],
+                &["v1", "session", "--session", session_id],
+                timeout,
+            )
+            .await?;
+        parse_session_agent(&output)
+    }
+
+    /// `router-acp <command> --config <config> <rest>`, its stdout when it succeeds.
+    async fn run(
+        &self,
+        command_args: &[&str],
+        rest: &[&str],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
+            .args(command_args)
+            .arg("--config")
+            .arg(&self.config)
+            .args(rest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        crate::subprocess::configure_subprocess(&mut command);
+        let name = command_args.first().copied().unwrap_or("command");
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("router-acp {name} timed out"))??;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let reason = stderr.trim().lines().last().unwrap_or("no error output");
+            anyhow::bail!("router-acp {name} failed: {reason}");
+        }
+        Ok(output.stdout)
+    }
+}
+
+/// One account from `router-acp account-status`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterAccount {
+    /// The router agent name, e.g. `claude@<id>`.
+    pub id: String,
+    pub provider: String,
+    /// The account's sign-in label (its email), or its id when it has none.
+    pub label: String,
+    pub state: AccountState,
+    pub usage: Option<AccountUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountUsage {
+    pub percent: i64,
+    /// The selected window's consumption ceiling when capacity is reserved.
+    pub max_percent: Option<f64>,
+}
+
+/// Whether an account is signed in, and whether the router can use it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountState {
+    /// Signed in and routable.
+    Available,
+    /// Signed in (`authState` "authenticated"), but the router is not routing to it now: a
+    /// usage limit, a reserve or a cordon.
+    Paused,
+    /// Authentication failed, or neither authentication nor routability is confirmed.
+    SignedOut,
+}
+
+impl AccountState {
+    pub fn signed_in(self) -> bool {
+        self != AccountState::SignedOut
+    }
+}
+
+pub fn parse_accounts(json: &[u8]) -> Result<Vec<RouterAccount>> {
+    #[derive(Deserialize)]
+    struct Status {
+        accounts: Vec<Account>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Account {
+        id: String,
+        provider: Option<String>,
+        label: Option<String>,
+        auth_state: Option<String>,
+        routing: Option<Routing>,
+        usage: Option<Usage>,
+        reserve_capacity: Option<ReserveCapacity>,
+    }
+    #[derive(Deserialize)]
+    struct Routing {
+        available: Option<bool>,
+        reason: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Usage {
+        #[serde(default)]
+        windows: Vec<Window>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Window {
+        id: Option<String>,
+        percent: Option<i64>,
+        scope: Option<String>,
+        reserve_kind: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct ReserveCapacity {
+        session: Option<f64>,
+        weekly: Option<f64>,
+    }
+    let status: Status = serde_json::from_slice(json)?;
+    Ok(status
+        .accounts
+        .into_iter()
+        .map(|account| {
+            let routing = account.routing.as_ref();
+            let state = if routing.and_then(|r| r.reason.as_deref()) == Some("authentication") {
+                AccountState::SignedOut
+            } else if routing.and_then(|r| r.available) == Some(true) {
+                AccountState::Available
+            } else if account.auth_state.as_deref() != Some("authenticated") {
+                AccountState::SignedOut
+            } else {
+                AccountState::Paused
+            };
+            // Use the router's normalized windows, excluding model-scoped and spend caps.
+            // For multiple pools, show the most consumed window of the preferred kind.
+            let usage = account.usage.as_ref().and_then(|usage| {
+                let window = usage
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        window.scope.is_none()
+                            && window.id.as_deref() != Some("weekly_scoped")
+                            && window.percent.is_some_and(|percent| percent >= 0)
+                            && matches!(window.reserve_kind.as_deref(), Some("session" | "weekly"))
+                    })
+                    .max_by_key(|window| {
+                        (
+                            window.reserve_kind.as_deref() == Some("session"),
+                            window.percent,
+                        )
+                    })?;
+                let reserve = account.reserve_capacity.as_ref().and_then(|reserve| {
+                    if window.reserve_kind.as_deref() == Some("session") {
+                        reserve.session
+                    } else {
+                        reserve.weekly
+                    }
+                });
+                Some(AccountUsage {
+                    percent: window.percent?,
+                    max_percent: reserve
+                        .filter(|reserve| {
+                            reserve.is_finite() && *reserve > 0.0 && *reserve <= 100.0
+                        })
+                        .map(|reserve| 100.0 - reserve),
+                })
+            });
+            RouterAccount {
+                provider: account.provider.unwrap_or_else(|| {
+                    account.id.split('@').next().unwrap_or_default().to_string()
+                }),
+                label: account
+                    .label
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| account.id.clone()),
+                state,
+                usage,
+                id: account.id,
+            }
+        })
+        .collect())
+}
+
+pub fn parse_session_agent(json: &[u8]) -> Result<Option<String>> {
+    let value: serde_json::Value = serde_json::from_slice(json)?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        anyhow::bail!("unexpected router-acp state-query session reply");
+    }
+    Ok(value
+        .pointer("/data/session/agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -333,6 +537,62 @@ impl ProviderDef for RouterAcpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_status_preserves_authentication_and_routing_evidence() {
+        // The shape `router-acp account-status` printed on 2026-11-19 (labels replaced).
+        let reply = br#"{"revision":"r","accounts":[
+            {"id":"claude@a","provider":"claude","label":"a@example.com","plan":"Personal Max","authState":"authenticated","credentialPresent":true,"priority":1,"routing":{"available":true,"reason":null,"resetsAt":null}},
+            {"id":"claude@w","provider":"claude","label":"w@example.com","authState":"authenticated","routing":{"available":false,"reason":"capacity","resetsAt":"2026-11-25T04:00:00.377938+00:00"}},
+            {"id":"claude@b","provider":"claude","label":"b@example.com","authState":"rejected","routing":{"available":false,"reason":"authentication","resetsAt":null}},
+            {"id":"grok@c","label":"","routing":null}]}"#;
+        let accounts = parse_accounts(reply).unwrap();
+        assert_eq!(accounts.len(), 4);
+        assert_eq!(accounts[0].state, AccountState::Available);
+        assert_eq!(accounts[0].label, "a@example.com");
+        assert_eq!(
+            accounts[1].state,
+            AccountState::Paused,
+            "authenticated but at a limit is still signed in"
+        );
+        assert!(accounts[1].state.signed_in());
+        assert_eq!(accounts[2].state, AccountState::SignedOut);
+        assert_eq!(
+            (
+                accounts[3].provider.as_str(),
+                accounts[3].label.as_str(),
+                accounts[3].state
+            ),
+            ("grok", "grok@c", AccountState::SignedOut),
+            "a missing provider, label or sign-in falls back without guessing it signed in"
+        );
+        let sparse = parse_accounts(br#"{"accounts":[
+            {"id":"codex@a","routing":{"available":true}},
+            {"id":"codex@b","authState":"refreshing","routing":{"available":true}},
+            {"id":"codex@c","authState":"authenticated","routing":{"available":true,"reason":"authentication"}},
+            {"id":"grok@d"}]}"#).unwrap();
+        assert_eq!(
+            sparse.iter().map(|a| a.state).collect::<Vec<_>>(),
+            [
+                AccountState::Available,
+                AccountState::Available,
+                AccountState::SignedOut,
+                AccountState::SignedOut
+            ]
+        );
+    }
+
+    #[test]
+    fn session_agent_comes_from_a_v1_session_envelope() {
+        // The shape `router-acp state-query v1 session --session <id>` printed for a live
+        // planner parent on 2026-11-19 (trimmed).
+        let reply = br#"{"version":1,"command":"session","data":{"session":{"router_session_id":"rtr-1","agent":"claude@a","model":"claude-opus-5-5","routing":{"candidate":"claude@a/claude-opus-5-5"}}}}"#;
+        assert_eq!(
+            parse_session_agent(reply).unwrap().as_deref(),
+            Some("claude@a")
+        );
+        assert!(parse_session_agent(br#"{"version":2}"#).is_err());
+    }
 
     #[test]
     fn delegates_reply_is_read_only_from_a_v1_delegates_envelope() {

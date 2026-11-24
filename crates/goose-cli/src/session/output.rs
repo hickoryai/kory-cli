@@ -1017,6 +1017,42 @@ fn print_tool_call_line(summary: &str) {
     print_marked_tool_call_line(summary, None);
 }
 
+/// Presentation only: append a boundary to the existing scrollback. Neither the
+/// stored conversation nor already-rendered transcript is cleared or replaced.
+fn print_context_boundary(label: &str) {
+    if !at_line_start() {
+        outln!();
+    }
+    outln!();
+    for line in context_boundary_lines(label, terminal_width().unwrap_or(80)) {
+        outln!("{}", style(line).red().bold());
+    }
+    outln!();
+}
+
+fn context_boundary_lines(label: &str, width: usize) -> Vec<String> {
+    let width = width.saturating_sub(1).max(1);
+    let bar = "━".repeat(width);
+    let label = sanitize_terminal_line(label);
+    // Keep the reason in full, wrapping at terminal cells rather than cutting
+    // it off or letting a long model/account id wrap the separator itself.
+    let mut lines = vec![bar.clone()];
+    let mut line = String::new();
+    for ch in label.chars() {
+        let mut next = line.clone();
+        next.push(ch);
+        if measure_text_width(&next) > width && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        line.push(ch);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines.push(bar);
+    lines
+}
+
 /// `print_tool_call_line` for call `id`: the line carries the relay's mark, so a click on it
 /// opens that call. The mark shows nothing and is on the line itself, captured or not.
 fn print_marked_tool_call_line(summary: &str, id: Option<&str>) {
@@ -1115,6 +1151,13 @@ fn render_reply_text(text: &str, buffer: &mut MarkdownBuffer, theme: Theme) {
             }
             super::router_notices::Segment::Notice(notice) => {
                 flush_markdown_buffer(buffer, theme);
+                if let Some(label) = super::router_notices::context_boundary(&notice) {
+                    print_context_boundary(&label);
+                    for detail in notice.lines().skip(1) {
+                        print_status_line(detail);
+                    }
+                    continue;
+                }
                 if let Some(message) = super::router_notices::external_message(&notice) {
                     print_external_message(&message);
                     continue;
@@ -2654,6 +2697,81 @@ mod tests {
             printed,
             "  ▸ Terminal\n  ▸ router-acp · delegate_task Feature · planner → opus\nOn it."
         );
+    }
+
+    #[test]
+    fn context_handoffs_and_failovers_append_boundaries_without_losing_history() {
+        for (notice, title) in [
+            (
+                "router-acp · parent context refreshed — context backstop; model codex/sol",
+                "CONTEXT HANDOFF",
+            ),
+            (
+                "router-acp · failover: cordon → claude/opus · task Bugfix (usage limit)",
+                "AUTOMATIC MODEL FAILOVER",
+            ),
+            (
+                "router-acp · switched codex/sol → claude/opus — outage",
+                "MODEL HANDOFF",
+            ),
+            (
+                "router-acp · Reserve reached: switching to GPT-6.1 Sol",
+                "AUTOMATIC MODEL FAILOVER",
+            ),
+            (
+                "router-acp · Claude Opus outage: retrying Claude Opus",
+                "AUTOMATIC MODEL FAILOVER",
+            ),
+        ] {
+            let before = Message::assistant().with_text("earlier history remains\n");
+            let boundary = Message::assistant().with_text(format!(
+                "> {notice}\n> reason: provider quota exhausted\n> account: claude@standby\n\n"
+            ));
+            let after = Message::assistant().with_text("continued history remains\n");
+            let messages = [before, boundary, after];
+            let replay = capture_output(|| {
+                for message in &messages {
+                    render_message(message, false);
+                }
+            });
+            for output in [stream(&messages), replay] {
+                let start = output.find("earlier history remains").unwrap();
+                let split = output.find(title).unwrap();
+                let end = output.find("continued history remains").unwrap();
+                assert!(start < split && split < end);
+                let (before_label, after_label) = output.split_at(split);
+                assert!(before_label.contains('━') && after_label.contains('━'));
+                assert!(after_label.contains("reason: provider quota exhausted"));
+                assert!(after_label.contains("account: claude@standby"));
+            }
+            let calls = super::super::tool_calls::collect(&messages);
+            assert!(calls
+                .iter()
+                .any(|call| call.output.iter().any(|text| text.contains(notice)
+                    && text.contains("reason: provider quota exhausted")
+                    && text.contains("account: claude@standby"))));
+        }
+        for notice in [
+            "parent handoff deferred: standby unavailable",
+            "Account limit: no other model can serve; retrying GPT-6.1 Sol in 4m",
+            "Account limit: retrying GPT-6.1 Sol now",
+        ] {
+            let ordinary = stream(&[Message::assistant()
+                .with_text(format!("> router-acp · {notice}\n\nStill working."))]);
+            assert!(
+                !ordinary.contains('━'),
+                "a deferred or pending attempt is not a context boundary"
+            );
+            assert!(ordinary.contains("Still working."));
+        }
+    }
+
+    #[test]
+    fn context_boundary_fits_narrow_terminals_and_keeps_its_label() {
+        let label = "MODEL HANDOFF · old → new · quota exhausted";
+        let lines = context_boundary_lines(label, 18);
+        assert!(lines.iter().all(|line| measure_text_width(line) < 18));
+        assert_eq!(lines[1..lines.len() - 1].join(""), label);
     }
 
     #[test]
