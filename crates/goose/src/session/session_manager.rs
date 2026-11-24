@@ -466,6 +466,12 @@ impl SessionManager {
         self.storage.get_session(id, include_messages).await
     }
 
+    /// The session's own row. `get_session` also counts every message of the conversation, which
+    /// takes a second in a long one; this is for callers that read settings, on every key and tick.
+    pub async fn get_session_settings(&self, id: &str) -> Result<Session> {
+        self.storage.session_row(id).await
+    }
+
     /// The session with the running turn, at least `context` messages before it and the first
     /// human message, and whether older messages were left out. A partial conversation must
     /// never be written back as the whole one.

@@ -709,7 +709,7 @@ impl ExtensionManager {
         let session = self
             .context
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await?;
         self.session_lease(&session).await
     }
@@ -880,7 +880,7 @@ impl ExtensionManager {
     async fn session(&self, session_id: &str) -> ExtensionResult<Session> {
         self.context
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await
             .map_err(|error| ExtensionError::SetupError(error.to_string()))
     }
@@ -1065,7 +1065,7 @@ impl ExtensionManager {
         let session = self
             .context
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await?;
         Ok(selection(&session))
     }

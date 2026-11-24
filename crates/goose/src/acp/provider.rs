@@ -417,6 +417,8 @@ impl AcpEffortState {
 #[derive(Clone)]
 struct AcpSessionState {
     active_id: Arc<Mutex<Option<SessionId>>>,
+    /// A `session/load` is in flight: the agent is replaying the conversation.
+    loading: Arc<AtomicBool>,
     effort: AcpEffortState,
     terminal: TerminalManager,
 }
@@ -425,6 +427,7 @@ impl AcpSessionState {
     fn new(effort: AcpEffortState, terminal: TerminalManager) -> Self {
         Self {
             active_id: Arc::new(Mutex::new(None)),
+            loading: Arc::new(AtomicBool::new(false)),
             effort,
             terminal,
         }
@@ -1627,6 +1630,11 @@ impl AcpClientLoop {
                             }
                             _ => {}
                         }
+                        // A loading agent replays the conversation goose already stores. Taken
+                        // for new output, every resume recorded the whole history again.
+                        if session_state.loading.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
                         // With no goose prompt in flight the agent is running a turn of its
                         // own (a router waking the session); surface it rather than drop it.
                         let prompt_tx = prompt_response_tx.lock().ok().and_then(|g| g.clone());
@@ -2215,19 +2223,23 @@ async fn handle_requests(
                 let result = if supports_load {
                     let mcp_servers =
                         filter_supported_servers(&config.mcp_servers, &mcp_capabilities);
-                    cx.send_request(
-                        LoadSessionRequest::new(session_id.clone(), config.work_dir.clone())
-                            .mcp_servers(mcp_servers),
-                    )
-                    .block_task()
-                    .await
-                    .map(|response| {
-                        NewSessionResponse::new(session_id.clone())
-                            .modes(response.modes)
-                            .config_options(response.config_options)
-                            .meta(response.meta)
-                    })
-                    .map_err(anyhow::Error::from)
+                    session_state.loading.store(true, Ordering::Release);
+                    let loaded = cx
+                        .send_request(
+                            LoadSessionRequest::new(session_id.clone(), config.work_dir.clone())
+                                .mcp_servers(mcp_servers),
+                        )
+                        .block_task()
+                        .await;
+                    session_state.loading.store(false, Ordering::Release);
+                    loaded
+                        .map(|response| {
+                            NewSessionResponse::new(session_id.clone())
+                                .modes(response.modes)
+                                .config_options(response.config_options)
+                                .meta(response.meta)
+                        })
+                        .map_err(anyhow::Error::from)
                 } else {
                     Err(anyhow::anyhow!("ACP agent does not support session/load"))
                 };
@@ -5642,6 +5654,92 @@ mod tests {
         assert!(matches!(
             updates.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// An agent replays the conversation while it loads a session. Goose stores that conversation
+    /// already, so only output that follows the load is new.
+    #[tokio::test]
+    async fn a_loaded_session_does_not_repeat_its_conversation() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, LoadSessionRequest,
+            LoadSessionResponse, NewSessionRequest, ToolCall,
+        };
+        use agent_client_protocol::{on_receive_request, Agent as ScriptedAgent, ByteStreams};
+
+        const SAVED: &str = "rtr-saved";
+        let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, client_write) = tokio::io::duplex(64 * 1024);
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let agent_wake = wake.clone();
+
+        tokio::spawn(async move {
+            ScriptedAgent
+                .builder()
+                .on_receive_request(
+                    async |_req: InitializeRequest, responder, _cx| {
+                        responder.respond(
+                            InitializeResponse::new(ProtocolVersion::LATEST)
+                                .agent_capabilities(AgentCapabilities::new().load_session(true)),
+                        )
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |_req: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new(SessionId::new("rtr-new")))
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: LoadSessionRequest, responder, cx| {
+                        for index in 0..50 {
+                            cx.send_notification(agent_text(SAVED, "replayed "))?;
+                            cx.send_notification(SessionNotification::new(
+                                SessionId::new(SAVED),
+                                SessionUpdate::ToolCall(
+                                    ToolCall::new(format!("old-{index}"), "Old call")
+                                        .status(ToolCallStatus::Completed),
+                                ),
+                            ))?;
+                        }
+                        responder.respond(LoadSessionResponse::new())?;
+                        let wake = agent_wake.clone();
+                        tokio::spawn(async move {
+                            wake.notified().await;
+                            cx.send_notification(agent_text(SAVED, "new output"))
+                                .unwrap();
+                        });
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .connect_to(ByteStreams::new(
+                    agent_write.compat_write(),
+                    agent_read.compat(),
+                ))
+                .await
+        });
+
+        let provider = AcpProvider::connect_with_transport(
+            "router-acp".to_string(),
+            GooseMode::Auto,
+            test_acp_config(HashMap::new(), None),
+            ByteStreams::new(client_write.compat_write(), client_read.compat()),
+        )
+        .await
+        .unwrap();
+        let mut updates = provider.subscribe_unsolicited().unwrap();
+        provider.resume(SAVED).await.unwrap();
+        wake.notify_one();
+
+        let UnsolicitedUpdate::Message(first) = next_unsolicited(&mut updates).await else {
+            panic!("expected the new output");
+        };
+        assert_eq!(first.as_concat_text(), "new output");
+        assert!(matches!(
+            next_unsolicited(&mut updates).await,
+            UnsolicitedUpdate::Settled
         ));
     }
 

@@ -379,7 +379,7 @@ impl Agent {
         let session = self
             .config
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await?;
         self.config.providers.provider_for(&session).await
     }
@@ -391,7 +391,7 @@ impl Agent {
         let session = self
             .config
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await?;
         crate::agents::provider_manager::model_config_for(&session)
     }
@@ -446,7 +446,7 @@ impl Agent {
             let final_output_tool = self
                 .config
                 .session_manager
-                .get_session(session_id, false)
+                .get_session_settings(session_id)
                 .await
                 .and_then(|session| ops_recipe::final_output_tool(&session));
             if let Ok(Some(final_output_tool)) = final_output_tool {
@@ -485,7 +485,7 @@ impl Agent {
     ) -> Result<()> {
         self.config
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await?;
 
         let (session_id, request_id) = self
@@ -1096,7 +1096,7 @@ impl Agent {
         let mut session = self
             .config
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await?;
         let registry_entry = crate::providers::get_from_registry(provider_name)
             .await
@@ -1170,7 +1170,7 @@ impl Agent {
         Ok(self
             .config
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await?
             .goose_mode)
     }
