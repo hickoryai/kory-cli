@@ -272,6 +272,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "prints measurements"]
+    async fn bench_loading_a_session_of_440_000_messages() {
+        use rmcp::model::{CallToolResult, ContentBlock};
+        use std::time::Instant;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let id = sm
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "long".to_string(),
+                goose::session::session_manager::SessionType::User,
+                goose::config::GooseMode::default(),
+            )
+            .await
+            .unwrap()
+            .id;
+        let messages = (0..440_000).map(|n| match n % 2 {
+            0 => said(n),
+            _ => Message::user().with_tool_response(
+                format!("call-{n}"),
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "x".repeat(1_500),
+                )])),
+            ),
+        });
+        sm.replace_conversation(&id, &Conversation::new_unvalidated(messages))
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let windowed = History::load(&sm, &id, true).await.unwrap();
+        println!(
+            "windowed: {} messages in {:?}",
+            windowed.len(),
+            started.elapsed()
+        );
+        let started = Instant::now();
+        let older = windowed.older(Arc::new(sm), &id).unwrap();
+        let page = older.clone().page(2_000).await.unwrap().0;
+        println!("older page of {}: {:?}", page.len(), started.elapsed());
+        drop((windowed, page));
+        let started = Instant::now();
+        let whole = History::load(&older.session_manager, &id, false)
+            .await
+            .unwrap();
+        println!("whole: {} messages in {:?}", whole.len(), started.elapsed());
+    }
+
     #[test]
     fn any_other_session_keeps_everything() {
         let mut history = History::default();

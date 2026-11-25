@@ -2056,56 +2056,83 @@ mod tests {
         });
     }
 
-    /// Prints how long a key takes to show while the task that takes keys spends `busy` on each
-    /// stream item, with and without the key reader editing the input box itself.
+    /// The longest a key takes to show while the task that takes keys does `work` for each
+    /// stream item, with the key reader editing the input box itself or without.
+    #[cfg(unix)]
+    fn key_latency(direct: bool, work: impl Fn() + Send + 'static) -> Duration {
+        use std::os::fd::AsRawFd;
+        let (mut master, slave) = crate::session::child_sessions::terminal::test_terminal();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready, dock) = std::sync::mpsc::channel();
+        let stopping = stop.clone();
+        let session = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let dock = Arc::new(in_turn());
+                    let mut keys = crate::session::child_sessions::terminal::KeyListener::start_on(
+                        slave.as_raw_fd(),
+                        direct.then(|| dock.direct_keys()),
+                    )
+                    .unwrap();
+                    ready.send(dock.clone()).unwrap();
+                    while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::select! {
+                            biased;
+                            key = keys.next() => { dock.type_key(key.unwrap()); }
+                            _ = tokio::task::yield_now() => work(),
+                        }
+                    }
+                });
+        });
+        let dock = dock.recv().unwrap();
+        let mut slowest = Duration::ZERO;
+        for n in 1..=4usize {
+            std::thread::sleep(Duration::from_millis(37));
+            master.write_all(b"k").unwrap();
+            let shown = blocked_until("the key shows", || dock.input_text().len() >= n);
+            slowest = slowest.max(shown);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        session.join().unwrap();
+        slowest
+    }
+
     #[cfg(unix)]
     #[test]
     #[ignore = "prints measurements"]
     fn bench_key_latency_while_the_session_is_busy() {
-        use std::os::fd::AsRawFd;
         for busy in [0, 100, 1_000, 5_000].map(Duration::from_millis) {
-            for direct in [false, true] {
-                let (mut master, slave) = crate::session::child_sessions::terminal::test_terminal();
-                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let (ready, dock) = std::sync::mpsc::channel();
-                let stopping = stop.clone();
-                let session = std::thread::spawn(move || {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(async {
-                            let dock = Arc::new(in_turn());
-                            let mut keys =
-                                crate::session::child_sessions::terminal::KeyListener::start_on(
-                                    slave.as_raw_fd(),
-                                    direct.then(|| dock.direct_keys()),
-                                )
-                                .unwrap();
-                            ready.send(dock.clone()).unwrap();
-                            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
-                                tokio::select! {
-                                    biased;
-                                    key = keys.next() => { dock.type_key(key.unwrap()); }
-                                    _ = tokio::task::yield_now() => std::thread::sleep(busy),
-                                }
-                            }
-                        });
-                });
-                let dock = dock.recv().unwrap();
-                let mut slowest = Duration::ZERO;
-                for n in 1..=4usize {
-                    std::thread::sleep(Duration::from_millis(37));
-                    master.write_all(b"k").unwrap();
-                    let shown = blocked_until("the key shows", || dock.input_text().len() >= n);
-                    slowest = slowest.max(shown);
-                }
-                stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                session.join().unwrap();
-                let path = if direct { "key reader" } else { "session task" };
-                println!("busy {busy:?} per item, keys shown by the {path}: slowest {slowest:?}");
-            }
+            let session = key_latency(false, move || std::thread::sleep(busy));
+            let reader = key_latency(true, move || std::thread::sleep(busy));
+            println!("busy {busy:?} per item: shown by the session {session:?}, by the key reader {reader:?}");
         }
+    }
+
+    /// The session's task goes through hundreds of thousands of messages again and again, as
+    /// opening the tool calls of a whole held conversation did.
+    #[cfg(unix)]
+    #[test]
+    fn typing_shows_at_once_beside_work_on_a_huge_conversation() {
+        use goose::conversation::message::Message;
+        let messages: Vec<Message> = (0..300_000)
+            .map(|n| {
+                Message::assistant().with_tool_request(
+                    format!("call-{n}"),
+                    Ok(rmcp::model::CallToolRequestParams::new("Terminal")),
+                )
+            })
+            .collect();
+        let slowest = key_latency(true, move || {
+            assert_eq!(
+                crate::session::tool_calls::collect(&messages).len(),
+                300_000
+            );
+            std::thread::sleep(Duration::from_millis(1_500));
+        });
+        assert!(slowest < Duration::from_secs(1), "{slowest:?}");
     }
 
     #[test]

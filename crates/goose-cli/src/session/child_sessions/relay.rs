@@ -1652,6 +1652,42 @@ mod tests {
         vec!["── rule".into(), "› typed".into()]
     }
 
+    /// A paste longer than the session's terminal takes while the session reads nothing: the
+    /// relay goes on (it used to spin until the session read, taking no output meanwhile) and
+    /// delivers the rest in order.
+    #[test]
+    fn input_the_session_does_not_read_yet_never_stops_the_relay() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let (master, mut slave) = super::super::terminal::test_terminal();
+        // SAFETY: settings of this test's own terminal.
+        unsafe {
+            let mut termios = std::mem::zeroed::<libc::termios>();
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut termios), 0);
+            libc::cfmakeraw(&mut termios);
+            assert_eq!(
+                libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &termios),
+                0
+            );
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let pasted: Vec<u8> = (0..64 * 1024u32).map(|n| b'a' + (n % 26) as u8).collect();
+        let mut pending = pasted.clone();
+        write_ready(master.as_raw_fd(), &mut pending);
+        assert!(!pending.is_empty() && pending.len() < pasted.len());
+
+        let mut read = Vec::new();
+        let mut buf = [0u8; 4096];
+        while read.len() < pasted.len() {
+            let count = slave.read(&mut buf).unwrap();
+            read.extend_from_slice(&buf[..count]);
+            write_ready(master.as_raw_fd(), &mut pending);
+        }
+        assert_eq!(read, pasted);
+        assert!(pending.is_empty());
+    }
+
     fn feed(generation: u64, text: &str) -> ChildFeed {
         ChildFeed {
             generation,
