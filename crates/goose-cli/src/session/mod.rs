@@ -2621,7 +2621,6 @@ impl CliSession {
 
             match self.get_prompt(&opts.name, arguments).await {
                 Ok(messages) => {
-                    let start_len = self.messages.len();
                     let mut valid = true;
                     let num_messages = messages.len();
                     for (i, prompt_message) in messages.into_iter().enumerate() {
@@ -2640,7 +2639,7 @@ impl CliSession {
                             ));
                             valid = false;
                             // get rid of everything we added to messages
-                            self.messages.truncate(start_len);
+                            self.messages.truncate(self.messages.len() - i);
                             break;
                         }
 
@@ -2652,8 +2651,9 @@ impl CliSession {
 
                     if valid {
                         if num_messages > 1 {
+                            let first = self.messages.len() - num_messages;
                             for i in 0..(num_messages - 1) {
-                                let msg = &self.messages.messages()[start_len + i];
+                                let msg = &self.messages.messages()[first + i];
                                 self.agent
                                     .config
                                     .session_manager
