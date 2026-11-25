@@ -2732,11 +2732,15 @@ impl CliSession {
             outcomes.clone(),
         );
         tokio::spawn(async move {
-            // A turn that never answers must not hold up the messages queued behind this one.
-            let outcome =
-                tokio::time::timeout(STEER_TIMEOUT, agent.steer_running_turn(&session_id, &text))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer to the steer in time")));
+            // A turn that never answers must not hold up the messages queued behind this one;
+            // one the router holds answers once it goes on.
+            let outcome = timeout_unless(
+                STEER_TIMEOUT,
+                goose::acp::session_activity::is_paused,
+                agent.steer_running_turn(&session_id, &text),
+            )
+            .await
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no answer to the steer in time")));
             let _ = outcomes.send((text, outcome));
         });
     }
@@ -3224,6 +3228,31 @@ async fn drain_stopped_run(
             Ok(AgentEvent::HistoryReplaced(conversation)) => *messages = conversation,
             Ok(AgentEvent::Usage(usage)) => *last_usage = Some(usage),
             _ => {}
+        }
+    }
+}
+
+/// `future`'s output unless it takes longer than `limit`, not counting the time `held` says the
+/// wait is expected.
+async fn timeout_unless<T>(
+    limit: Duration,
+    held: impl Fn() -> bool,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    const STEP: Duration = Duration::from_millis(250);
+    tokio::pin!(future);
+    let mut left = limit;
+    loop {
+        tokio::select! {
+            output = &mut future => return Some(output),
+            _ = tokio::time::sleep(STEP.min(left)) => {
+                if !held() {
+                    left = left.saturating_sub(STEP);
+                    if left.is_zero() {
+                        return None;
+                    }
+                }
+            }
         }
     }
 }
@@ -4007,6 +4036,27 @@ mod tests {
         // goose's own loop: the last call's usage is the context.
         assert_eq!(context_in_use(None, false, Some(12_000)), Some(12_000));
         assert_eq!(context_in_use(None, false, None), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_steer_is_not_given_up_while_the_router_holds_the_turn() {
+        let limit = Duration::from_millis(300);
+        let started = Instant::now();
+        let answer = timeout_unless(
+            limit,
+            || started.elapsed() < Duration::from_secs(2),
+            async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                "delivered"
+            },
+        )
+        .await;
+        assert_eq!(answer, Some("delivered"));
+
+        let started = Instant::now();
+        let answer = timeout_unless(limit, || false, std::future::pending::<()>()).await;
+        assert_eq!(answer, None);
+        assert!(started.elapsed() >= limit);
     }
 
     #[test]

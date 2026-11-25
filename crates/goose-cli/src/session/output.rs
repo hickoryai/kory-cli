@@ -1983,7 +1983,8 @@ const TITLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 /// The terminal title for one tick: the session's reported title (router-acp
 /// sends `<project> [<model>]`) or the directory name, behind a spinner while
-/// the session works and a sprout while it is idle.
+/// the session works, a pause icon while the router holds its turn and a sprout while it
+/// is idle.
 fn terminal_title(
     activity: &goose::acp::session_activity::SessionActivity,
     local_busy: bool,
@@ -1993,7 +1994,9 @@ fn terminal_title(
     let title = activity.title.as_deref().unwrap_or(dir_name);
     // Sanitize: strip control characters (ESC, BEL, etc.) to prevent terminal escape injection
     let sanitized: String = title.chars().filter(|c| !c.is_control()).collect();
-    let glyph = if activity.busy || local_busy {
+    let glyph = if activity.paused.is_some() {
+        "⏸"
+    } else if activity.busy || local_busy {
         TITLE_SPINNER[tick % TITLE_SPINNER.len()]
     } else {
         "🌱"
@@ -2363,6 +2366,12 @@ mod tests {
         assert_eq!(terminal_title(&routed, false, "x", 0), "⠋ Chordzy [opus]");
         assert_eq!(terminal_title(&routed, false, "x", 1), "⠙ Chordzy [opus]");
         assert_eq!(terminal_title(&idle, true, "Chordzy", 2), "⠹ Chordzy");
+        // A held turn does not look like work, even with goose's own prompt in flight.
+        let held = SessionActivity {
+            paused: Some("offline".into()),
+            ..routed
+        };
+        assert_eq!(terminal_title(&held, true, "x", 1), "⏸ Chordzy [opus]");
     }
 
     #[test]
