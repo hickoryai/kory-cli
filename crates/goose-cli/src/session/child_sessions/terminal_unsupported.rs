@@ -1,16 +1,15 @@
 use super::keys::Key;
+use std::sync::Arc;
 
 pub fn is_capable() -> bool {
     false
 }
 
-pub struct EchoOff;
-
-impl EchoOff {
-    pub fn start() -> Option<Self> {
-        None
-    }
+pub fn screen_is_open() -> bool {
+    false
 }
+
+pub type DirectKeys = Arc<dyn Fn(Key) -> Option<Key> + Send + Sync>;
 
 pub struct KeyListener;
 
@@ -19,13 +18,23 @@ impl KeyListener {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
-    pub fn start_for_prompt() -> std::io::Result<Self> {
+    pub fn start_direct(_direct: DirectKeys) -> std::io::Result<Self> {
         Self::start()
+    }
+
+    pub fn set_ctrl_keys(&self, _ctrl_keys: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub fn is_direct(&self) -> bool {
+        false
     }
 
     pub async fn next(&mut self) -> Option<Key> {
         None
     }
+
+    pub fn handled(&mut self) {}
 }
 
 pub struct Screen;

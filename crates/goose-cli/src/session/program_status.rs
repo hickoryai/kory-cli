@@ -58,6 +58,14 @@ pub fn report(status: ProgramStatus, msg: Option<&str>) {
     let _ = stdout.flush();
 }
 
+/// The router holds the running turn for a reason, or lets it go on (`None`).
+pub fn report_pause(reason: Option<&str>) {
+    if REPORTER.lock().unwrap().last == Some(ProgramStatus::Working) {
+        let msg = reason.map(|reason| format!("paused: {reason}"));
+        report(ProgramStatus::Working, msg.as_deref());
+    }
+}
+
 pub fn report_idle() {
     let last = REPORTER.lock().unwrap().last;
     if !matches!(last, Some(ProgramStatus::Done | ProgramStatus::Error)) {

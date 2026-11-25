@@ -44,6 +44,9 @@ const FORCE_QUIT_WINDOW: Duration = Duration::from_secs(2);
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 /// Rows one wheel notch scrolls.
 const WHEEL_ROWS: usize = 3;
+/// Session output taken in between looking at the keyboard: a session that writes without
+/// pause must not hold up what is typed.
+const OUTPUT_PER_ROUND: usize = 256 * 1024;
 const IDLE_POLL_MS: i32 = 200;
 /// The fastest the screen is drawn again while output streams.
 const FRAME: Duration = Duration::from_millis(16);
@@ -204,6 +207,8 @@ struct Relay {
 /// A child session's rendered transcript and its pane; `generation` changes with either.
 struct ChildFeed {
     generation: u64,
+    /// What `transcript` was made from.
+    source: Arc<str>,
     transcript: Arc<Vec<u8>>,
     painter: Painter,
 }
@@ -286,26 +291,28 @@ pub fn remove_painter() {
 /// Shows child session output (`transcript`, as the session itself would have printed it) and
 /// `painter`'s pane in place of the session's own, until `hide_child`. Called again as the
 /// child goes on. False when no relay hosts the terminal.
-pub fn show_child(transcript: &str, painter: Painter) -> bool {
+pub fn show_child(source: &Arc<str>, painter: Painter) -> bool {
     let Some(relay) = active() else {
         return false;
     };
-    {
-        let mut child = relay.child.lock().unwrap();
-        let bytes = crlf(transcript);
-        let generation = child
-            .as_ref()
-            .map_or(0, |feed| feed.generation.wrapping_add(1));
-        let transcript = match child.as_ref() {
-            Some(feed) if *feed.transcript == bytes => feed.transcript.clone(),
-            _ => Arc::new(bytes),
-        };
-        *child = Some(ChildFeed {
-            generation,
-            transcript,
-            painter,
-        });
-    }
+    // The relay waits for this lock between two frames, so nothing long happens under it.
+    let shown = relay.child.lock().unwrap().as_ref().map(|feed| {
+        (
+            feed.generation,
+            feed.source.clone(),
+            feed.transcript.clone(),
+        )
+    });
+    let transcript = match &shown {
+        Some((_, shown, transcript)) if Arc::ptr_eq(shown, source) => transcript.clone(),
+        _ => Arc::new(crlf(source)),
+    };
+    *relay.child.lock().unwrap() = Some(ChildFeed {
+        generation: shown.map_or(0, |(generation, ..)| generation.wrapping_add(1)),
+        source: source.clone(),
+        transcript,
+        painter,
+    });
     relay.wake();
     true
 }
@@ -515,8 +522,9 @@ fn write_fd(fd: RawFd, mut bytes: &[u8]) {
     }
 }
 
-fn read_all(fd: RawFd, buf: &mut [u8], into: &mut Vec<u8>) {
-    loop {
+/// Reads what is there, up to about `limit` bytes.
+fn read_some(fd: RawFd, buf: &mut [u8], into: &mut Vec<u8>, limit: usize) {
+    while into.len() < limit {
         // SAFETY: reading into a buffer of the given length.
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
@@ -524,6 +532,27 @@ fn read_all(fd: RawFd, buf: &mut [u8], into: &mut Vec<u8>) {
         }
         into.extend_from_slice(&buf[..n as usize]);
     }
+}
+
+/// Writes what `fd` takes now and leaves the rest in `pending`.
+fn write_ready(fd: RawFd, pending: &mut Vec<u8>) {
+    let mut written = 0;
+    while written < pending.len() {
+        let rest = &pending[written..];
+        // SAFETY: writing from a live slice.
+        let n = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
+        if n > 0 {
+            written += n as usize;
+            continue;
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::Interrupted if n < 0 => continue,
+            std::io::ErrorKind::WouldBlock => break,
+            // Nothing reads it any more.
+            _ => written = pending.len(),
+        }
+    }
+    pending.drain(..written);
 }
 
 impl Relay {
@@ -566,6 +595,9 @@ impl Relay {
         let mut last_frame = Instant::now() - FRAME;
         let mut dirty = true;
         let mut interrupts: Vec<Instant> = Vec::new();
+        // Input the session has not taken yet. A session that does not read (it is starting a
+        // turn, or writing output only this thread can take) must not stop the relay.
+        let mut to_session: Vec<u8> = Vec::new();
         // X11 keeps clipboard ownership only while this handle stays alive.
         let mut clipboard: Option<arboard::Clipboard> = None;
         loop {
@@ -573,6 +605,7 @@ impl Relay {
             let timeout = if stopping {
                 30
             } else if dirty
+                || !to_session.is_empty()
                 || view.holding_input()
                 || child
                     .as_ref()
@@ -591,14 +624,14 @@ impl Relay {
             unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout) };
 
             let mut output = Vec::new();
-            read_all(self.master, &mut buf, &mut output);
+            read_some(self.master, &mut buf, &mut output, OUTPUT_PER_ROUND);
             if !output.is_empty() {
                 view.output(&output);
                 dirty = true;
             }
             let replies = view.take_replies();
             if !replies.is_empty() {
-                write_fd(self.master, &replies);
+                to_session.extend_from_slice(&replies);
             }
             let child_painter = {
                 let feed = self.child.lock().unwrap();
@@ -621,7 +654,7 @@ impl Relay {
             };
             let mut typed = Vec::new();
             if !stopping {
-                read_all(self.real_in, &mut buf, &mut typed);
+                read_some(self.real_in, &mut buf, &mut typed, usize::MAX);
             }
             // A child on screen scrolls and selects in its own transcript.
             let input = match child.as_mut() {
@@ -659,16 +692,17 @@ impl Relay {
                     // SAFETY: the signal the terminal would have raised for Ctrl-C.
                     unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
                 } else {
-                    write_fd(self.master, sequence);
+                    to_session.extend_from_slice(sequence);
                 }
             }
             if !input.forward.is_empty() {
-                write_fd(self.master, &input.forward);
+                to_session.extend_from_slice(&input.forward);
             }
             if let Some(target) = input.activate {
                 *ACTIVATED.lock().unwrap() = Some(target);
-                write_fd(self.master, super::keys::ACTIVATE_SEQUENCE);
+                to_session.extend_from_slice(super::keys::ACTIVATE_SEQUENCE);
             }
+            write_ready(self.master, &mut to_session);
             // SAFETY: draining the wake pipe.
             while unsafe { libc::read(self.wake[0], buf.as_mut_ptr().cast(), buf.len()) } > 0 {
                 dirty = true;
@@ -1618,9 +1652,46 @@ mod tests {
         vec!["── rule".into(), "› typed".into()]
     }
 
+    /// A paste longer than the session's terminal takes while the session reads nothing: the
+    /// relay goes on (it used to spin until the session read, taking no output meanwhile) and
+    /// delivers the rest in order.
+    #[test]
+    fn input_the_session_does_not_read_yet_never_stops_the_relay() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let (master, mut slave) = super::super::terminal::test_terminal();
+        // SAFETY: settings of this test's own terminal.
+        unsafe {
+            let mut termios = std::mem::zeroed::<libc::termios>();
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut termios), 0);
+            libc::cfmakeraw(&mut termios);
+            assert_eq!(
+                libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &termios),
+                0
+            );
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let pasted: Vec<u8> = (0..64 * 1024u32).map(|n| b'a' + (n % 26) as u8).collect();
+        let mut pending = pasted.clone();
+        write_ready(master.as_raw_fd(), &mut pending);
+        assert!(!pending.is_empty() && pending.len() < pasted.len());
+
+        let mut read = Vec::new();
+        let mut buf = [0u8; 4096];
+        while read.len() < pasted.len() {
+            let count = slave.read(&mut buf).unwrap();
+            read.extend_from_slice(&buf[..count]);
+            write_ready(master.as_raw_fd(), &mut pending);
+        }
+        assert_eq!(read, pasted);
+        assert!(pending.is_empty());
+    }
+
     fn feed(generation: u64, text: &str) -> ChildFeed {
         ChildFeed {
             generation,
+            source: text.into(),
             transcript: Arc::new(crlf(text)),
             painter: Arc::new(|_, _| Vec::new()),
         }

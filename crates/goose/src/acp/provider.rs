@@ -184,6 +184,10 @@ enum AcpUpdate {
 }
 
 const UNSOLICITED_CAPACITY: usize = 1024;
+/// Updates a prompt may have waiting for its reader. The notification handler cannot wait and
+/// drops what does not fit, so this covers the whole burst an agent sends while the reader is
+/// held up (a held turn going on, a question on screen). Memory is used only as it fills.
+const PROMPT_UPDATE_CAPACITY: usize = 1 << 20;
 /// A quiet stretch this long closes the unsolicited output streamed so far, so subscribers
 /// can record it and later chunks start new messages.
 const UNSOLICITED_SETTLE_AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -824,7 +828,7 @@ impl AcpProvider {
         session_id: SessionId,
         content: Vec<ContentBlock>,
     ) -> Result<mpsc::Receiver<AcpUpdate>> {
-        let (response_tx, response_rx) = mpsc::channel(64);
+        let (response_tx, response_rx) = mpsc::channel(PROMPT_UPDATE_CAPACITY);
         self.tx
             .as_ref()
             .unwrap()
@@ -1403,7 +1407,8 @@ impl Provider for AcpProvider {
                                 // seen and rejected this memo, so rebuilding it on a later
                                 // turn would reproduce the rejection forever.
                                 handoff_claim_guard.commit();
-                                let (response_tx, response_rx) = mpsc::channel(64);
+                                let (response_tx, response_rx) =
+                                    mpsc::channel(PROMPT_UPDATE_CAPACITY);
                                 let request = ClientRequest::Prompt {
                                     session_id,
                                     content: blocks,
@@ -1616,16 +1621,16 @@ impl AcpClientLoop {
                                 context_used.store(usage.used.saturating_add(1), Ordering::Relaxed);
                             }
                             SessionUpdate::SessionInfoUpdate(update) => {
-                                let busy = update
+                                let report = update
                                     .meta
                                     .as_ref()
                                     .and_then(|meta| meta.get("routerAcp"))
-                                    .and_then(|router| router.get("busy"))
-                                    .and_then(|busy| busy.as_bool());
+                                    .map(super::session_activity::RouterReport::parse)
+                                    .unwrap_or_default();
                                 super::session_activity::update(
                                     notification.session_id.0.as_ref(),
                                     update.title.value().cloned(),
-                                    busy,
+                                    report,
                                 );
                             }
                             _ => {}
@@ -3483,6 +3488,38 @@ mod tests {
         assert!(stream.next().await.is_none());
         assert!(rx.try_recv().is_err());
         assert!(!provider.handoff_context_sent.load(Ordering::Acquire));
+    }
+
+    /// Everything an agent sends while nobody polls the stream (the session is drawing a
+    /// question, or a held turn went on with a burst) is still in the reply.
+    #[tokio::test]
+    async fn a_burst_while_the_reader_is_held_up_loses_nothing() {
+        use futures::StreamExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let (provider, model) = test_provider_with_tx(Some(tx));
+        let messages = vec![Message::user().with_text("go")];
+        let mut stream = provider.stream(&model, "", &messages, &[]).await.unwrap();
+        let Some(ClientRequest::Prompt { response_tx, .. }) = rx.recv().await else {
+            panic!("expected ACP prompt request");
+        };
+        // As the notification handler and the request loop deliver.
+        for _ in 0..5_000 {
+            response_tx
+                .try_send(AcpUpdate::Text(TextContent::new("x")))
+                .unwrap();
+        }
+        response_tx
+            .try_send(AcpUpdate::Complete(StopReason::EndTurn, None))
+            .unwrap();
+
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            if let (Some(message), _) = item.unwrap() {
+                text.push_str(&message.as_concat_text());
+            }
+        }
+        assert_eq!(text.len(), 5_000);
     }
 
     #[tokio::test]

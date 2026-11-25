@@ -16,7 +16,7 @@ pub fn remove_painter() {}
 
 pub fn set_header(_header: Option<Painter>) {}
 
-pub fn show_child(_transcript: &str, _painter: Painter) -> bool {
+pub fn show_child(_source: &Arc<str>, _painter: Painter) -> bool {
     false
 }
 

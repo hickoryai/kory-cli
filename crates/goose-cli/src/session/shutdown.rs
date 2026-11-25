@@ -201,24 +201,26 @@ pub fn footer(progress: &Progress) -> Option<String> {
     }
 }
 
-/// Whether the session runs router-acp's planner: an operator `/implement` (or `/plan`) opted
-/// it in.
-pub fn is_planner_session(messages: &[Message]) -> bool {
-    messages
+/// What opts a session in to router-acp's planner.
+pub const PLANNER_COMMANDS: [&str; 2] = ["/implement", "/plan"];
+
+/// Whether this message opts its session in to router-acp's planner.
+pub fn starts_planner(message: &Message) -> bool {
+    if message.role != Role::User {
+        return false;
+    }
+    let text = message.as_concat_text();
+    let command = text.split_whitespace().next().unwrap_or("");
+    PLANNER_COMMANDS
         .iter()
-        .filter(|message| message.role == Role::User)
-        .any(|message| {
-            let text = message.as_concat_text();
-            let command = text.split_whitespace().next().unwrap_or("");
-            command.eq_ignore_ascii_case("/implement") || command.eq_ignore_ascii_case("/plan")
-        })
+        .any(|planner| command.eq_ignore_ascii_case(planner))
 }
 
 pub const AUTO_MODE_NOTICE: &str = "Planner session switched to Auto mode for its lifetime; worker starts and planner tools are authorized by /implement.";
 
 /// Keep the opt-in after compaction removes the original command from history.
-pub fn planner_mode(planner: &mut bool, messages: &[Message], requested: GooseMode) -> GooseMode {
-    *planner |= is_planner_session(messages);
+pub fn planner_mode(planner: &mut bool, opted_in: bool, requested: GooseMode) -> GooseMode {
+    *planner |= opted_in;
     if *planner {
         GooseMode::Auto
     } else {
@@ -470,6 +472,7 @@ mod tests {
 
     #[test]
     fn shutdown_is_offered_only_in_planner_sessions() {
+        let is_planner_session = |messages: &[Message]| messages.iter().any(starts_planner);
         assert!(!is_planner_session(&[
             Message::user().with_text("fix the bug")
         ]));
@@ -495,25 +498,14 @@ mod tests {
             GooseMode::Auto,
         ] {
             let mut planner = false;
+            assert_eq!(planner_mode(&mut planner, false, configured), configured);
             assert_eq!(
-                planner_mode(
-                    &mut planner,
-                    &[Message::user().with_text("hello")],
-                    configured
-                ),
-                configured
-            );
-            assert_eq!(
-                planner_mode(
-                    &mut planner,
-                    &[Message::user().with_text("/implement Docs/Plans/X.md")],
-                    configured
-                ),
+                planner_mode(&mut planner, true, configured),
                 GooseMode::Auto
             );
             // A later operator turn or compaction cannot return to approval mode.
             assert_eq!(
-                planner_mode(&mut planner, &[], GooseMode::Approve),
+                planner_mode(&mut planner, false, GooseMode::Approve),
                 GooseMode::Auto
             );
         }
@@ -521,7 +513,7 @@ mod tests {
         assert_eq!(
             planner_mode(
                 &mut planner,
-                &[Message::assistant().with_text("/implement")],
+                starts_planner(&Message::assistant().with_text("/implement")),
                 GooseMode::Approve
             ),
             GooseMode::Approve

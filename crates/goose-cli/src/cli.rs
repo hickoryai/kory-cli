@@ -2115,7 +2115,7 @@ async fn handle_interactive_session(args: InteractiveSessionArgs) -> Result<()> 
     .await;
 
     if (resume || fork) && history {
-        session.render_message_history();
+        session.render_message_history().await;
     }
 
     let result = session.interactive(None).await;

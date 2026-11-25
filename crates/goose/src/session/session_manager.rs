@@ -479,6 +479,38 @@ impl SessionManager {
         self.storage.get_recent_session(id, context).await
     }
 
+    /// Up to `limit` messages before `before` (the newest ones without it), in conversation
+    /// order.
+    pub async fn messages_before(
+        &self,
+        id: &str,
+        before: Option<MessageCursor>,
+        limit: usize,
+    ) -> Result<MessagePage> {
+        self.storage.messages_before(id, before, limit).await
+    }
+
+    /// Where a stored message is, for `messages_before`.
+    pub async fn message_cursor(
+        &self,
+        id: &str,
+        message_id: &str,
+    ) -> Result<Option<MessageCursor>> {
+        self.storage.message_cursor(id, message_id).await
+    }
+
+    /// Whether `matches` holds for a message the user wrote (tool responses are not) before
+    /// `before`. `words` narrow down, in the database, which ones are decoded.
+    pub async fn any_user_text(
+        &self,
+        id: &str,
+        before: Option<MessageCursor>,
+        words: &[&str],
+        matches: impl Fn(&Message) -> bool + Send + Sync,
+    ) -> Result<bool> {
+        self.storage.any_user_text(id, before, words, matches).await
+    }
+
     pub fn update(&self, id: &str) -> SessionUpdateBuilder<'_> {
         SessionUpdateBuilder::new(self, id.to_string())
     }
@@ -648,7 +680,7 @@ impl SessionManager {
         id: &str,
         provider: Arc<dyn Provider>,
     ) -> Result<Option<SessionNameUpdate>> {
-        let session = self.get_session(id, true).await?;
+        let session = self.get_session_settings(id).await?;
 
         if session.user_set_name {
             return Ok(None);
@@ -682,15 +714,11 @@ impl SessionManager {
                 )?
             }
         };
-        let conversation = session
-            .conversation
-            .ok_or_else(|| anyhow::anyhow!("No messages found"))?;
-
-        let user_message_count = conversation
-            .messages()
-            .iter()
-            .filter(|m| matches!(m.role, Role::User) && m.is_user_visible())
-            .count();
+        // Asked on every reply: only a conversation that just started is loaded.
+        let user_message_count = self
+            .storage
+            .visible_user_messages(id, MSG_COUNT_FOR_SESSION_NAME_GENERATION + 1)
+            .await?;
 
         let should_generate_name = if provider.manages_own_context() {
             user_message_count == 1
@@ -699,6 +727,11 @@ impl SessionManager {
         };
 
         if should_generate_name {
+            let conversation = self
+                .get_session(id, true)
+                .await?
+                .conversation
+                .ok_or_else(|| anyhow::anyhow!("No messages found"))?;
             let name = generate_session_name(
                 provider.as_ref(),
                 &model_config,
@@ -864,6 +897,19 @@ fn user_visible_message_sql(column: &str) -> String {
 }
 
 type MessageRow = (String, String, i64, Option<String>, Option<String>);
+
+/// A message's place in its stored conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageCursor {
+    created: i64,
+    row: i64,
+}
+
+pub struct MessagePage {
+    pub messages: Vec<Message>,
+    /// Where the page starts, for the one before it; `None` when nothing is before it.
+    pub older: Option<MessageCursor>,
+}
 
 /// Parses stored messages away from the calling task. Decoding and sanitizing tool results has
 /// no yield points, so a long conversation parsed in place freezes whatever else that task
@@ -2148,6 +2194,111 @@ impl SessionStorage {
         Ok(Conversation::new_unvalidated(parse_messages(rows).await?))
     }
 
+    async fn messages_before(
+        &self,
+        session_id: &str,
+        before: Option<MessageCursor>,
+        limit: usize,
+    ) -> Result<MessagePage> {
+        let pool = self.pool().await?;
+        let before = before.unwrap_or(MessageCursor {
+            created: i64::MAX,
+            row: i64::MAX,
+        });
+        let rows = sqlx::query_as::<_, (i64, i64, String, String, Option<String>, Option<String>)>(
+            "SELECT id, created_timestamp, role, content_json, metadata_json, message_id FROM messages \
+             WHERE session_id = ? AND (created_timestamp, id) < (?, ?) \
+             ORDER BY created_timestamp DESC, id DESC LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(before.created)
+        .bind(before.row)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?;
+        let older = rows
+            .last()
+            .filter(|_| rows.len() >= limit)
+            .map(|oldest| MessageCursor {
+                created: oldest.1,
+                row: oldest.0,
+            });
+        let rows = rows
+            .into_iter()
+            .rev()
+            .map(|(_, created, role, content, metadata, id)| (role, content, created, metadata, id))
+            .collect();
+        Ok(MessagePage {
+            messages: parse_messages(rows).await?,
+            older,
+        })
+    }
+
+    async fn message_cursor(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Option<MessageCursor>> {
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT created_timestamp, id FROM messages WHERE message_id = ? AND session_id = ? \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(message_id)
+        .bind(session_id)
+        .fetch_optional(self.pool().await?)
+        .await?;
+        Ok(row.map(|(created, row)| MessageCursor { created, row }))
+    }
+
+    async fn any_user_text(
+        &self,
+        session_id: &str,
+        before: Option<MessageCursor>,
+        words: &[&str],
+        matches: impl Fn(&Message) -> bool + Send + Sync,
+    ) -> Result<bool> {
+        use futures::TryStreamExt;
+        let before = before.unwrap_or(MessageCursor {
+            created: i64::MAX,
+            row: i64::MAX,
+        });
+        let any_word = vec!["content_json LIKE ?"; words.len()].join(" OR ");
+        let mut query = sqlx::query_as::<_, (String, i64)>(AssertSqlSafe(format!(
+            "SELECT content_json, created_timestamp FROM messages \
+             WHERE session_id = ? AND (created_timestamp, id) < (?, ?) AND role = 'user' \
+             AND content_json NOT LIKE '%\"type\":\"toolResponse\"%' AND ({any_word}) \
+             ORDER BY created_timestamp, id"
+        )))
+        .bind(session_id)
+        .bind(before.created)
+        .bind(before.row);
+        for word in words {
+            query = query.bind(format!("%{word}%"));
+        }
+        let mut rows = query.fetch(self.pool().await?);
+        while let Some((content, created)) = rows.try_next().await? {
+            let content = serde_json::from_str(&content)?;
+            if matches(&Message::new(Role::User, created, content)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The user-visible messages of the user role, counted up to `at_most`.
+    async fn visible_user_messages(&self, session_id: &str, at_most: usize) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM messages \
+             WHERE session_id = ? AND role = 'user' AND {} LIMIT ?)",
+            user_visible_message_sql("metadata_json")
+        )))
+        .bind(session_id)
+        .bind(at_most as i64)
+        .fetch_one(self.pool().await?)
+        .await?;
+        Ok(count as usize)
+    }
+
     async fn get_recent_conversation(
         &self,
         session_id: &str,
@@ -2155,36 +2306,17 @@ impl SessionStorage {
     ) -> Result<(Conversation, bool)> {
         let pool = self.pool().await?;
         let page = context.max(1);
-        let mut before = (i64::MAX, i64::MAX);
+        let mut before = None;
         // Newest page first; each page is in conversation order.
         let mut pages: Vec<Vec<Message>> = Vec::new();
         let mut turn_started = false;
         let mut reached_start = false;
         loop {
-            let rows = sqlx::query_as::<_, (i64, i64, String, String, Option<String>, Option<String>)>(
-                "SELECT id, created_timestamp, role, content_json, metadata_json, message_id FROM messages \
-                 WHERE session_id = ? AND (created_timestamp, id) < (?, ?) \
-                 ORDER BY created_timestamp DESC, id DESC LIMIT ?",
-            )
-            .bind(session_id)
-            .bind(before.0)
-            .bind(before.1)
-            .bind(page as i64)
-            .fetch_all(pool)
-            .await?;
-            reached_start |= rows.len() < page;
-            if let Some(oldest) = rows.last() {
-                before = (oldest.1, oldest.0);
-            }
-            let rows = rows
-                .into_iter()
-                .rev()
-                .map(|(_, created, role, content, metadata, id)| {
-                    (role, content, created, metadata, id)
-                })
-                .collect();
+            let MessagePage { messages, older } =
+                self.messages_before(session_id, before, page).await?;
+            reached_start |= older.is_none();
+            before = older;
             let had_turn = turn_started;
-            let messages = parse_messages(rows).await?;
             turn_started |= messages.iter().any(is_turn_start);
             pages.push(messages);
             // One more page than the one the turn starts in is `context` messages before it.
@@ -5200,6 +5332,66 @@ mod tests {
             .iter()
             .map(Message::as_concat_text)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_conversation_is_read_backwards_a_page_at_a_time() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let id = new_session(&sm).await;
+        let sent: Vec<String> = (0..7).map(|n| format!("m{n}")).collect();
+        let rows: Vec<(&str, &str)> = sent.iter().map(|text| ("user", text.as_str())).collect();
+        add_texts(&sm, &id, &rows).await;
+        let texts = |page: &MessagePage| -> Vec<String> {
+            page.messages.iter().map(Message::as_concat_text).collect()
+        };
+
+        let newest = sm.messages_before(&id, None, 3).await.unwrap();
+        assert_eq!(texts(&newest), ["m4", "m5", "m6"]);
+        let older = sm.messages_before(&id, newest.older, 3).await.unwrap();
+        assert_eq!(texts(&older), ["m1", "m2", "m3"]);
+        let oldest = sm.messages_before(&id, older.older, 3).await.unwrap();
+        assert_eq!(texts(&oldest), ["m0"]);
+        assert!(oldest.older.is_none());
+
+        let cursor = sm.message_cursor(&id, "m4").await.unwrap();
+        assert_eq!(cursor, newest.older);
+        assert_eq!(sm.message_cursor(&id, "unknown").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn what_the_user_wrote_is_found_without_the_tool_responses_that_mention_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let id = new_session(&sm).await;
+        let tool = Message::user().with_tool_response(
+            "call",
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text("/implement in a tool's output"),
+            ])),
+        );
+        sm.add_message(&id, &tool).await.unwrap();
+        let wrote_it = |message: &Message| message.as_concat_text().starts_with("/implement");
+        let words = ["/implement", "/plan"];
+        assert!(!sm.any_user_text(&id, None, &words, wrote_it).await.unwrap());
+
+        add_texts(
+            &sm,
+            &id,
+            &[("user", "/implement a plan"), ("user", "later")],
+        )
+        .await;
+        assert!(sm.any_user_text(&id, None, &words, wrote_it).await.unwrap());
+        let newest = sm.messages_before(&id, None, 1).await.unwrap();
+        assert!(sm
+            .any_user_text(&id, newest.older, &words, wrote_it)
+            .await
+            .unwrap());
+        let both = sm.messages_before(&id, None, 2).await.unwrap();
+        assert!(!sm
+            .any_user_text(&id, both.older, &words, wrote_it)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

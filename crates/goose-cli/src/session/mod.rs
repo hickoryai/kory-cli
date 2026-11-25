@@ -4,6 +4,7 @@ mod child_sessions;
 mod completion;
 pub mod editor;
 mod elicitation;
+mod history;
 mod input;
 mod output;
 mod paste;
@@ -287,7 +288,7 @@ impl ExtensionProgress {
 
 pub struct CliSession {
     agent: Arc<Agent>,
-    messages: Conversation,
+    messages: history::History,
     session_id: String,
     completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
     debug: bool,
@@ -309,6 +310,11 @@ pub struct CliSession {
     /// (Behind a lock so a running turn, which holds the agent's stream, can start one.)
     shutdown: std::sync::Mutex<Option<shutdown::Run>>,
     planner_auto: bool,
+    /// Reads keys from one prompt or turn to the next, so typing shows at once between them
+    /// too. Off whenever something else reads the terminal.
+    typing: Option<child_sessions::KeyReader>,
+    /// Where router-acp keeps its state, once found.
+    router_state: std::sync::OnceLock<RouterStateSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,15 +362,19 @@ impl CliSession {
         edit_mode: Option<EditMode>,
         output_format: String,
         stats: bool,
-        refresh_completions: bool,
+        interactive: bool,
         extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
     ) -> Self {
-        let messages = agent
-            .config
-            .session_manager
-            .get_session(&session_id, true)
+        // A router session's conversation is the router's and grows without end.
+        let session_manager = &agent.config.session_manager;
+        let routed = interactive
+            && output_format == "text"
+            && session_manager
+                .get_session_settings(&session_id)
+                .await
+                .is_ok_and(|session| provider_name_for(&session).is_ok_and(|p| is_router_acp(&p)));
+        let messages = history::History::load(session_manager, &session_id, routed)
             .await
-            .map(|session| session.conversation.unwrap_or_default())
             .unwrap();
         let completion_cache = Arc::new(std::sync::RwLock::new(CompletionCache::new()));
         let extension_progress = Arc::new(ExtensionProgress::default());
@@ -378,7 +388,7 @@ impl CliSession {
                     let failures = handle.await.map_err(|error| {
                         anyhow::anyhow!("Extension loading task failed: {}", error)
                     })??;
-                    if refresh_completions {
+                    if interactive {
                         Self::refresh_completion_cache(&agent, &session_id, &completion_cache)
                             .await?;
                     }
@@ -407,6 +417,8 @@ impl CliSession {
             dock: None,
             shutdown: std::sync::Mutex::new(None),
             planner_auto: false,
+            typing: None,
+            router_state: std::sync::OnceLock::new(),
         }
     }
 
@@ -621,9 +633,6 @@ impl CliSession {
         cancel_token: CancellationToken,
         interactive: bool,
     ) -> Result<()> {
-        // Typing may start as soon as the message is sent; keep it off the output until the
-        // turn's footer input reads it.
-        let _quiet = self.dock().and_then(|_| child_sessions::EchoOff::start());
         self.ensure_extensions_loaded(interactive).await?;
         let cancel_token = cancel_token.clone();
         self.sync_unsolicited(None).await;
@@ -643,6 +652,7 @@ impl CliSession {
         program_status::enable(self.output_format == "text");
 
         let result = self.run_interactive(prompt).await;
+        self.typing = None;
 
         self.agent
             .emit_hook(goose::hooks::HookEvent::SessionEnd, &self.session_id)
@@ -701,6 +711,7 @@ impl CliSession {
             show_status = true;
             // A `/shutdown` still draining holds the prompt back until it ends.
             if self.shutdown_gate() == shutdown::Gate::Draining {
+                self.typing = None;
                 if let Some(dock) = self.dock() {
                     dock.end_turn();
                 }
@@ -714,37 +725,17 @@ impl CliSession {
                 dock.take_queued()
             });
 
-            let conversation_strings: Vec<String> = self
-                .messages
-                .user_visible_messages()
-                .iter()
-                .map(|msg| {
-                    let role = match msg.role {
-                        rmcp::model::Role::User => "User",
-                        rmcp::model::Role::Assistant => "Assistant",
-                    };
-                    format!("## {}: {}", role, msg.as_concat_text())
-                })
-                .collect();
-
             // Messages typed during the last turn go out as soon as it ends.
             if let Some(queued) = queued {
                 output::print_submitted(&queued);
-                self.handle_input(
-                    InputResult::Message(queued),
-                    &history_manager,
-                    &mut editor,
-                    &conversation_strings,
-                )
-                .await?;
+                self.handle_input(InputResult::Message(queued), &history_manager, &mut editor)
+                    .await?;
                 continue;
             }
 
             output::run_status_hook("waiting");
             program_status::report_idle();
-            if shutdown::is_planner_session(self.messages.messages())
-                && self.router_session_id().await.is_some()
-            {
+            if self.messages.is_planner() && self.router_session_id().await.is_some() {
                 self.completion_cache
                     .write()
                     .unwrap()
@@ -754,11 +745,16 @@ impl CliSession {
             tool_calls::set_available(tool_calls::has_tool_calls(self.messages.messages()));
             let input = input::get_input(
                 &mut editor,
-                Some(&conversation_strings),
+                &self.messages,
                 self.unsolicited.as_ref(),
                 self.dock.as_ref().map(|(_, dock)| dock),
+                &mut self.typing,
             )
             .await?;
+            // A command may ask something itself.
+            if !matches!(input, InputResult::Message(_)) {
+                self.typing = None;
+            }
             if matches!(input, InputResult::Interrupt) {
                 let step = self
                     .completion_cache
@@ -796,7 +792,7 @@ impl CliSession {
                 }
                 show_status = false;
             }
-            self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
+            self.handle_input(input, &history_manager, &mut editor)
                 .await?;
         }
 
@@ -827,7 +823,6 @@ impl CliSession {
         input: InputResult,
         history: &HistoryManager,
         editor: &mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>,
-        conversation_messages: &[String],
     ) -> Result<()> {
         // The REPL's loading gate: every command, including future ones, waits
         // here until background extension loading has finished.
@@ -839,6 +834,10 @@ impl CliSession {
                 }
             }
             InputResult::Message(content) => {
+                // Enter queues from here on.
+                if let Some(dock) = self.dock() {
+                    dock.begin_turn();
+                }
                 self.handle_message_input(&content, history, editor).await?;
             }
             InputResult::Shutdown => self.start_shutdown().await,
@@ -914,8 +913,8 @@ impl CliSession {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
                     Some(editor_cmd) => {
-                        let messages: Vec<&str> =
-                            conversation_messages.iter().map(|s| s.as_str()).collect();
+                        let conversation = input::conversation_strings(&self.messages);
+                        let messages: Vec<&str> = conversation.iter().map(|s| s.as_str()).collect();
                         match crate::session::editor::get_editor_input(
                             &editor_cmd,
                             &messages,
@@ -1492,15 +1491,15 @@ impl CliSession {
     }
 
     async fn enforce_planner_mode(&mut self) -> Result<()> {
-        if !self.planner_auto && !shutdown::is_planner_session(self.messages.messages()) {
+        let opted_in = self.messages.is_planner();
+        if !self.planner_auto && !opted_in {
             return Ok(());
         }
         if self.agent.provider(&self.session_id).await?.get_name() != "router-acp" {
             return Ok(());
         }
         let current = self.agent.goose_mode(&self.session_id).await?;
-        let mode =
-            shutdown::planner_mode(&mut self.planner_auto, self.messages.messages(), current);
+        let mode = shutdown::planner_mode(&mut self.planner_auto, opted_in, current);
         if current != mode {
             // Updates both ACP's permission decision and the persisted session;
             // the global config continues to govern ordinary sessions.
@@ -1524,6 +1523,13 @@ impl CliSession {
         if interactive && !is_json_mode && !is_stream_json_mode {
             let _provider = self.agent.provider(&self.session_id).await?;
             self.sync_dock(true).await;
+            // What is typed while the turn starts shows at once and queues.
+            if let Some(dock) = self.dock() {
+                dock.begin_turn();
+                if self.typing.is_none() {
+                    self.typing = child_sessions::KeyReader::start_direct(dock.direct_keys()).ok();
+                }
+            }
         }
 
         let session_config = SessionConfig {
@@ -1569,33 +1575,54 @@ impl CliSession {
         let mut children = self
             .child_navigator(interactive && !is_json_mode && !is_stream_json_mode)
             .await;
+        children.resume_listening(self.typing.take());
         // Typing during the turn: the footer's input line takes keys, and Ctrl+Enter is only
         // reported once the terminal's extended keyboard reporting is on.
         let mut extended_keys = None;
-        if let Some(dock) = self.dock() {
-            dock.begin_turn();
+        if self.dock().is_some() {
             children.listen_for_input();
             extended_keys = child_sessions::dock::ExtendedKeys::enable();
         }
         let mut deferred_messages: Vec<Message> = Vec::new();
         let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
+        let mut refresh_tools = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
         let mut refresh_background = tokio::time::interval(CONTEXT_REFRESH);
+        for interval in [
+            &mut refresh_children,
+            &mut refresh_tools,
+            &mut refresh_background,
+        ] {
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
         // Messages queued in the footer reach the running turn one at a time.
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut steer_retry = tokio::time::interval(STEER_RETRY);
+        steer_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut handed_to_goose: Vec<String> = Vec::new();
         // ↑ from the input line with nothing queued: the session's tool calls, full screen.
         let mut tool_view: Option<tool_calls::ToolCallsView> = None;
+        // Messages arrived since the open list was last brought up to date.
+        let mut tools_stale = false;
         // A background task chosen from the children list, full screen.
         let mut background: Option<background_view::BackgroundView> = None;
         // A `/shutdown`'s progress, and its lines held while a full-screen view is open.
         let mut shutdown_rx = self.take_shutdown_notifications();
         let mut held_status: Vec<String> = Vec::new();
+        let show_cost = Config::global()
+            .get_param::<bool>("GOOSE_CLI_SHOW_COST")
+            .unwrap_or(false);
 
         use futures::StreamExt;
         loop {
             tokio::select! {
+                // Keys first: a key handed over holds back the ones typed after it until the
+                // next one is asked for here.
+                biased;
                 key = children.next_key() => {
+                    if key == child_sessions::Key::MessageQueued {
+                        self.start_steer(&steer_tx);
+                        continue;
+                    }
                     // A background task's output, while open, takes every key but Ctrl-C.
                     if let Some(view) = background.as_mut() {
                         if key == child_sessions::Key::Interrupt {
@@ -1638,14 +1665,12 @@ impl CliSession {
                                     dock.set_input(&format!("/goal {objective}"), usize::MAX);
                                 }
                             }
-                            Some(GoalKey::Remove) => self.change_goal(None).await,
+                            Some(GoalKey::Remove) => self.change_goal(None),
                             Some(GoalKey::ToolCalls) => {
-                                let calls = tool_calls::collect(self.messages.messages());
-                                if !calls.is_empty() {
-                                    output::hide_thinking();
-                                    let _ = progress_bars.hide();
-                                    tool_view = tool_calls::ToolCallsView::open(calls);
-                                }
+                                output::hide_thinking();
+                                let _ = progress_bars.hide();
+                                tool_view = self.open_tool_calls(None);
+                                tools_stale = false;
                             }
                             _ => {}
                         }
@@ -1660,7 +1685,7 @@ impl CliSession {
                             if let Some(dock) = self.dock() {
                                 dock.clear_input();
                             }
-                            self.change_goal(change).await;
+                            self.change_goal(change);
                             continue;
                         }
                         let gate = self.shutdown_gate();
@@ -1694,19 +1719,17 @@ impl CliSession {
                                     None
                                 }
                                 Key::Open => {
-                                    children.handle_key(key, true).await;
+                                    children.handle_key(key, true);
                                     None
                                 }
                                 // A click on a child row or a tool-call line.
                                 Key::Activate => match child_sessions::take_activation() {
                                     Some(child_sessions::Target::Child(index)) => dock.row(index),
                                     Some(child_sessions::Target::ToolCall(id)) => {
-                                        let calls = tool_calls::collect(self.messages.messages());
-                                        if !calls.is_empty() {
-                                            output::hide_thinking();
-                                            let _ = progress_bars.hide();
-                                            tool_view = tool_calls::ToolCallsView::open_at(calls, &id);
-                                        }
+                                        output::hide_thinking();
+                                        let _ = progress_bars.hide();
+                                        tool_view = self.open_tool_calls(Some(&id));
+                                        tools_stale = false;
                                         None
                                     }
                                     None => None,
@@ -1727,12 +1750,10 @@ impl CliSession {
                                 }
                                 // Nothing queued to take back: ↑ moves into the tool calls.
                                 Key::Up if !dock.has_queued() => {
-                                    let calls = tool_calls::collect(self.messages.messages());
-                                    if !calls.is_empty() {
-                                        output::hide_thinking();
-                                        let _ = progress_bars.hide();
-                                        tool_view = tool_calls::ToolCallsView::open(calls);
-                                    }
+                                    output::hide_thinking();
+                                    let _ = progress_bars.hide();
+                                    tool_view = self.open_tool_calls(None);
+                                    tools_stale = false;
                                     None
                                 }
                                 Key::Down if dock.has_rows() => {
@@ -1765,7 +1786,7 @@ impl CliSession {
                                         background = background_view::BackgroundView::open(provider, &child);
                                     }
                                 } else {
-                                    children.open_at(&child, true).await;
+                                    children.open_at(&child, true);
                                 }
                             }
                             continue;
@@ -1776,11 +1797,23 @@ impl CliSession {
                         output::hide_thinking();
                         let _ = progress_bars.hide();
                     }
-                    children.handle_key(key, true).await;
+                    children.handle_key(key, true);
                     if was_open && !children.is_open() {
                         print_held_status(&mut held_status);
                         render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                     }
+                }
+                _ = cancel_token_clone.cancelled() => {
+                    tool_view = None;
+                    background = None;
+                    children.release_keys();
+                    render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
+                    drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
+                    drop(stream);
+                    if let Err(e) = self.handle_interrupted_messages(true).await {
+                        eprintln!("Error handling interruption: {}", e);
+                    }
+                    break;
                 }
                 notification = shutdown::next_notification(&mut shutdown_rx) => {
                     let lines = self.take_shutdown_progress(&notification);
@@ -1812,6 +1845,14 @@ impl CliSession {
                 _ = steer_retry.tick(), if self.dock().is_some_and(|dock| dock.has_queued()) => {
                     self.start_steer(&steer_tx);
                 }
+                _ = refresh_tools.tick(), if tool_view.is_some() => {
+                    if let Some(view) = tool_view.as_mut() {
+                        view.show_older();
+                        if std::mem::take(&mut tools_stale) {
+                            view.refresh(tool_calls::collect(self.messages.messages()));
+                        }
+                    }
+                }
                 _ = refresh_background.tick(), if background.is_some() => {
                     if let Some(view) = background.as_mut() {
                         view.refresh();
@@ -1819,7 +1860,7 @@ impl CliSession {
                 }
                 _ = refresh_children.tick(), if children.is_open() || children.watches_router() => {
                     if children.is_open() {
-                        children.refresh(true).await;
+                        children.refresh(true);
                     } else {
                         children.check_router();
                     }
@@ -1981,8 +2022,8 @@ impl CliSession {
 
                                 if is_stream_json_mode {
                                     emit_stream_event(&StreamEvent::Message { message: message.clone() });
-                                } else if let Some(view) = tool_view.as_mut() {
-                                    view.refresh(tool_calls::collect(self.messages.messages()));
+                                } else if tool_view.is_some() {
+                                    tools_stale = true;
                                     deferred_messages.push(message);
                                 } else if children.is_open() || background.is_some() {
                                     deferred_messages.push(message);
@@ -1999,8 +2040,12 @@ impl CliSession {
                         Some(Ok(AgentEvent::Usage(usage))) => {
                             last_usage = Some(usage);
                             // The pane's context bar follows the turn as it goes.
-                            if self.dock().is_some() {
-                                let _ = self.display_context_usage().await;
+                            if let Some(dock) = self.dock() {
+                                if show_cost {
+                                    let _ = self.display_context_usage().await;
+                                } else {
+                                    dock.update_context(self.agent.clone(), self.session_id.clone());
+                                }
                             }
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
@@ -2018,12 +2063,12 @@ impl CliSession {
                             );
                         }
                         Some(Ok(AgentEvent::HistoryReplaced(updated_conversation))) => {
-                            self.messages = updated_conversation;
+                            self.messages.replace(updated_conversation);
                         }
                         Some(Err(e)) => {
                             tool_view = None;
                             background = None;
-                            children.suspend();
+                            children.release_keys();
                             render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
                             if interactive || !is_stream_json_mode {
                                 handle_agent_error(&e, is_stream_json_mode);
@@ -2046,22 +2091,12 @@ impl CliSession {
                         None => break,
                     }
                 }
-                _ = cancel_token_clone.cancelled() => {
-                    tool_view = None;
-                    background = None;
-                    children.suspend();
-                    render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_block, self.debug);
-                    drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
-                    drop(stream);
-                    if let Err(e) = self.handle_interrupted_messages(true).await {
-                        eprintln!("Error handling interruption: {}", e);
-                    }
-                    break;
-                }
             }
         }
         drop(tool_view);
         drop(background);
+        // Typing goes on showing while the turn is wrapped up.
+        self.typing = children.take_listener().filter(|keys| keys.is_direct());
         drop(children);
         print_held_status(&mut held_status);
         self.return_shutdown_notifications(shutdown_rx);
@@ -2200,9 +2235,7 @@ impl CliSession {
         if interactive {
             let signal_time = *interrupted_at.lock().unwrap();
             if let Some(at) = signal_time {
-                if shutdown::is_planner_session(self.messages.messages())
-                    && self.router_session_id().await.is_some()
-                {
+                if self.messages.is_planner() && self.router_session_id().await.is_some() {
                     {
                         let mut cache = self.completion_cache.write().unwrap();
                         cache
@@ -2459,20 +2492,26 @@ impl CliSession {
     }
 
     pub fn message_history(&self) -> Conversation {
-        self.messages.clone()
+        Conversation::clone(&self.messages)
     }
 
-    /// Render all past messages from the session history
-    pub fn render_message_history(&self) {
+    /// Render past messages from the session history: all of them, or in a long router
+    /// session what the transcript keeps.
+    pub async fn render_message_history(&self) {
         let messages = self.messages.user_visible_messages();
         if messages.is_empty() {
             return;
         }
+        let restored = match self.messages.has_older() {
+            true => self.get_session().await.ok().map(|s| s.message_count),
+            false => None,
+        }
+        .unwrap_or(messages.len());
 
         println!(
             "\n  {} {}",
             console::style("↻").cyan(),
-            console::style(format!("{} messages restored", messages.len())).dim()
+            console::style(format!("{restored} messages restored")).dim()
         );
 
         // Render each message
@@ -2582,7 +2621,6 @@ impl CliSession {
 
             match self.get_prompt(&opts.name, arguments).await {
                 Ok(messages) => {
-                    let start_len = self.messages.len();
                     let mut valid = true;
                     let num_messages = messages.len();
                     for (i, prompt_message) in messages.into_iter().enumerate() {
@@ -2601,7 +2639,7 @@ impl CliSession {
                             ));
                             valid = false;
                             // get rid of everything we added to messages
-                            self.messages.truncate(start_len);
+                            self.messages.truncate(self.messages.len() - i);
                             break;
                         }
 
@@ -2613,8 +2651,9 @@ impl CliSession {
 
                     if valid {
                         if num_messages > 1 {
+                            let first = self.messages.len() - num_messages;
                             for i in 0..(num_messages - 1) {
-                                let msg = &self.messages.messages()[start_len + i];
+                                let msg = &self.messages.messages()[first + i];
                                 self.agent
                                     .config
                                     .session_manager
@@ -2699,8 +2738,10 @@ impl CliSession {
         if self.dock.as_ref().is_some_and(|(id, _)| *id == root) {
             return;
         }
+        // Its reader edits the dock that goes.
+        self.typing = None;
         self.dock = None;
-        let router = RouterStateSource::configured().ok().zip(root.clone());
+        let router = self.router_state().ok().zip(root.clone());
         let dock = child_sessions::dock::Dock::start(child_sessions::dock::Sources {
             session_manager: self.agent.config.session_manager.clone(),
             session_id: self.session_id.clone(),
@@ -2708,10 +2749,35 @@ impl CliSession {
             agent: Some(self.agent.clone()),
         });
         self.dock = dock.map(|dock| (root, dock));
+        self.sync_gate();
     }
 
     fn dock(&self) -> Option<&child_sessions::dock::Dock> {
         self.dock.as_ref().map(|(_, dock)| dock)
+    }
+
+    /// Asking where router-acp keeps its state runs it, so it is asked once.
+    fn router_state(&self) -> Result<RouterStateSource> {
+        if let Some(source) = self.router_state.get() {
+            return Ok(source.clone());
+        }
+        let source = RouterStateSource::configured()?;
+        Ok(self.router_state.get_or_init(|| source).clone())
+    }
+
+    /// Enter goes to the queue only while messages can be sent.
+    fn sync_gate(&self) {
+        if let Some(dock) = self.dock() {
+            dock.set_closed(self.shutdown_gate() != shutdown::Gate::Open);
+        }
+    }
+
+    /// The session's tool calls, full screen, on call `id` or the newest.
+    fn open_tool_calls(&self, id: Option<&str>) -> Option<tool_calls::ToolCallsView> {
+        let older = self
+            .messages
+            .older(self.agent.config.session_manager.clone(), &self.session_id);
+        tool_calls::ToolCallsView::open_history(&self.messages, older, id)
     }
 
     /// Hands the footer's oldest queued message to the running turn, unless one is on its way;
@@ -2732,11 +2798,15 @@ impl CliSession {
             outcomes.clone(),
         );
         tokio::spawn(async move {
-            // A turn that never answers must not hold up the messages queued behind this one.
-            let outcome =
-                tokio::time::timeout(STEER_TIMEOUT, agent.steer_running_turn(&session_id, &text))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer to the steer in time")));
+            // A turn that never answers must not hold up the messages queued behind this one;
+            // one the router holds answers once it goes on.
+            let outcome = timeout_unless(
+                STEER_TIMEOUT,
+                goose::acp::session_activity::is_paused,
+                agent.steer_running_turn(&session_id, &text),
+            )
+            .await
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no answer to the steer in time")));
             let _ = outcomes.send((text, outcome));
         });
     }
@@ -2769,20 +2839,21 @@ impl CliSession {
     }
 
     async fn browse_tool_calls_at(&mut self, id: Option<&str>) {
-        let calls = tool_calls::collect(self.messages.messages());
         let Ok(mut keys) = child_sessions::KeyReader::start() else {
             return;
         };
-        let view = match id {
-            Some(id) => tool_calls::ToolCallsView::open_at(calls, id),
-            None => tool_calls::ToolCallsView::open(calls),
-        };
-        let Some(mut view) = view else {
+        let Some(mut view) = self.open_tool_calls(id) else {
             return;
         };
-        while let Some(key) = keys.next().await {
-            if !view.key(key) {
-                break;
+        let mut refresh = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
+        loop {
+            tokio::select! {
+                biased;
+                key = keys.next() => match key {
+                    Some(key) if view.key(key) => {}
+                    _ => break,
+                },
+                _ = refresh.tick() => view.show_older(),
             }
         }
     }
@@ -2800,10 +2871,7 @@ impl CliSession {
 
     async fn warn_planner_exit(&self) {
         let draining = self.shutdown_gate() == shutdown::Gate::Draining;
-        if draining
-            || (shutdown::is_planner_session(self.messages.messages())
-                && self.router_session_id().await.is_some())
-        {
+        if draining || (self.messages.is_planner() && self.router_session_id().await.is_some()) {
             if let Some(line) = self.planner_census().await.exit_warning(draining) {
                 output::print_status_line(line);
             }
@@ -2841,9 +2909,7 @@ impl CliSession {
             output::print_status_line(notice);
             return;
         }
-        if self.router_session_id().await.is_none()
-            || !shutdown::is_planner_session(self.messages.messages())
-        {
+        if self.router_session_id().await.is_none() || !self.messages.is_planner() {
             output::print_status_line(shutdown::REFUSED);
             return;
         }
@@ -2868,6 +2934,7 @@ impl CliSession {
                     notifications: requested.notifications,
                     drained: false,
                 });
+                self.sync_gate();
                 if let Some(dock) = self.dock() {
                     dock.set_status(Some("shutting down".to_string()));
                 }
@@ -2901,6 +2968,7 @@ impl CliSession {
             }
             (progress, lines)
         };
+        self.sync_gate();
         if let Some(dock) = self.dock() {
             dock.set_status(shutdown::footer(&progress));
         }
@@ -2950,18 +3018,21 @@ impl CliSession {
     }
 
     /// Sets (`Some`) or removes (`None`) the goal router-acp holds this session to, without a
-    /// prompt, as while a turn runs.
-    async fn change_goal(&self, objective: Option<String>) {
-        let Ok(provider) = self.agent.provider(&self.session_id).await else {
-            return;
-        };
+    /// prompt, as while a turn runs, and without holding the turn up for the answer.
+    fn change_goal(&self, objective: Option<String>) {
+        let (agent, session_id) = (self.agent.clone(), self.session_id.clone());
         let params = match &objective {
             Some(objective) => serde_json::json!({"action": "set", "objective": objective}),
             None => serde_json::json!({"action": "clear"}),
         };
-        if let Err(error) = provider.extension_request("_router/goal", params).await {
-            output::print_status_line(&format!("the goal did not change: {error}"));
-        }
+        tokio::spawn(async move {
+            let Ok(provider) = agent.provider(&session_id).await else {
+                return;
+            };
+            if let Err(error) = provider.extension_request("_router/goal", params).await {
+                output::print_status_line(&format!("the goal did not change: {error}"));
+            }
+        });
     }
 
     /// A background task chosen from the children list, full screen until q or Esc; its
@@ -3041,9 +3112,13 @@ impl CliSession {
             self.session_id.clone(),
             enabled,
         );
+        let navigator = match self.dock() {
+            Some(dock) => navigator.with_direct_keys(dock.direct_keys()),
+            None => navigator,
+        };
         match self.router_session_id().await {
             Some(router_session_id) => navigator
-                .with_router(RouterStateSource::configured(), router_session_id)
+                .with_router(self.router_state(), router_session_id)
                 .with_messenger(self.delegate_messenger()),
             None => navigator,
         }
@@ -3200,7 +3275,7 @@ async fn create_successor_session(
 
 async fn drain_stopped_run(
     stream: &mut (impl futures::Stream<Item = Result<AgentEvent>> + Unpin),
-    messages: &mut Conversation,
+    messages: &mut history::History,
     last_usage: &mut Option<ProviderUsage>,
 ) {
     use futures::StreamExt;
@@ -3221,9 +3296,34 @@ async fn drain_stopped_run(
             {
                 messages.push(message);
             }
-            Ok(AgentEvent::HistoryReplaced(conversation)) => *messages = conversation,
+            Ok(AgentEvent::HistoryReplaced(conversation)) => messages.replace(conversation),
             Ok(AgentEvent::Usage(usage)) => *last_usage = Some(usage),
             _ => {}
+        }
+    }
+}
+
+/// `future`'s output unless it takes longer than `limit`, not counting the time `held` says the
+/// wait is expected.
+async fn timeout_unless<T>(
+    limit: Duration,
+    held: impl Fn() -> bool,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    const STEP: Duration = Duration::from_millis(250);
+    tokio::pin!(future);
+    let mut left = limit;
+    loop {
+        tokio::select! {
+            output = &mut future => return Some(output),
+            _ = tokio::time::sleep(STEP.min(left)) => {
+                if !held() {
+                    left = left.saturating_sub(STEP);
+                    if left.is_zero() {
+                        return None;
+                    }
+                }
+            }
         }
     }
 }
@@ -4009,6 +4109,27 @@ mod tests {
         assert_eq!(context_in_use(None, false, None), Some(0));
     }
 
+    #[tokio::test]
+    async fn a_steer_is_not_given_up_while_the_router_holds_the_turn() {
+        let limit = Duration::from_millis(300);
+        let started = Instant::now();
+        let answer = timeout_unless(
+            limit,
+            || started.elapsed() < Duration::from_secs(2),
+            async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                "delivered"
+            },
+        )
+        .await;
+        assert_eq!(answer, Some("delivered"));
+
+        let started = Instant::now();
+        let answer = timeout_unless(limit, || false, std::future::pending::<()>()).await;
+        assert_eq!(answer, None);
+        assert!(started.elapsed() >= limit);
+    }
+
     #[test]
     fn provider_selection_carries_the_resolved_model_into_a_new_session() {
         // A new `goose run --provider pi-acp --model default` session has no saved
@@ -4593,7 +4714,7 @@ mod tests {
             GooseMode::Auto
         );
         session.handle_goose_mode("approve").await.unwrap();
-        session.messages = Conversation::default();
+        session.messages.clear();
         session.push_message(Message::user().with_text("continue the release"));
         session.enforce_planner_mode().await.unwrap();
         assert_eq!(
@@ -4616,7 +4737,7 @@ mod tests {
         let handled = tokio::spawn(async move {
             let history = HistoryManager::new();
             session
-                .handle_input(InputResult::ListSkills, &history, &mut editor, &[])
+                .handle_input(InputResult::ListSkills, &history, &mut editor)
                 .await
                 .expect("handle_input failed");
         });

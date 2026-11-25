@@ -52,6 +52,9 @@ pub enum Key {
     /// The pane's relay saw a click on a tool call or a child; `relay::take_activation`
     /// says which.
     Activate,
+    /// Not typed: the key reader queued a message for the running turn (`dock`), which the
+    /// session may hand to it.
+    MessageQueued,
 }
 
 /// The sequence the relay types for `Key::Activate`.

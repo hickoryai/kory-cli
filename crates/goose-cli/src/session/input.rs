@@ -1,4 +1,5 @@
 use super::child_sessions::dock::Dock;
+use super::child_sessions::KeyReader;
 use super::completion::GooseCompleter;
 use super::paste::{
     read_paste_aware_input, PasteAwareEnterHandler, PasteCaptureHandler, PasteState,
@@ -7,6 +8,7 @@ use super::unsolicited::UnsolicitedRelay;
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
 use goose::config::{Config, GooseMode};
+use goose::conversation::Conversation;
 use rustyline::Editor;
 use shlex;
 use std::collections::HashMap;
@@ -289,11 +291,14 @@ fn should_use_editor_always(
     editor_always_override.unwrap_or(has_editor)
 }
 
+/// `typing` is the key reader that stayed on since the last prompt; the pane's prompt goes on
+/// with it and leaves it on.
 pub async fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
-    conversation_messages: Option<&Vec<String>>,
+    conversation: &Conversation,
     background_output: Option<&UnsolicitedRelay>,
     pane: Option<&Dock>,
+    typing: &mut Option<KeyReader>,
 ) -> Result<InputResult> {
     let config = Config::global();
     let prompt_editor = config.get_goose_prompt_editor().ok().flatten();
@@ -303,7 +308,8 @@ pub async fn get_input(
     if editor_always {
         if let Ok(Some(editor_cmd)) = config.get_goose_prompt_editor() {
             if !editor_cmd.is_empty() {
-                let messages = extract_recent_messages(conversation_messages);
+                *typing = None;
+                let messages = conversation_strings(conversation);
                 let message_refs: Vec<&str> = messages.iter().map(|s| s.as_str()).collect();
                 let (message, has_meaningful_content) =
                     crate::session::editor::get_editor_input(&editor_cmd, &message_refs, None)?;
@@ -323,7 +329,7 @@ pub async fn get_input(
         if let Some(relay) = background_output {
             relay.resume();
         }
-        let read = read_in_pane(editor, pane).await;
+        let read = read_in_pane(editor, pane, typing).await;
         if let Some(relay) = background_output {
             relay.pause();
         }
@@ -335,6 +341,7 @@ pub async fn get_input(
             PaneRead::Result(result) => Ok(result),
         };
     }
+    *typing = None;
 
     let completion_cache = editor
         .helper()
@@ -538,6 +545,24 @@ fn complete_in_pane(
 async fn read_in_pane(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     pane: &Dock,
+    typing: &mut Option<KeyReader>,
+) -> Result<PaneRead> {
+    let mut keys = match typing.take() {
+        Some(keys) => keys,
+        None => KeyReader::start_direct(pane.direct_keys())?,
+    };
+    keys.set_ctrl_keys(true)?;
+    let read = read_keys_in_pane(editor, pane, &mut keys).await?;
+    keys.set_ctrl_keys(false)?;
+    keys.handled();
+    *typing = Some(keys);
+    Ok(read)
+}
+
+async fn read_keys_in_pane(
+    editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    pane: &Dock,
+    keys: &mut KeyReader,
 ) -> Result<PaneRead> {
     use super::child_sessions::dock::Typed;
     use super::child_sessions::Key;
@@ -558,10 +583,16 @@ async fn read_in_pane(
     let entries: Vec<String> = editor.history().iter().cloned().collect();
     let mut walk = HistoryWalk::default();
     let mut cycle: Option<CompletionCycle> = None;
-    let mut keys = super::child_sessions::KeyReader::start_for_prompt()?;
+    // The key reader edits the box itself; what that means to this prompt is noticed here.
+    let mut edits = pane.edits();
     while let Some(key) = keys.next().await {
         if key != Key::Open {
             cycle = None;
+        }
+        if std::mem::replace(&mut edits, pane.edits()) != edits {
+            cycle = None;
+            walk.back = None;
+            completion_cache.write().unwrap().hint_status = HintStatus::Default;
         }
         if !matches!(
             key,
@@ -609,6 +640,7 @@ async fn read_in_pane(
                     "Press Ctrl+C again to exit, or type new instructions to continue".into(),
                 ));
             }
+            Key::MessageQueued => {}
             Key::Eof if empty => return Ok(PaneRead::Result(InputResult::Exit)),
             // A click opens a child or tool call; what was typed stays in the box.
             Key::Activate => return Ok(PaneRead::Result(InputResult::Activate)),
@@ -937,15 +969,21 @@ fn print_help() {
     println!("{}", help_text());
 }
 
-/// Extract recent messages for editor context
-pub(super) fn extract_recent_messages(conversation_messages: Option<&Vec<String>>) -> Vec<String> {
-    match conversation_messages {
-        Some(messages) => {
-            // Return the messages in reverse chronological order (newest first)
-            messages.clone()
-        }
-        None => Vec::new(),
-    }
+/// The conversation as the prompt editor shows it.
+pub(super) fn conversation_strings(conversation: &Conversation) -> Vec<String> {
+    conversation
+        .iter()
+        .filter(|message| message.is_user_visible())
+        .map(|message| message.user_visible_content())
+        .filter(|message| !message.content.is_empty())
+        .map(|message| {
+            let role = match message.role {
+                rmcp::model::Role::User => "User",
+                rmcp::model::Role::Assistant => "Assistant",
+            };
+            format!("## {}: {}", role, message.as_concat_text())
+        })
+        .collect()
 }
 
 /// Print help information about editor input
