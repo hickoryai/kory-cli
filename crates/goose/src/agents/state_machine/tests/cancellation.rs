@@ -99,6 +99,7 @@ async fn interrupted_inference_saves_streamed_output_then_answers_its_request() 
             &pipeline.hook_manager,
             &pipeline.session_id,
             &emit,
+            false,
         )
         .instrument(turn_span),
     )

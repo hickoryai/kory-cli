@@ -69,6 +69,7 @@ async fn capture_state_machine_trace_fields(
         &pipeline.hook_manager,
         &pipeline.session_id,
         &emit,
+        false,
     )
     .instrument(span)
     .await?;

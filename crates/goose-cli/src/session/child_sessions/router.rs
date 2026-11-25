@@ -5,7 +5,9 @@
 use super::super::tool_calls::{CallStatus, ToolCall};
 use super::view::{ChildRow, ChildStatus, LineKind, TranscriptLine};
 use chrono::{DateTime, Utc};
-use goose::providers::router_acp::{RouterDelegate, RouterDelegateLog, RouterStateSource};
+use goose::providers::router_acp::{
+    DelegateLogs, RouterDelegate, RouterDelegateLog, RouterStateSource,
+};
 use goose::utils::safe_truncate;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +16,8 @@ use tokio_util::task::AbortOnDropHandle;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Newest log entries read per delegate.
+const RECENT_LOG: usize = 24;
 const TASK_LINES: usize = 12;
 const ACTIVITY_CHARS: usize = 120;
 
@@ -24,18 +28,38 @@ pub enum Fetched {
     Failed(String),
 }
 
+/// What the poller reads: the parents, and how much of their delegates' logs.
+#[derive(Debug, Clone, PartialEq)]
+struct Targets {
+    parents: Vec<String>,
+    /// Delegates on screen, whose whole log is read.
+    open: Vec<String>,
+    /// Nothing is listing ended delegates.
+    live_only: bool,
+}
+
+impl Targets {
+    fn closed(root: &str) -> Self {
+        Self {
+            parents: vec![root.to_string()],
+            open: Vec::new(),
+            live_only: true,
+        }
+    }
+}
+
 /// Polls `state-query v1 delegates` in the background for the root router session and
 /// every router session the navigator has descended into.
 pub struct RouterChildren {
     root: String,
-    targets: watch::Sender<Vec<String>>,
+    targets: watch::Sender<Targets>,
     latest: Arc<Mutex<Fetched>>,
     _poller: Option<AbortOnDropHandle<()>>,
 }
 
 impl RouterChildren {
     pub fn start(source: anyhow::Result<RouterStateSource>, root: String) -> Self {
-        let (targets, mut watched) = watch::channel(vec![root.clone()]);
+        let (targets, mut watched) = watch::channel(Targets::closed(&root));
         let source = match source {
             Ok(source) => source,
             Err(error) => {
@@ -51,8 +75,12 @@ impl RouterChildren {
         let published = latest.clone();
         let poller = tokio::spawn(async move {
             loop {
-                let ids = watched.borrow_and_update().clone();
-                let fetched = match source.delegates(&ids, QUERY_TIMEOUT).await {
+                let targets = watched.borrow_and_update().clone();
+                let logs = recent_logs(&targets.open, targets.live_only);
+                let fetched = match source
+                    .delegates(&targets.parents, &logs, QUERY_TIMEOUT)
+                    .await
+                {
                     Ok(delegates) => Fetched::Ready(Arc::new(delegates)),
                     Err(error) => Fetched::Failed(error.to_string()),
                 };
@@ -75,14 +103,30 @@ impl RouterChildren {
         &self.root
     }
 
-    /// Router sessions the navigator currently shows, root first; the poller queries them all.
-    pub fn follow(&self, path: &[&str]) {
-        let mut ids = vec![self.root.clone()];
-        ids.extend(path.iter().map(|id| id.to_string()));
+    /// Router sessions the navigator currently shows, below the root, and the child opened on
+    /// its own; the poller queries them all and reads their whole logs.
+    pub fn follow(&self, path: &[&str], child: Option<&str>) {
+        let path = path.iter().map(|id| id.to_string());
+        let mut open: Vec<String> = path.clone().collect();
+        open.extend(child.map(str::to_string));
+        open.dedup();
+        self.retarget(Targets {
+            parents: std::iter::once(self.root.clone()).chain(path).collect(),
+            open,
+            live_only: false,
+        });
+    }
+
+    /// The navigator closed: back to the live rows.
+    pub fn unfollow(&self) {
+        self.retarget(Targets::closed(&self.root));
+    }
+
+    fn retarget(&self, targets: Targets) {
         self.targets.send_if_modified(|current| {
-            let changed = *current != ids;
+            let changed = *current != targets;
             if changed {
-                *current = ids;
+                *current = targets;
             }
             changed
         });
@@ -99,6 +143,15 @@ impl RouterChildren {
                 .any(|delegate| delegate_status(delegate, now) == ChildStatus::Running),
             _ => false,
         }
+    }
+}
+
+/// Enough of each log to show what a delegate is doing, plus the whole log of `open` ones.
+pub fn recent_logs(open: &[String], live_only: bool) -> DelegateLogs {
+    DelegateLogs {
+        recent: RECENT_LOG,
+        whole: open.to_vec(),
+        live_only,
     }
 }
 

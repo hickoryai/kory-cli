@@ -1369,7 +1369,9 @@ impl CliSession {
 
     async fn prepare_successor_session(&self) -> Result<String> {
         let session_manager = &self.agent.config.session_manager;
-        let old_session = session_manager.get_session(&self.session_id, false).await?;
+        let old_session = session_manager
+            .get_session_settings(&self.session_id)
+            .await?;
         let new_session_id =
             create_successor_session(session_manager, &old_session, old_session.goose_mode).await?;
         self.agent
@@ -2489,8 +2491,16 @@ impl CliSession {
             .await
     }
 
+    async fn session_settings(&self) -> Result<goose::session::Session> {
+        self.agent
+            .config
+            .session_manager
+            .get_session_settings(&self.session_id)
+            .await
+    }
+
     pub async fn get_total_token_usage(&self) -> Result<Option<i32>> {
-        let metadata = self.get_session().await?;
+        let metadata = self.session_settings().await?;
         Ok(metadata.accumulated_usage.total_tokens)
     }
 
@@ -2520,7 +2530,7 @@ impl CliSession {
             Some(dock) => dock.set_context(Some((used, context_limit))),
             None => output::display_context_usage(used, context_limit),
         };
-        match self.get_session().await {
+        match self.session_settings().await {
             Ok(metadata) => {
                 if let Some(used) = context_in_use(
                     provider.context_tokens(),
@@ -2640,7 +2650,7 @@ impl CliSession {
         // started from it calls this without one and must keep it.
         let at_prompt = editor.is_some();
         let session_manager = self.agent.config.session_manager.clone();
-        let provider = match session_manager.get_session(&self.session_id, false).await {
+        let provider = match session_manager.get_session_settings(&self.session_id).await {
             Ok(session) => self.agent.config.providers.pinned(&session).await,
             Err(_) => None,
         };
@@ -3076,7 +3086,7 @@ impl CliSession {
             .agent
             .config
             .session_manager
-            .get_session(&self.session_id, false)
+            .get_session_settings(&self.session_id)
             .await
             .ok()?;
         let provider_name = provider_name_for(&session).ok()?;
@@ -3135,7 +3145,7 @@ pub(crate) async fn session_provider(
     let session = agent
         .config
         .session_manager
-        .get_session(session_id, false)
+        .get_session_settings(session_id)
         .await?;
     let session = with_provider_selection(session, provider_name, model_config);
     agent.config.providers.provider_for(&session).await
@@ -3920,7 +3930,7 @@ async fn load_context_usage(
         agent
             .config
             .session_manager
-            .get_session(session_id, false)
+            .get_session_settings(session_id)
             .await?
             .usage
             .total_tokens

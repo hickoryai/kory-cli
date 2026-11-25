@@ -48,7 +48,7 @@ pub async fn turn_context_message(
     let session = extension_manager
         .get_context()
         .session_manager
-        .get_session(session_id, false)
+        .get_session_settings(session_id)
         .await
         .ok();
     let session_model_config = session

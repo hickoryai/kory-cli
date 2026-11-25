@@ -101,10 +101,12 @@ impl RouterStateSource {
     }
 
     /// Delegate panels of every given router session, from router-acp's read-only
-    /// `state-query v1 delegates` boundary.
+    /// `state-query v1 delegates` boundary. [`DelegateLogs`] bounds what each panel carries: a long run
+    /// has thousands of delegates, and their whole logs are hundreds of megabytes.
     pub async fn delegates(
         &self,
         parent_session_ids: &[String],
+        logs: &DelegateLogs,
         timeout: Duration,
     ) -> Result<Vec<RouterDelegate>> {
         let mut command = tokio::process::Command::new(&self.binary);
@@ -120,6 +122,13 @@ impl RouterStateSource {
         for id in parent_session_ids {
             command.arg("--session").arg(id);
         }
+        command.arg("--log-limit").arg(logs.recent.to_string());
+        for id in &logs.whole {
+            command.arg("--whole-log").arg(id);
+        }
+        if logs.live_only {
+            command.arg("--live-only");
+        }
         crate::subprocess::configure_subprocess(&mut command);
         let output = tokio::time::timeout(timeout, command.output())
             .await
@@ -129,7 +138,8 @@ impl RouterStateSource {
             let reason = stderr.trim().lines().last().unwrap_or("no error output");
             anyhow::bail!("router-acp state-query failed: {reason}");
         }
-        parse_delegates(&output.stdout)
+        // Decoding has no yield points; keep it off the tasks that draw and take keys.
+        tokio::task::spawn_blocking(move || parse_delegates(&output.stdout)).await?
     }
 
     /// Every account router-acp routes to, from its sanitized `account-status` reader (labels,
@@ -335,6 +345,17 @@ pub fn parse_session_agent(json: &[u8]) -> Result<Option<String>> {
         .pointer("/data/session/agent")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string))
+}
+
+/// How much of each delegate's log a `delegates` read returns.
+#[derive(Debug, Clone, Default)]
+pub struct DelegateLogs {
+    /// Newest entries per delegate; its task is always included.
+    pub recent: usize,
+    /// Delegates whose log is returned whole.
+    pub whole: Vec<String>,
+    /// Leaves out delegates a later session replaced.
+    pub live_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

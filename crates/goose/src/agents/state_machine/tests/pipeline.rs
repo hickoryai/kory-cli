@@ -507,6 +507,7 @@ impl TestPipeline {
             &self.hook_manager,
             &self.session_id,
             &emit,
+            false,
         )
         .await?;
         drop(emit);

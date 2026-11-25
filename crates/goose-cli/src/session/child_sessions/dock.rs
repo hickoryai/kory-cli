@@ -1284,8 +1284,9 @@ async fn load_rows(sources: &Sources, turn_active: bool) -> Option<Vec<ChildRow>
             .await
             .ok()?;
     if let Some((source, root)) = &sources.router {
+        let logs = router::recent_logs(&[], true);
         let delegates = source
-            .delegates(std::slice::from_ref(root), QUERY_TIMEOUT)
+            .delegates(std::slice::from_ref(root), &logs, QUERY_TIMEOUT)
             .await
             .ok()?;
         rows.extend(router::dock_rows(&delegates, root, chrono::Utc::now()));
