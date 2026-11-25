@@ -6,13 +6,15 @@
 //! closes that again.
 
 use super::child_sessions::{Key, Screen};
+use super::history::{History, Older};
 use super::output::{sanitize_terminal_line, tool_call_line, tool_call_summary};
 use super::router_notices::{self, Segment};
 use console::style;
-use goose::conversation::message::{Message, MessageContent};
+use goose::conversation::message::{Message, MessageContent, ToolResponse};
 use rmcp::model::JsonObject;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::task::AbortOnDropHandle;
 
 /// Whether the session has tool calls to move into, for the line editor's ↑ handler.
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -20,6 +22,12 @@ static REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Rows PageUp/PageDown move the list by.
 const PAGE: usize = 10;
+/// Stored messages read at once when the list is moved to its oldest call.
+const OLDER_MESSAGES: usize = 2_000;
+/// Pages of them read looking for a clicked call.
+const OLDER_PAGES: usize = 10;
+/// Reads the older calls when the selection is this close to the oldest.
+const OLDER_AHEAD: usize = 50;
 
 pub fn set_available(available: bool) {
     AVAILABLE.store(available, Ordering::Relaxed);
@@ -72,7 +80,7 @@ pub struct ToolCall {
 }
 
 pub fn has_tool_calls(messages: &[Message]) -> bool {
-    messages.iter().any(|message| {
+    messages.iter().rev().any(|message| {
         message.content.iter().any(|content| match content {
             MessageContent::ToolRequest(_) => true,
             MessageContent::Text(text) => router_notices::split(&text.text)
@@ -85,9 +93,24 @@ pub fn has_tool_calls(messages: &[Message]) -> bool {
 
 /// Every tool call in `messages`, in order, with its response when one arrived.
 pub fn collect(messages: &[Message]) -> Vec<ToolCall> {
+    collect_page(messages, Vec::new()).0
+}
+
+/// `collect` for part of a conversation, given the responses after it without a call there.
+/// Also returns the responses whose calls come before it.
+fn collect_page(
+    messages: &[Message],
+    later: Vec<ToolResponse>,
+) -> (Vec<ToolCall>, Vec<ToolResponse>) {
     let mut calls: Vec<ToolCall> = Vec::new();
-    let mut notices = 0;
-    for content in messages.iter().flat_map(|message| &message.content) {
+    let mut unmatched = Vec::new();
+    let contents = messages.iter().flat_map(|message| {
+        message
+            .content
+            .iter()
+            .map(move |content| (message, content))
+    });
+    for (message, content) in contents {
         match content {
             MessageContent::ToolRequest(request) => {
                 let kind = request
@@ -123,37 +146,16 @@ pub fn collect(messages: &[Message]) -> Vec<ToolCall> {
                 });
             }
             MessageContent::ToolResponse(response) => {
-                let Some(call) = calls.iter_mut().rev().find(|call| call.id == response.id) else {
-                    continue;
-                };
-                match &response.tool_result {
-                    Ok(result) => {
-                        call.output = result
-                            .content
-                            .iter()
-                            .map(|block| match block.as_text() {
-                                Some(text) => text.text.clone(),
-                                None => serde_json::to_string(block).unwrap_or_default(),
-                            })
-                            .collect();
-                        call.status = if result.is_error == Some(true) {
-                            CallStatus::Failed
-                        } else {
-                            CallStatus::Done
-                        };
-                    }
-                    Err(error) => {
-                        call.error = Some(error.message.to_string());
-                        call.status = CallStatus::Failed;
-                    }
+                if !answer(&mut calls, response) {
+                    unmatched.push(response.clone());
                 }
             }
             MessageContent::Text(text) => {
-                for segment in router_notices::split(&text.text) {
+                for (index, segment) in router_notices::split(&text.text).into_iter().enumerate() {
                     if let Segment::Notice(notice) = segment {
-                        notices += 1;
+                        let said = message.id.clone().unwrap_or(message.created.to_string());
                         calls.push(ToolCall {
-                            id: format!("router-notice-{notices}"),
+                            id: format!("router-notice-{said}-{index}"),
                             name: "router-acp".to_string(),
                             summary: router_notices::summary(&notice),
                             kind: Some("router notice".to_string()),
@@ -169,7 +171,41 @@ pub fn collect(messages: &[Message]) -> Vec<ToolCall> {
             _ => {}
         }
     }
-    calls
+    unmatched.extend(
+        later
+            .into_iter()
+            .filter(|response| !answer(&mut calls, response)),
+    );
+    (calls, unmatched)
+}
+
+/// Puts a response on its call; false when the call is not among `calls`.
+fn answer(calls: &mut [ToolCall], response: &ToolResponse) -> bool {
+    let Some(call) = calls.iter_mut().rev().find(|call| call.id == response.id) else {
+        return false;
+    };
+    match &response.tool_result {
+        Ok(result) => {
+            call.output = result
+                .content
+                .iter()
+                .map(|block| match block.as_text() {
+                    Some(text) => text.text.clone(),
+                    None => serde_json::to_string(block).unwrap_or_default(),
+                })
+                .collect();
+            call.status = if result.is_error == Some(true) {
+                CallStatus::Failed
+            } else {
+                CallStatus::Done
+            };
+        }
+        Err(error) => {
+            call.error = Some(error.message.to_string());
+            call.status = CallStatus::Failed;
+        }
+    }
+    true
 }
 
 /// What a key does in the list.
@@ -352,13 +388,15 @@ fn list_frame(
     selected: usize,
     offset: usize,
     size: (usize, usize),
+    older: bool,
 ) -> Vec<String> {
     let (cols, rows) = size;
     let slots = rows.saturating_sub(1);
     let mut frame = vec![rule(
         &format!(
-            "── tool calls · {} · ↑↓ select · Enter details · ↓ past the last or Esc back ",
-            calls.len()
+            "── tool calls · {}{} · ↑↓ select · Enter details · ↓ past the last or Esc back ",
+            calls.len(),
+            if older { "+" } else { "" }
         ),
         cols,
     )];
@@ -409,24 +447,99 @@ fn detail_frame(call: &ToolCall, scroll: usize, size: (usize, usize)) -> (Vec<St
 pub struct ToolCallsView {
     screen: Screen,
     calls: Vec<ToolCall>,
+    /// How many of `calls` came from `older`, before the ones the session holds.
+    older_calls: usize,
+    older: OlderCalls,
     selected: usize,
     offset: usize,
     detail: Option<usize>,
 }
 
+/// Calls of a long session before the ones it holds, read as the list is moved up to them.
+#[derive(Default)]
+struct OlderCalls {
+    next: Option<Older>,
+    load: Option<AbortOnDropHandle<OlderPage>>,
+    /// Responses read so far whose calls come before them.
+    unmatched: Vec<ToolResponse>,
+    /// A clicked call that is not held, and how many pages may still be read for it.
+    seek: Option<(String, usize)>,
+}
+
+struct OlderPage {
+    calls: Vec<ToolCall>,
+    unmatched: Vec<ToolResponse>,
+    next: Option<Older>,
+}
+
+impl OlderCalls {
+    fn more(&self) -> bool {
+        self.next.is_some() || self.load.is_some()
+    }
+
+    fn start(&mut self) {
+        if self.load.is_some() {
+            return;
+        }
+        let Some(next) = self.next.take() else {
+            return;
+        };
+        let later = std::mem::take(&mut self.unmatched);
+        self.load = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            match next.page(OLDER_MESSAGES).await {
+                Ok((messages, next)) => {
+                    let (calls, unmatched) = collect_page(&messages, later);
+                    OlderPage {
+                        calls,
+                        unmatched,
+                        next,
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not read the session's older tool calls");
+                    OlderPage {
+                        calls: Vec::new(),
+                        unmatched: later,
+                        next: None,
+                    }
+                }
+            }
+        })));
+    }
+
+    fn take_loaded(&mut self) -> Option<OlderPage> {
+        use futures::FutureExt;
+        if !self.load.as_ref()?.is_finished() {
+            return None;
+        }
+        self.load.take()?.now_or_never()?.ok()
+    }
+}
+
 impl ToolCallsView {
     /// Opens on the newest call; `None` when there are no calls.
     pub fn open(calls: Vec<ToolCall>) -> Option<Self> {
-        Self::open_on(calls, None)
+        Self::open_on(calls, OlderCalls::default(), None)
     }
 
     /// Opens on call `id`'s details, as a click on its transcript line does (Esc goes to the
     /// list); on the newest call when `id` is not among them.
     pub fn open_at(calls: Vec<ToolCall>, id: &str) -> Option<Self> {
-        Self::open_on(calls, Some(id))
+        Self::open_on(calls, OlderCalls::default(), Some(id))
     }
 
-    fn open_on(calls: Vec<ToolCall>, id: Option<&str>) -> Option<Self> {
+    /// The session's calls, opened on call `id` or the newest.
+    pub fn open_history(history: &History, older: Option<Older>, id: Option<&str>) -> Option<Self> {
+        let (calls, unmatched) = collect_page(history.messages(), Vec::new());
+        let older = OlderCalls {
+            next: older,
+            unmatched,
+            ..OlderCalls::default()
+        };
+        Self::open_on(calls, older, id)
+    }
+
+    fn open_on(calls: Vec<ToolCall>, older: OlderCalls, id: Option<&str>) -> Option<Self> {
         if calls.is_empty() {
             return None;
         }
@@ -435,30 +548,64 @@ impl ToolCallsView {
         let mut view = Self {
             screen: Screen::enter(),
             calls,
+            older_calls: 0,
+            older,
             selected,
             offset: usize::MAX,
             detail: found.map(|_| 0),
         };
+        if let (Some(id), None) = (id, found) {
+            view.older.seek = Some((id.to_string(), OLDER_PAGES));
+            view.older.start();
+        }
         view.draw();
         Some(view)
     }
 
     /// New calls (or responses) arrived while the view is open.
-    pub fn refresh(&mut self, calls: Vec<ToolCall>) {
+    pub fn refresh(&mut self, mut calls: Vec<ToolCall>) {
         if calls.is_empty() {
             return;
         }
         let id = self.calls.get(self.selected).map(|call| call.id.clone());
-        self.selected = id
-            .and_then(|id| calls.iter().position(|call| call.id == id))
-            .unwrap_or(self.selected)
-            .min(calls.len() - 1);
-        self.calls = calls;
+        self.calls.truncate(self.older_calls);
+        self.calls.append(&mut calls);
+        if self.calls.get(self.selected).map(|call| &call.id) != id.as_ref() {
+            self.selected = id
+                .and_then(|id| self.calls.iter().position(|call| call.id == id))
+                .unwrap_or(self.selected)
+                .min(self.calls.len() - 1);
+        }
+        self.draw();
+    }
+
+    /// Shows the older calls read since the last call.
+    pub fn show_older(&mut self) {
+        let Some(page) = self.older.take_loaded() else {
+            return;
+        };
+        let added = page.calls.len();
+        self.calls.splice(0..0, page.calls);
+        self.older_calls += added;
+        self.selected += added;
+        self.offset = self.offset.saturating_add(added);
+        self.older.unmatched = page.unmatched;
+        self.older.next = page.next;
+        if let Some((id, pages)) = self.older.seek.take() {
+            if let Some(index) = self.calls.iter().position(|call| call.id == id) {
+                self.selected = index;
+                self.detail = Some(0);
+            } else if pages > 1 {
+                self.older.seek = Some((id, pages - 1));
+                self.older.start();
+            }
+        }
         self.draw();
     }
 
     /// Handles one key; false once the view has closed back to the input.
     pub fn key(&mut self, key: Key) -> bool {
+        self.older.seek = None;
         let (_, rows) = self.screen.size();
         // A click on a call in the list opens its details, as selecting it and Enter would.
         if let (Key::Click { row, .. }, None) = (key, self.detail) {
@@ -479,7 +626,12 @@ impl ToolCallsView {
             }
         } else {
             match list_step(self.selected, self.calls.len(), key) {
-                ListStep::Select(selected) => self.selected = selected,
+                ListStep::Select(selected) => {
+                    self.selected = selected;
+                    if selected < OLDER_AHEAD {
+                        self.older.start();
+                    }
+                }
                 ListStep::Open => self.detail = Some(0),
                 ListStep::Leave => return false,
                 ListStep::Stay => return true,
@@ -501,7 +653,13 @@ impl ToolCallsView {
                     slots,
                     self.calls.len(),
                 );
-                list_frame(&self.calls, self.selected, self.offset, size)
+                list_frame(
+                    &self.calls,
+                    self.selected,
+                    self.offset,
+                    size,
+                    self.older.more(),
+                )
             }
         };
         self.screen.draw(&lines);
@@ -675,16 +833,32 @@ mod tests {
     #[test]
     fn list_is_bottom_anchored_with_the_selection_marked() {
         let calls = collect(&conversation());
-        let frame: Vec<String> = list_frame(&calls, 2, 0, (60, 6))
+        let frame: Vec<String> = list_frame(&calls, 2, 0, (60, 6), false)
             .iter()
             .map(|line| console::strip_ansi_codes(line).into_owned())
             .collect();
+        let more =
+            console::strip_ansi_codes(&list_frame(&calls, 2, 0, (60, 6), true)[0]).into_owned();
+        assert!(more.starts_with("── tool calls · 3+"), "{more}");
         assert_eq!(frame.len(), 6);
         assert!(frame[0].starts_with("── tool calls · 3"));
         assert_eq!(&frame[1..3], ["", ""]);
         assert_eq!(frame[3], "  ▸ Terminal");
         assert_eq!(frame[4], "  ▸ mcp.router-delegate.planner_workflow ✗");
         assert_eq!(frame[5], "› ▸ Guardian Review …");
+    }
+
+    #[test]
+    fn a_response_finds_its_call_on_the_page_before() {
+        let conversation = conversation();
+        // The page boundary falls between call "a" and its response.
+        let (held, unmatched) = collect_page(&conversation[1..], Vec::new());
+        assert_eq!(held.len(), 2);
+        assert_eq!(unmatched.len(), 1);
+        let (older, unmatched) = collect_page(&conversation[..1], unmatched);
+        assert!(unmatched.is_empty());
+        assert_eq!(older[0].status, CallStatus::Done);
+        assert_eq!(older[0].output, ["ok\n2 passed"]);
     }
 
     #[test]

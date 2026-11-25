@@ -1,7 +1,7 @@
 use super::keys::{Key, KeyParser};
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use tokio::sync::mpsc;
@@ -16,47 +16,94 @@ pub fn is_capable() -> bool {
         && std::env::var("TERM").map_or(true, |term| term != "dumb")
 }
 
+/// Acts on a key as soon as it is read, on the reader's thread, or hands it back for whoever
+/// awaits keys.
+pub type DirectKeys = Arc<dyn Fn(Key) -> Option<Key> + Send + Sync>;
+
 /// Reads keys from stdin without line buffering or echo for as long as it lives.
 /// ISIG stays on so Ctrl-C still reaches the session's cancel handler, and OPOST stays on so
 /// parent output printed meanwhile keeps its newline translation.
+///
+/// With `DirectKeys` what is typed shows at once however busy the task awaiting keys is. A key
+/// handed to that task holds the ones after it back until it was handled, so keys never take
+/// effect out of order.
 pub struct KeyListener {
     keys: mpsc::UnboundedReceiver<Key>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     original: libc::termios,
+    fd: i32,
+    direct: bool,
+    /// Keys handed over and not handled yet.
+    unhandled: Arc<AtomicUsize>,
+    /// The key `next` gave out last counts in `unhandled`.
+    handling: bool,
 }
 
 impl KeyListener {
     pub fn start() -> std::io::Result<Self> {
-        Self::start_with(false)
+        Self::start_on(std::io::stdin().as_raw_fd(), None)
     }
 
-    /// For the prompt, where Ctrl-C and Ctrl-D are keys rather than signals and end of input.
-    pub fn start_for_prompt() -> std::io::Result<Self> {
-        Self::start_with(true)
+    /// For the session's own input box: what `direct` acts on never waits for the session.
+    pub fn start_direct(direct: DirectKeys) -> std::io::Result<Self> {
+        Self::start_on(std::io::stdin().as_raw_fd(), Some(direct))
     }
 
-    fn start_with(ctrl_keys: bool) -> std::io::Result<Self> {
-        let fd = std::io::stdin().as_raw_fd();
+    pub(super) fn start_on(fd: i32, direct: Option<DirectKeys>) -> std::io::Result<Self> {
         let original = get_termios(fd)?;
-        let cbreak = input_mode(original, ctrl_keys);
+        let cbreak = input_mode(original, false);
         set_termios(fd, &cbreak)?;
         let typed_ahead = enters_restored(read_pending(fd));
 
         let (tx, keys) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let reader_stop = stop.clone();
-        let reader = std::thread::spawn(move || read_keys(fd, &typed_ahead, &reader_stop, &tx));
+        let unhandled = Arc::new(AtomicUsize::new(0));
+        let is_direct = direct.is_some();
+        let delivery = Delivery {
+            direct,
+            unhandled: unhandled.clone(),
+            keys: tx,
+        };
+        let reader = std::thread::spawn({
+            let stop = stop.clone();
+            move || read_keys(fd, &typed_ahead, &stop, &delivery)
+        });
         Ok(Self {
             keys,
             stop,
             reader: Some(reader),
             original,
+            fd,
+            direct: is_direct,
+            unhandled,
+            handling: false,
         })
     }
 
+    /// Whether Ctrl-C and Ctrl-D are keys, as at the prompt, rather than signals and end of
+    /// input.
+    pub fn set_ctrl_keys(&self, ctrl_keys: bool) -> std::io::Result<()> {
+        set_termios(self.fd, &input_mode(self.original, ctrl_keys))
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// The next key; the one before it counts as handled.
     pub async fn next(&mut self) -> Option<Key> {
-        self.keys.recv().await
+        self.handled();
+        let key = self.keys.recv().await?;
+        self.handling = key != Key::MessageQueued;
+        Some(key)
+    }
+
+    /// The key `next` gave out last is dealt with.
+    pub fn handled(&mut self) {
+        if std::mem::take(&mut self.handling) {
+            self.unhandled.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -81,30 +128,7 @@ impl Drop for KeyListener {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
-        let _ = set_termios(std::io::stdin().as_raw_fd(), &self.original);
-    }
-}
-
-/// Keeps typed keys off the screen until the turn's key listener reads them: a message
-/// typed while the turn is still starting would otherwise echo into the output.
-pub struct EchoOff {
-    original: libc::termios,
-}
-
-impl EchoOff {
-    pub fn start() -> Option<Self> {
-        let fd = std::io::stdin().as_raw_fd();
-        let original = get_termios(fd).ok()?;
-        let mut quiet = original;
-        quiet.c_lflag &= !(libc::ICANON | libc::ECHO);
-        set_termios(fd, &quiet).ok()?;
-        Some(Self { original })
-    }
-}
-
-impl Drop for EchoOff {
-    fn drop(&mut self) {
-        let _ = set_termios(std::io::stdin().as_raw_fd(), &self.original);
+        let _ = set_termios(self.fd, &self.original);
     }
 }
 
@@ -131,10 +155,34 @@ fn enters_restored(mut typed: Vec<u8>) -> Vec<u8> {
     typed
 }
 
-fn read_keys(fd: i32, typed_ahead: &[u8], stop: &AtomicBool, tx: &mpsc::UnboundedSender<Key>) {
+/// Where the reader's keys go.
+struct Delivery {
+    direct: Option<DirectKeys>,
+    unhandled: Arc<AtomicUsize>,
+    keys: mpsc::UnboundedSender<Key>,
+}
+
+impl Delivery {
+    /// False once nobody takes keys.
+    fn deliver(&self, key: Key) -> bool {
+        let key = match &self.direct {
+            Some(direct) if self.unhandled.load(Ordering::Acquire) == 0 => match direct(key) {
+                Some(key) => key,
+                None => return true,
+            },
+            _ => key,
+        };
+        if key != Key::MessageQueued {
+            self.unhandled.fetch_add(1, Ordering::AcqRel);
+        }
+        self.keys.send(key).is_ok()
+    }
+}
+
+fn read_keys(fd: i32, typed_ahead: &[u8], stop: &AtomicBool, delivery: &Delivery) {
     let mut parser = KeyParser::default();
     for key in parser.feed(typed_ahead) {
-        if tx.send(key).is_err() {
+        if !delivery.deliver(key) {
             return;
         }
     }
@@ -148,7 +196,7 @@ fn read_keys(fd: i32, typed_ahead: &[u8], stop: &AtomicBool, tx: &mpsc::Unbounde
         let ready = unsafe { libc::poll(&mut pollfd, 1, POLL_MS) };
         if ready <= 0 {
             if let Some(key) = parser.flush_idle() {
-                if tx.send(key).is_err() {
+                if !delivery.deliver(key) {
                     return;
                 }
             }
@@ -159,7 +207,7 @@ fn read_keys(fd: i32, typed_ahead: &[u8], stop: &AtomicBool, tx: &mpsc::Unbounde
             return;
         }
         for key in parser.feed(&buf[..read as usize]) {
-            if tx.send(key).is_err() {
+            if !delivery.deliver(key) {
                 return;
             }
         }
@@ -184,8 +232,17 @@ fn set_termios(fd: i32, termios: &libc::termios) -> std::io::Result<()> {
 /// The alternate screen with mouse reporting, restored on drop.
 pub struct Screen;
 
+/// Full-screen views open now.
+static SCREENS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a full-screen view has the terminal, and so the keys.
+pub fn screen_is_open() -> bool {
+    SCREENS.load(Ordering::Acquire) > 0
+}
+
 impl Screen {
     pub fn enter() -> Self {
+        SCREENS.fetch_add(1, Ordering::AcqRel);
         super::dock::suspend();
         write_raw(ENTER_SCREEN);
         Self
@@ -214,6 +271,7 @@ impl Drop for Screen {
     fn drop(&mut self) {
         write_raw(LEAVE_SCREEN);
         super::dock::resume();
+        SCREENS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -223,6 +281,25 @@ fn write_raw(text: &str) {
     let _ = stdout.flush();
 }
 
+/// An isolated terminal, so a test never changes the test runner's own.
+#[cfg(test)]
+pub(super) fn test_terminal() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    // SAFETY: descriptors this opens and hands to their owners.
+    unsafe {
+        let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(fd >= 0);
+        let master = std::fs::File::from_raw_fd(fd);
+        assert_eq!(libc::grantpt(fd), 0);
+        assert_eq!(libc::unlockpt(fd), 0);
+        let name = libc::ptsname(fd);
+        assert!(!name.is_null());
+        let slave_fd = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+        assert!(slave_fd >= 0);
+        (master, std::fs::File::from_raw_fd(slave_fd))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,21 +307,8 @@ mod tests {
     #[test]
     fn output_after_a_raw_reader_starts_each_line_at_the_left_margin() {
         use std::io::Read;
-        use std::os::fd::FromRawFd;
 
-        // Use an isolated terminal; never change the test runner's own terminal.
-        let (mut master, mut slave) = unsafe {
-            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(fd >= 0);
-            let master = std::fs::File::from_raw_fd(fd);
-            assert_eq!(libc::grantpt(fd), 0);
-            assert_eq!(libc::unlockpt(fd), 0);
-            let name = libc::ptsname(fd);
-            assert!(!name.is_null());
-            let slave_fd = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
-            assert!(slave_fd >= 0);
-            (master, std::fs::File::from_raw_fd(slave_fd))
-        };
+        let (mut master, mut slave) = test_terminal();
         for ctrl_keys in [false, true] {
             let mut raw = get_termios(slave.as_raw_fd()).unwrap();
             unsafe { libc::cfmakeraw(&mut raw) };

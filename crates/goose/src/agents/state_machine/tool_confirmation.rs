@@ -72,13 +72,19 @@ pub(crate) fn has_unapplied_tool_confirmation_response(conversation: &Conversati
         .has_unapplied_confirmation_response()
 }
 
+/// Read at once when looking for the running turn.
+const RECENT_MESSAGES: usize = 500;
+
 pub(crate) async fn persist_tool_confirmation_decision(
     session_manager: &SessionManager,
     session_id: &str,
     request_id: &str,
     permission: &Permission,
 ) -> Result<()> {
-    let session = session_manager.get_session(session_id, true).await?;
+    // Only the running turn decides this.
+    let (session, _) = session_manager
+        .get_recent_session(session_id, RECENT_MESSAGES)
+        .await?;
     let conversation = session
         .conversation
         .as_ref()

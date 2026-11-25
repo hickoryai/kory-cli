@@ -75,6 +75,14 @@ const CHILD_TAKES_NO_MESSAGES: &str = "goose subagents take no messages · Esc r
 /// The live pane, so a full-screen view or child process can hand the screen back and forth.
 static ACTIVE: OnceLock<Mutex<Weak<Shared>>> = OnceLock::new();
 
+/// The pane of the child session on screen: what is typed goes there.
+static CHILD_PANE: Mutex<Weak<ChildPane>> = Mutex::new(Weak::new());
+
+/// `pane` takes what is typed from now on, or the session's own does again.
+pub fn focus_child(pane: Option<&Arc<ChildPane>>) {
+    *CHILD_PANE.lock().unwrap() = pane.map(Arc::downgrade).unwrap_or_default();
+}
+
 /// The message being written.
 #[derive(Default)]
 struct InputLine {
@@ -404,6 +412,151 @@ impl Dock {
         relay::repaint();
         typed
     }
+
+    /// What the key reader does with a key itself. Everything the input box, the queue and the
+    /// children list answer alone needs nothing from the session, so it shows at once however
+    /// busy the session is; the rest is handed to the session.
+    pub fn direct_keys(&self) -> super::terminal::DirectKeys {
+        let shared = Arc::downgrade(&self.shared);
+        Arc::new(move |key| match shared.upgrade() {
+            Some(shared) => shared.direct_key(key),
+            None => Some(key),
+        })
+    }
+
+    /// Changes whenever the key reader edits the input box.
+    pub fn edits(&self) -> u64 {
+        self.shared.state.lock().unwrap().edits
+    }
+
+    /// Brings the context bar up to date without waiting for it.
+    pub fn update_context(&self, agent: Arc<goose::agents::Agent>, session_id: String) {
+        let shared = self.shared.clone();
+        tokio::spawn(async move { shared.refresh_context(&agent, &session_id).await });
+    }
+
+    /// Whether messages can be sent now; while not, the session answers Enter.
+    pub fn set_closed(&self, closed: bool) {
+        self.shared.state.lock().unwrap().closed = closed;
+    }
+}
+
+/// A key that edits the text being written, whatever else the pane shows.
+fn edits_text(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Char(_)
+            | Key::Newline
+            | Key::PasteStart
+            | Key::Backspace
+            | Key::Delete
+            | Key::Left
+            | Key::Right
+            | Key::WordLeft
+            | Key::WordRight
+            | Key::Home
+            | Key::End
+            | Key::KillLine
+            | Key::KillToEnd
+            | Key::KillWord
+    )
+}
+
+impl Shared {
+    fn direct_key(&self, key: Key) -> Option<Key> {
+        if super::terminal::screen_is_open() {
+            return Some(key);
+        }
+        let child = CHILD_PANE.lock().unwrap().upgrade();
+        let left = match child {
+            Some(child) => child.direct_key(key),
+            None => direct_key(&mut self.state.lock().unwrap(), key),
+        };
+        if left != Some(key) {
+            relay::repaint();
+        }
+        left
+    }
+}
+
+/// Acts on `key` from `state` alone, or returns what the session has to act on.
+fn direct_key(state: &mut State, key: Key) -> Option<Key> {
+    // Questions and the selected goal answer their own keys.
+    if state.question || state.goal_selected {
+        return Some(key);
+    }
+    let turn = state.turn_started.is_some();
+    let pasting = state.input.paste.is_some();
+    if !pasting {
+        let empty = state.input.text.is_empty();
+        match key {
+            key if edits_text(key) => {}
+            Key::Escape if state.selected.is_some() => {
+                state.selected = None;
+                follow_selection(state);
+                return None;
+            }
+            Key::Escape => {}
+            Key::Up if turn && state.selected.is_some() => {
+                select(state, -1);
+                return None;
+            }
+            Key::Up if turn && move_vertical(state, -1) => return None,
+            // ↑ reaches the goal first; the tool calls after it are the session's.
+            Key::Up if turn && state.queued.is_empty() && empty && state.goal.is_some() => {
+                state.goal_selected = true;
+                return None;
+            }
+            Key::Up if turn && !state.queued.is_empty() => {}
+            Key::Down if turn && state.selected.is_none() && move_vertical(state, 1) => {
+                return None
+            }
+            Key::Down if turn && !state.rows.is_empty() => {
+                select(state, 1);
+                return None;
+            }
+            // A command is the session's to act on, and so is Enter on a child.
+            Key::Enter if turn && state.selected.is_none() && !state.closed => {
+                let first = state.input.text.iter().find(|c| !c.is_whitespace());
+                if first == Some(&'/') {
+                    return Some(key);
+                }
+            }
+            key => return Some(key),
+        }
+    }
+    state.edits += 1;
+    match type_into(state, key) {
+        Typed::Queued => Some(Key::MessageQueued),
+        _ => None,
+    }
+}
+
+fn select(state: &mut State, delta: isize) {
+    state.selected = next_selection(state.selected, state.rows.len(), delta);
+    follow_selection(state);
+}
+
+/// ↑/↓ inside a message that spans rows; false at its first or last row.
+fn move_vertical(state: &mut State, delta: isize) -> bool {
+    let width = input_width(state.size.0);
+    let input = &mut state.input;
+    let layout = layout(&input.text, input.cursor, width);
+    let (row, _) = layout.caret;
+    let Some(target) = row
+        .checked_add_signed(delta)
+        .filter(|row| *row < layout.rows.len())
+    else {
+        return false;
+    };
+    let column = width_of(&input.text[layout.rows[row].0..input.cursor]);
+    let (start, end) = layout.rows[target];
+    let mut cursor = start;
+    while cursor < end && width_of(&input.text[start..=cursor]) <= column {
+        cursor += 1;
+    }
+    input.cursor = cursor;
+    true
 }
 
 /// A key typed into `state`'s input box.
@@ -522,29 +675,7 @@ impl Dock {
     /// ↑/↓ inside a message that spans rows; false at its first or last row, where the key
     /// means something else (history, tool calls, the children).
     pub fn move_vertical(&self, delta: isize) -> bool {
-        let moved = {
-            let mut state = self.shared.state.lock().unwrap();
-            let width = input_width(state.size.0);
-            let input = &mut state.input;
-            let layout = layout(&input.text, input.cursor, width);
-            let (row, _) = layout.caret;
-            match row
-                .checked_add_signed(delta)
-                .filter(|row| *row < layout.rows.len())
-            {
-                Some(target) => {
-                    let column = width_of(&input.text[layout.rows[row].0..input.cursor]);
-                    let (start, end) = layout.rows[target];
-                    let mut cursor = start;
-                    while cursor < end && width_of(&input.text[start..=cursor]) <= column {
-                        cursor += 1;
-                    }
-                    input.cursor = cursor;
-                    true
-                }
-                None => false,
-            }
-        };
+        let moved = move_vertical(&mut self.shared.state.lock().unwrap(), delta);
         if moved {
             relay::repaint();
         }
@@ -607,8 +738,7 @@ impl Dock {
     pub fn step(&self, delta: isize) -> bool {
         let selecting = {
             let mut state = self.shared.state.lock().unwrap();
-            state.selected = next_selection(state.selected, state.rows.len(), delta);
-            follow_selection(&mut state);
+            select(&mut state, delta);
             state.selected.is_some()
         };
         relay::repaint();
@@ -1011,6 +1141,20 @@ impl ChildPane {
 
     pub fn input_is_empty(&self) -> bool {
         self.state.lock().unwrap().input.text.is_empty()
+    }
+
+    /// What the key reader does itself with a key typed at this pane.
+    fn direct_key(&self, key: Key) -> Option<Key> {
+        let mut state = self.state.lock().unwrap();
+        let edits = state.input.paste.is_some()
+            || edits_text(key)
+            || (key == Key::Escape && !state.input.text.is_empty());
+        if !edits {
+            return Some(key);
+        }
+        state.status = None;
+        type_into(&mut state, key);
+        None
     }
 
     /// A key for the input box. Enter (or Ctrl+Enter) hands back the message to send, whether
@@ -1849,6 +1993,176 @@ mod tests {
         for c in text.chars() {
             dock.type_key(Key::Char(c));
         }
+    }
+
+    /// Waits, without letting the runtime run anything else, until `shown` holds.
+    #[cfg(unix)]
+    fn blocked_until(what: &str, shown: impl Fn() -> bool) -> Duration {
+        let started = Instant::now();
+        while !shown() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "never happened: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        started.elapsed()
+    }
+
+    /// The session's one task is stuck in a slow stream item or refresh for the whole test: it
+    /// never asks for a key. What is typed still shows, and Enter still queues.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn typing_shows_at_once_while_the_session_is_blocked() {
+        use std::os::fd::AsRawFd;
+        let (mut master, slave) = crate::session::child_sessions::terminal::test_terminal();
+        let dock = in_turn();
+        let mut keys = crate::session::child_sessions::terminal::KeyListener::start_on(
+            slave.as_raw_fd(),
+            Some(dock.direct_keys()),
+        )
+        .unwrap();
+
+        let mut slowest = Duration::ZERO;
+        let mut text = String::new();
+        for c in "a message typed".chars() {
+            text.push(c);
+            master.write_all(c.to_string().as_bytes()).unwrap();
+            let shown = blocked_until("the typed character shows", || dock.input_text() == text);
+            slowest = slowest.max(shown);
+        }
+        println!("slowest key while the session is blocked: {slowest:?}");
+        assert!(slowest < Duration::from_secs(1), "{slowest:?}");
+        master.write_all(b"\r").unwrap();
+        blocked_until("the message is queued", || {
+            queued(&dock).0 == ["a message typed"] && dock.input_text().is_empty()
+        });
+        // ↑ takes it back, also without the session.
+        master.write_all(b"\x1b[A").unwrap();
+        blocked_until("the message is back", || dock.input_text() == text);
+        // The session learns that a message was queued once it looks.
+        assert_eq!(keys.next().await, Some(Key::MessageQueued));
+
+        // Tab is the session's. What is typed after it waits until the session handled it, so
+        // it can mean what it means in the view Tab opens.
+        master.write_all(b"\tx").unwrap();
+        assert_eq!(keys.next().await, Some(Key::Open));
+        assert_eq!(keys.next().await, Some(Key::Char('x')));
+        assert_eq!(dock.input_text(), text);
+        keys.handled();
+        master.write_all(b"y").unwrap();
+        blocked_until("typing shows again", || {
+            dock.input_text() == format!("{text}y")
+        });
+    }
+
+    /// Prints how long a key takes to show while the task that takes keys spends `busy` on each
+    /// stream item, with and without the key reader editing the input box itself.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "prints measurements"]
+    fn bench_key_latency_while_the_session_is_busy() {
+        use std::os::fd::AsRawFd;
+        for busy in [0, 100, 1_000, 5_000].map(Duration::from_millis) {
+            for direct in [false, true] {
+                let (mut master, slave) = crate::session::child_sessions::terminal::test_terminal();
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (ready, dock) = std::sync::mpsc::channel();
+                let stopping = stop.clone();
+                let session = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            let dock = Arc::new(in_turn());
+                            let mut keys =
+                                crate::session::child_sessions::terminal::KeyListener::start_on(
+                                    slave.as_raw_fd(),
+                                    direct.then(|| dock.direct_keys()),
+                                )
+                                .unwrap();
+                            ready.send(dock.clone()).unwrap();
+                            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                                tokio::select! {
+                                    biased;
+                                    key = keys.next() => { dock.type_key(key.unwrap()); }
+                                    _ = tokio::task::yield_now() => std::thread::sleep(busy),
+                                }
+                            }
+                        });
+                });
+                let dock = dock.recv().unwrap();
+                let mut slowest = Duration::ZERO;
+                for n in 1..=4usize {
+                    std::thread::sleep(Duration::from_millis(37));
+                    master.write_all(b"k").unwrap();
+                    let shown = blocked_until("the key shows", || dock.input_text().len() >= n);
+                    slowest = slowest.max(shown);
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                session.join().unwrap();
+                let path = if direct { "key reader" } else { "session task" };
+                println!("busy {busy:?} per item, keys shown by the {path}: slowest {slowest:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_key_reader_leaves_to_the_session_what_only_it_can_do() {
+        let mut state = State {
+            turn_started: Some(Instant::now()),
+            rows: vec![row("a", ChildStatus::Running)],
+            ..State::default()
+        };
+        let mut press = |state: &mut State, key| direct_key(state, key);
+        for key in [
+            Key::Open,
+            Key::Interrupt,
+            Key::SendNow,
+            Key::Activate,
+            Key::Up,
+        ] {
+            assert_eq!(press(&mut state, key), Some(key));
+        }
+        // A command is the session's, and stays in the box until it took it.
+        for c in "/shutdown".chars() {
+            assert_eq!(press(&mut state, Key::Char(c)), None);
+        }
+        assert_eq!(press(&mut state, Key::Enter), Some(Key::Enter));
+        assert_eq!(state.input.text.len(), "/shutdown".len());
+        assert_eq!(press(&mut state, Key::Escape), None);
+        assert!(state.input.text.is_empty());
+        // The children list answers the arrows; Enter on a child opens it.
+        assert_eq!(press(&mut state, Key::Down), None);
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(press(&mut state, Key::Enter), Some(Key::Enter));
+        assert_eq!(press(&mut state, Key::Up), None);
+        assert_eq!(state.selected, None);
+        // A goal takes the keys once ↑ reached it.
+        state.goal = Some(goal("active"));
+        assert_eq!(press(&mut state, Key::Up), None);
+        assert!(state.goal_selected);
+        assert_eq!(press(&mut state, Key::Delete), Some(Key::Delete));
+        state.goal_selected = false;
+        // While nothing can be sent, Enter keeps the text for the session to answer.
+        state.closed = true;
+        press(&mut state, Key::Char('x'));
+        assert_eq!(press(&mut state, Key::Enter), Some(Key::Enter));
+        assert!(state.queued.is_empty() && state.input.text == ['x']);
+        state.closed = false;
+        assert_eq!(press(&mut state, Key::Enter), Some(Key::MessageQueued));
+        assert_eq!(state.queued, ["x"]);
+        // A question on screen takes every key.
+        state.question = true;
+        assert_eq!(press(&mut state, Key::Char('y')), Some(Key::Char('y')));
+        // At the prompt Enter submits and the arrows walk the history: the session's.
+        let mut state = State::default();
+        press(&mut state, Key::Char('h'));
+        for key in [Key::Enter, Key::Up, Key::Down, Key::Eof] {
+            assert_eq!(press(&mut state, key), Some(key));
+        }
+        assert_eq!(state.input.text, ['h']);
     }
 
     fn queued(dock: &Dock) -> (Vec<String>, Option<String>) {

@@ -37,11 +37,11 @@ use rmcp::model::{ContentBlock, Role};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
-pub use terminal::EchoOff;
 /// Raw key input for a view the session drives itself (the dock's selection).
 pub use terminal::KeyListener as KeyReader;
 /// The alternate screen, for other full-screen views (the tool-call list).
 pub use terminal::Screen;
+use tokio_util::task::AbortOnDropHandle;
 pub use view::ChildRow;
 use view::{ChildStatus, LineKind, Navigator, Outcome, Snapshot, TranscriptLine};
 
@@ -106,9 +106,19 @@ impl OpenView {
                 .find(|row| row.id == id)
                 .cloned()
         });
-        self.child = Some(ChildScreen::new(id.to_string(), row));
+        let child = ChildScreen::new(id.to_string(), row);
+        dock::focus_child(Some(&child.pane));
+        self.child = Some(child);
         // The list's screen goes; the child is drawn over the transcript from now on.
         self.screen = None;
+    }
+
+    fn draw(&mut self) {
+        if let Some(screen) = &self.screen {
+            let (width, height) = screen.size();
+            self.frame = self.navigator.render(&self.snapshot, width, height);
+            screen.draw(&self.frame.lines);
+        }
     }
 }
 
@@ -120,7 +130,7 @@ struct ChildScreen {
     row: Option<ChildRow>,
     pane: Arc<dock::ChildPane>,
     /// What the transcript was rendered from (and at what width), and the rendering.
-    rendered: Option<(u64, String)>,
+    rendered: Option<(u64, Arc<str>)>,
     /// When the child was first seen running, for a child that does not say when it started.
     seen_running: Option<std::time::Instant>,
     /// The child's tool calls as last loaded, for ↑ and clicks on its tool-call lines.
@@ -143,7 +153,8 @@ impl ChildScreen {
         }
     }
 
-    fn update(&mut self, loaded: ChildTranscript, width: usize) {
+    /// What was loaded, and its rendering when that is not the one already shown.
+    fn update(&mut self, loaded: ChildTranscript, rendered: Option<(u64, Arc<str>)>) {
         if let Some(row) = loaded.row {
             self.row = Some(row);
         }
@@ -173,32 +184,9 @@ impl ChildScreen {
         }
         self.pane.set_turn(started);
         self.pane.set_context(loaded.context);
-
-        let status = self
-            .row
-            .as_ref()
-            .map_or("unknown", |row| row.status.label());
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&(loaded.fingerprint, width, status), &mut hasher);
-        let key = std::hash::Hasher::finish(&hasher);
-        if self.rendered.as_ref().is_some_and(|(seen, _)| *seen == key) {
-            return;
+        if rendered.is_some() {
+            self.rendered = rendered;
         }
-        let (model, label) = self
-            .row
-            .as_ref()
-            .map_or(("unknown model", self.id.as_str()), |row| {
-                (row.model.as_str(), row.label.as_str())
-            });
-        let mut text = output::child_session_header(status, model, label, &self.id);
-        text.push_str(&output::render_transcript(&loaded.entries, false));
-        if let Some(notice) = loaded.notice {
-            text.push_str(&output::render_transcript(
-                &[output::TranscriptEntry::Notice(notice)],
-                false,
-            ));
-        }
-        self.rendered = Some((key, text));
     }
 
     fn draw(&self) {
@@ -241,6 +229,7 @@ impl ChildScreen {
 
 impl Drop for ChildScreen {
     fn drop(&mut self) {
+        dock::focus_child(None);
         relay::hide_child();
     }
 }
@@ -258,6 +247,50 @@ struct ChildTranscript {
     fingerprint: u64,
 }
 
+/// `loaded` as the session itself would print it, unless that is what is `shown` already.
+fn render_child(
+    id: &str,
+    row: Option<&ChildRow>,
+    loaded: &ChildTranscript,
+    width: usize,
+    shown: Option<u64>,
+) -> Option<(u64, Arc<str>)> {
+    let row = loaded.row.as_ref().or(row);
+    let status = row.map_or("unknown", |row| row.status.label());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (loaded.fingerprint, width, status).hash(&mut hasher);
+    let key = hasher.finish();
+    if shown == Some(key) {
+        return None;
+    }
+    let (model, label) = row.map_or(("unknown model", id), |row| {
+        (row.model.as_str(), row.label.as_str())
+    });
+    let mut text = output::child_session_header(status, model, label, id);
+    text.push_str(&output::render_transcript(&loaded.entries, false));
+    if let Some(notice) = &loaded.notice {
+        text.push_str(&output::render_transcript(
+            &[output::TranscriptEntry::Notice(notice.clone())],
+            false,
+        ));
+    }
+    Some((key, text.into()))
+}
+
+/// What the navigator shows, loaded and rendered away from the task that takes keys.
+enum Loaded {
+    Child {
+        id: String,
+        transcript: Box<ChildTranscript>,
+        rendered: Option<(u64, Arc<str>)>,
+    },
+    /// The children of `current`; `None` when they could not be read.
+    List {
+        current: Option<String>,
+        snapshot: Option<Snapshot>,
+    },
+}
+
 pub struct ChildSessionNavigator {
     session_manager: Arc<SessionManager>,
     root_id: String,
@@ -265,9 +298,13 @@ pub struct ChildSessionNavigator {
     has_children: bool,
     hinted: bool,
     listener: Option<terminal::KeyListener>,
+    direct: Option<terminal::DirectKeys>,
     open: Option<OpenView>,
-    router: Option<router::RouterChildren>,
+    router: Option<Arc<router::RouterChildren>>,
     messenger: Option<Messenger>,
+    load: Option<AbortOnDropHandle<Loaded>>,
+    /// What is shown changed while a load ran: load again (with whether a turn is active).
+    reload: Option<bool>,
 }
 
 /// Sends a message to a router-acp delegate (by its state session id) and answers how
@@ -303,9 +340,12 @@ impl ChildSessionNavigator {
             has_children: false,
             hinted: false,
             listener: None,
+            direct: None,
             open: None,
             router: None,
             messenger: None,
+            load: None,
+            reload: None,
         }
     }
 
@@ -317,9 +357,25 @@ impl ChildSessionNavigator {
         router_session_id: String,
     ) -> Self {
         if self.available {
-            self.router = Some(router::RouterChildren::start(source, router_session_id));
+            self.router = Some(Arc::new(router::RouterChildren::start(
+                source,
+                router_session_id,
+            )));
         }
         self
+    }
+
+    /// The session's input box takes what is typed as the key reader reads it.
+    pub fn with_direct_keys(mut self, direct: terminal::DirectKeys) -> Self {
+        self.direct = Some(direct);
+        self
+    }
+
+    /// Goes on reading keys with `listener`, so none typed meanwhile is lost or waits.
+    pub fn resume_listening(&mut self, listener: Option<terminal::KeyListener>) {
+        if self.available && self.listener.is_none() {
+            self.listener = listener;
+        }
     }
 
     /// How a message typed into a router-acp delegate's input box reaches it.
@@ -380,7 +436,11 @@ impl ChildSessionNavigator {
         if !self.available || !self.has_children || self.listener.is_some() {
             return;
         }
-        match terminal::KeyListener::start() {
+        let started = match &self.direct {
+            Some(direct) => terminal::KeyListener::start_direct(direct.clone()),
+            None => terminal::KeyListener::start(),
+        };
+        match started {
             Ok(listener) => self.listener = Some(listener),
             Err(_) => {
                 self.available = false;
@@ -397,21 +457,70 @@ impl ChildSessionNavigator {
         self.open.is_some()
     }
 
+    /// The next key. What was loaded meanwhile is shown while waiting for it.
     pub async fn next_key(&mut self) -> Key {
-        match self.listener.as_mut() {
-            Some(listener) => match listener.next().await {
-                Some(key) => key,
-                None => std::future::pending().await,
-            },
-            None => std::future::pending().await,
+        loop {
+            let loaded = {
+                let listener = self.listener.as_mut();
+                let load = self.load.as_mut();
+                let key = async {
+                    match listener {
+                        Some(listener) => listener.next().await,
+                        None => None,
+                    }
+                };
+                let loaded = async {
+                    match load {
+                        Some(load) => load.await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    Some(key) = key => return key,
+                    loaded = loaded => loaded,
+                }
+            };
+            self.load = None;
+            if let Ok(loaded) = loaded {
+                self.show(loaded);
+            }
         }
     }
 
-    pub async fn handle_key(&mut self, key: Key, turn_active: bool) {
+    fn show(&mut self, loaded: Loaded) {
+        if let Some(view) = self.open.as_mut() {
+            match loaded {
+                Loaded::Child {
+                    id,
+                    transcript,
+                    rendered,
+                } => {
+                    if let Some(child) = view.child.as_mut().filter(|child| child.id == id) {
+                        child.update(*transcript, rendered);
+                        child.draw();
+                    }
+                }
+                Loaded::List { current, snapshot } => {
+                    if view.child.is_none() && view.navigator.current() == current.as_deref() {
+                        if let Some(snapshot) = snapshot {
+                            view.snapshot = snapshot;
+                        }
+                        view.draw();
+                    }
+                }
+            }
+        }
+        if let Some(turn_active) = self.reload.take() {
+            self.refresh(turn_active);
+        }
+    }
+
+    pub fn handle_key(&mut self, key: Key, turn_active: bool) {
         let Some(view) = self.open.as_mut() else {
             if key == Key::Open {
                 self.open = Some(OpenView::list(Navigator::default()));
-                self.refresh(turn_active).await;
+                self.load_shown(turn_active);
             }
             return;
         };
@@ -455,15 +564,31 @@ impl ChildSessionNavigator {
                     return;
                 }
             }
-        } else if view.navigator.handle(key, &view.snapshot, &view.frame) == Outcome::Close {
-            return self.close();
         } else {
+            let before = view.navigator.current().map(str::to_string);
+            if view.navigator.handle(key, &view.snapshot, &view.frame) == Outcome::Close {
+                return self.close();
+            }
             view.show_child(None);
+            // The same list moves at once; another one is drawn when it is loaded.
+            if view.navigator.current() == before.as_deref() {
+                view.draw();
+            }
         }
-        self.refresh(turn_active).await;
+        self.load_shown(turn_active);
     }
 
-    pub async fn refresh(&mut self, turn_active: bool) {
+    /// `refresh` for a view that shows something else now: a load that runs is not for it.
+    fn load_shown(&mut self, turn_active: bool) {
+        if self.load.is_some() {
+            self.reload = Some(turn_active);
+        }
+        self.refresh(turn_active);
+    }
+
+    /// Loads what is open again; `next_key` shows it. The task that takes keys never waits for
+    /// a database, a subprocess or a long transcript.
+    pub fn refresh(&mut self, turn_active: bool) {
         let Some(view) = self.open.as_mut() else {
             return;
         };
@@ -477,40 +602,59 @@ impl ChildSessionNavigator {
             let child = view.child.as_ref().map(|child| child.id.as_str());
             router.follow(&router_path, child.filter(|id| is_router_delegate(id)));
         }
-        if let Some(child) = view.child.as_mut() {
-            let loaded = load_child(
-                &self.session_manager,
-                &self.root_id,
-                self.router.as_ref(),
-                &child.id,
-                turn_active,
-            )
-            .await;
-            let (width, _) = terminal_size();
-            child.update(loaded, width);
-            child.draw();
+        if self.load.is_some() {
             return;
         }
-        if let Ok(snapshot) = load_snapshot(
-            &self.session_manager,
-            &self.root_id,
-            self.router.as_ref(),
-            view.navigator.current(),
-            turn_active,
-        )
-        .await
-        {
-            view.snapshot = snapshot;
-        }
-        if let Some(screen) = &view.screen {
-            let (width, height) = screen.size();
-            view.frame = view.navigator.render(&view.snapshot, width, height);
-            screen.draw(&view.frame.lines);
-        }
+        let session_manager = self.session_manager.clone();
+        let root_id = self.root_id.clone();
+        let router = self.router.clone();
+        let load = match view.child.as_ref() {
+            Some(child) => {
+                let id = child.id.clone();
+                let row = child.row.clone();
+                let shown = child.rendered.as_ref().map(|(key, _)| *key);
+                let (width, _) = terminal_size();
+                tokio::spawn(async move {
+                    let mut transcript = load_child(
+                        &session_manager,
+                        &root_id,
+                        router.as_deref(),
+                        &id,
+                        turn_active,
+                    )
+                    .await;
+                    let rendered = render_child(&id, row.as_ref(), &transcript, width, shown);
+                    transcript.entries.clear();
+                    Loaded::Child {
+                        id,
+                        transcript: Box::new(transcript),
+                        rendered,
+                    }
+                })
+            }
+            None => {
+                let current = view.navigator.current().map(str::to_string);
+                tokio::spawn(async move {
+                    let snapshot = load_snapshot(
+                        &session_manager,
+                        &root_id,
+                        router.as_deref(),
+                        current.as_deref(),
+                        turn_active,
+                    )
+                    .await
+                    .ok();
+                    Loaded::List { current, snapshot }
+                })
+            }
+        };
+        self.load = Some(AbortOnDropHandle::new(load));
     }
 
     pub fn close(&mut self) {
         self.open = None;
+        self.load = None;
+        self.reload = None;
         if let Some(router) = &self.router {
             router.unfollow();
         }
@@ -524,12 +668,29 @@ impl ChildSessionNavigator {
     }
 
     /// Opens the navigator inside `child` (chosen from the dock) while a turn runs.
-    pub async fn open_at(&mut self, child: &ChildRow, turn_active: bool) {
+    pub fn open_at(&mut self, child: &ChildRow, turn_active: bool) {
         if !self.available {
             return;
         }
         self.open = Some(OpenView::child(child));
-        self.refresh(turn_active).await;
+        self.load_shown(turn_active);
+    }
+
+    /// The session is busy ending its turn: nothing is open, and the key handled last holds
+    /// back no others.
+    pub fn release_keys(&mut self) {
+        self.close();
+        if let Some(listener) = self.listener.as_mut() {
+            listener.handled();
+        }
+    }
+
+    /// Keeps reading keys after this navigator is gone (`resume_listening`).
+    pub fn take_listener(&mut self) -> Option<terminal::KeyListener> {
+        self.close();
+        let mut listener = self.listener.take()?;
+        listener.handled();
+        Some(listener)
     }
 
     /// `browse`, starting inside `child`.
@@ -540,15 +701,8 @@ impl ChildSessionNavigator {
         self.has_children = true;
         self.hinted = true;
         self.listen();
-        self.open_at(child, false).await;
-        let mut tick = tokio::time::interval(REFRESH_INTERVAL);
-        while self.is_open() {
-            tokio::select! {
-                key = self.next_key() => self.handle_key(key, false).await,
-                _ = tick.tick() => self.refresh(false).await,
-            }
-        }
-        self.suspend();
+        self.open_at(child, false);
+        self.run().await;
     }
 
     /// Opens the navigator between turns, when completed and failed children stay inspectable.
@@ -563,12 +717,21 @@ impl ChildSessionNavigator {
         self.has_children = true;
         self.hinted = true;
         self.listen();
-        self.handle_key(Key::Open, false).await;
+        self.handle_key(Key::Open, false);
+        self.run().await;
+    }
+
+    async fn run(&mut self) {
         let mut tick = tokio::time::interval(REFRESH_INTERVAL);
         while self.is_open() {
-            tokio::select! {
-                key = self.next_key() => self.handle_key(key, false).await,
-                _ = tick.tick() => self.refresh(false).await,
+            let key = tokio::select! {
+                biased;
+                key = self.next_key() => Some(key),
+                _ = tick.tick() => None,
+            };
+            match key {
+                Some(key) => self.handle_key(key, false),
+                None => self.refresh(false),
             }
         }
         self.suspend();
@@ -953,7 +1116,12 @@ mod tests {
             fingerprint: 7,
             ..Default::default()
         };
-        child.update(loaded(), 100);
+        let render = |child: &ChildScreen| {
+            let shown = child.rendered.as_ref().map(|(key, _)| *key);
+            render_child(&child.id, child.row.as_ref(), &loaded(), 100, shown)
+        };
+        let rendered = render(&child);
+        child.update(loaded(), rendered);
         let text = console::strip_ansi_codes(&child.rendered.as_ref().unwrap().1).into_owned();
         assert!(text.contains("child session · running"), "{text}");
         assert!(text.contains("child-1 · jam-packet-map"), "{text}");
@@ -970,8 +1138,9 @@ mod tests {
         assert_eq!(pane[1], "›");
 
         // The same transcript is not rendered again.
-        let before = child.rendered.as_ref().unwrap().0;
-        child.update(loaded(), 100);
+        assert!(render(&child).is_none());
+        let before = child.rendered.clone().unwrap().0;
+        child.update(loaded(), None);
         assert_eq!(child.rendered.as_ref().unwrap().0, before);
     }
 
