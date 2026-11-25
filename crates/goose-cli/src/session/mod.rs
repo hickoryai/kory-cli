@@ -1579,7 +1579,7 @@ impl CliSession {
         // Typing during the turn: the footer's input line takes keys, and Ctrl+Enter is only
         // reported once the terminal's extended keyboard reporting is on.
         let mut extended_keys = None;
-        if let Some(dock) = self.dock() {
+        if self.dock().is_some() {
             children.listen_for_input();
             extended_keys = child_sessions::dock::ExtendedKeys::enable();
         }
