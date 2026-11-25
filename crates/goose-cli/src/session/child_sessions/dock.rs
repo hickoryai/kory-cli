@@ -2115,7 +2115,7 @@ mod tests {
             rows: vec![row("a", ChildStatus::Running)],
             ..State::default()
         };
-        let mut press = |state: &mut State, key| direct_key(state, key);
+        let press = direct_key;
         for key in [
             Key::Open,
             Key::Interrupt,
